@@ -40,6 +40,10 @@ You can also pass an OBJ path on startup:
 
 Use `--cube` for the built-in cube or `--check-environment` to list available Vulkan devices and validation-layer support.
 
+## Presentations
+
+- [Milestone 1](presentations/Milestone1.pptx), November 11, 2026. Speaker notes include the presentation script.
+
 ## Source layout
 
 | File | Responsibility |
