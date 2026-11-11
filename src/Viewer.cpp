@@ -2,7 +2,7 @@
 
 #include "ClusterBuilder.h"
 #include "MeshSource.h"
-#include "ObjLoader.h"
+#include "SceneData.h"
 #include "OrbitCamera.h"
 #include "VulkanRenderer.h"
 
@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -41,8 +42,7 @@ struct ViewerInput {
 };
 
 struct ViewerModel {
-    MeshSource mesh;
-    ClusterDataset dataset;
+    SceneData scene;
     OrbitCamera camera;
     std::string name;
 };
@@ -70,6 +70,9 @@ public:
         }
 #endif
         ImGui::StyleColorsDark();
+        // Readable on a presentation display; independent of model/camera scale.
+        ImGui::GetStyle().FontScaleMain = 1.4f;
+        ImGui::GetStyle().ScaleAllSizes(1.2f);
         if (!ImGui_ImplGlfw_InitForVulkan(window, true)) {
             ImGui::DestroyContext();
             throw std::runtime_error("Could not initialize ImGui input.");
@@ -103,11 +106,11 @@ OrbitCamera frameMesh(const MeshSource& mesh)
     return OrbitCamera(minimum + halfSize, radius);
 }
 
-ViewerModel makeModel(MeshSource mesh, std::string name)
+ViewerModel makeModel(SceneData scene, std::string name)
 {
-    auto dataset = buildClusters(mesh);
-    auto camera = frameMesh(mesh);
-    return {std::move(mesh), std::move(dataset), camera, std::move(name)};
+    validateScene(scene);
+    auto camera = frameMesh(scene.mesh);
+    return {std::move(scene), camera, std::move(name)};
 }
 
 void handleMouseButton(GLFWwindow* window, int button, int action, int)
@@ -175,52 +178,67 @@ void showModelInfo(GLFWwindow* window, const ViewerModel& model)
 {
     const std::string title = "Adaptive Cluster Rendering - " + model.name;
     glfwSetWindowTitle(window, title.c_str());
-    std::cout << model.name << " | vertices: " << model.mesh.vertices.size()
-              << " | triangles: " << model.dataset.indices.size() / 3
-              << " | clusters: " << model.dataset.clusters.size() << std::endl;
+    std::cout << model.name << " | vertices: " << model.scene.mesh.vertices.size()
+              << " | triangles: " << model.scene.dataset.indices.size() / 3
+              << " | clusters: " << model.scene.dataset.clusters.size() << std::endl;
 }
 
-bool drawPanel(ViewerModel& model, bool& clusterColors, const std::string& error)
+enum class ModelAction { None, Open, Save, Mock };
+
+ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds, int& boundsCluster,
+                      const std::string& status)
 {
-    bool openModel = false;
+    ModelAction action = ModelAction::None;
     ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f));
-    ImGui::SetNextWindowSize(ImVec2(248.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(330.0f, 0.0f));
     if (ImGui::Begin("Model", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
         ImGui::TextWrapped("%s", model.name.c_str());
-        ImGui::Text("Vertices: %zu", model.mesh.vertices.size());
-        ImGui::Text("Triangles: %zu", model.dataset.indices.size() / 3);
-        ImGui::Text("Clusters: %zu", model.dataset.clusters.size());
+        ImGui::Text("Vertices: %zu", model.scene.mesh.vertices.size());
+        ImGui::Text("Triangles: %zu", model.scene.dataset.indices.size() / 3);
+        ImGui::Text("Clusters: %zu", model.scene.dataset.clusters.size());
+        ImGui::Text("Triangles / cluster: <= %u", model.scene.maxTrianglesPerCluster);
         ImGui::Separator();
         ImGui::Checkbox("Cluster colors", &clusterColors);
+        ImGui::Checkbox("Cluster bounds", &showBounds);
+        if (showBounds) {
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##bounds", &boundsCluster, -1,
+                             static_cast<int>(model.scene.dataset.clusters.size() - 1), "Cluster %d");
+            ImGui::TextUnformatted("-1: all cluster bounds");
+        }
         if (ImGui::Button("Reset camera")) {
             model.camera.reset();
         }
 #ifdef _WIN32
+        if (ImGui::Button("Open OBJ / ACR...")) action = ModelAction::Open;
+        if (ImGui::Button("Save ACR...")) action = ModelAction::Save;
         ImGui::SameLine();
-        openModel = ImGui::Button("Open OBJ...");
 #endif
-        if (!error.empty()) {
+        if (ImGui::Button("Load mock")) action = ModelAction::Mock;
+        if (!status.empty()) {
             ImGui::Separator();
-            ImGui::TextWrapped("%s", error.c_str());
+            ImGui::TextWrapped("%s", status.c_str());
         }
     }
     ImGui::End();
-    return openModel;
+    return action;
 }
 
 #ifdef _WIN32
-std::filesystem::path chooseObjFile(GLFWwindow* window)
+std::filesystem::path chooseSceneFile(GLFWwindow* window, bool save)
 {
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = glfwGetWin32Window(window);
-    dialog.lpstrFilter = L"Wavefront OBJ (*.obj)\0*.obj\0";
+    dialog.lpstrFilter = save ? L"Cluster scene (*.acr)\0*.acr\0" :
+                               L"Scene (*.obj;*.acr)\0*.obj;*.acr\0";
     dialog.lpstrFile = path;
     dialog.nMaxFile = static_cast<DWORD>(sizeof(path) / sizeof(path[0]));
-    dialog.lpstrDefExt = L"obj";
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if (GetOpenFileNameW(&dialog)) {
+    dialog.lpstrDefExt = save ? L"acr" : L"obj";
+    dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER |
+                   (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    if (save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog)) {
         return path;
     }
 
@@ -234,11 +252,14 @@ std::filesystem::path chooseObjFile(GLFWwindow* window)
 
 } // namespace
 
-int runViewer(MeshSource mesh, std::string modelName)
+int runViewer(SceneData scene, std::string modelName, ViewerOptions options)
 {
-    auto model = makeModel(std::move(mesh), std::move(modelName));
+    auto model = makeModel(std::move(scene), std::move(modelName));
+    const auto smokeOriginal = options.smokeTest ? std::optional<SceneData>(model.scene) : std::nullopt;
+    const auto originalName = model.name;
     ViewerInput input;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    glfwWindowHint(GLFW_VISIBLE, options.smokeTest ? GLFW_FALSE : GLFW_TRUE);
     std::unique_ptr<GLFWwindow, decltype(&glfwDestroyWindow)> window(
         glfwCreateWindow(960, 640, "Adaptive Cluster Rendering", nullptr, nullptr), glfwDestroyWindow);
     if (!window) {
@@ -254,15 +275,35 @@ int runViewer(MeshSource mesh, std::string modelName)
     ViewerUi ui(window.get());
     VulkanRenderer renderer;
     renderer.initialize(window.get());
-    renderer.uploadMesh(model.mesh, model.dataset.indices);
+    renderer.uploadScene(model.scene);
+    if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(model.scene);
     showModelInfo(window.get(), model);
 
-    bool clusterColors = false;
-    std::string error;
+    bool clusterColors = options.clusterColors;
+    bool showBounds = options.showBounds;
+    int boundsCluster = -1;
+    std::string status;
+    unsigned frame = 0;
+    auto replaceModel = [&](SceneData replacement, const std::string& name) {
+        auto next = makeModel(std::move(replacement), name);
+        renderer.uploadScene(next.scene);
+        if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(next.scene);
+        model = std::move(next);
+        boundsCluster = -1;
+        showModelInfo(window.get(), model);
+    };
     while (!glfwWindowShouldClose(window.get())) {
         glfwPollEvents();
         if (glfwWindowShouldClose(window.get())) {
             break;
+        }
+        if (options.smokeTest && frame == 4) {
+            replaceModel(makeMockScene(), "Mock (4 clusters)");
+            clusterColors = true;
+            showBounds = true;
+        } else if (options.smokeTest && frame == 8) {
+            replaceModel(*smokeOriginal, originalName);
+            boundsCluster = 0;
         }
         if (!renderer.prepareFrame(window.get())) {
             input = {};
@@ -274,30 +315,42 @@ int runViewer(MeshSource mesh, std::string modelName)
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         updateCamera(input, model.camera);
-        const bool openModel = drawPanel(model, clusterColors, error);
+        const auto action = drawPanel(model, clusterColors, showBounds, boundsCluster, status);
         ImGui::Render();
-        renderer.drawFrame(model.camera, model.dataset, clusterColors, ImGui::GetDrawData());
+        if (renderer.drawFrame(model.camera, clusterColors, showBounds, boundsCluster, ImGui::GetDrawData())) ++frame;
+        if (options.smokeTest && frame >= 12) break;
 
-#ifdef _WIN32
-        if (openModel) {
+        if (action != ModelAction::None) {
             input = {};
             try {
-                const auto path = chooseObjFile(window.get());
-                if (!path.empty()) {
-                    auto replacement = makeModel(loadObj(path), path.filename().u8string());
-                    renderer.uploadMesh(replacement.mesh, replacement.dataset.indices);
-                    model = std::move(replacement);
-                    showModelInfo(window.get(), model);
-                    error.clear();
+                if (action == ModelAction::Mock) {
+                    replaceModel(makeMockScene(), "Mock (4 clusters)");
+                    status.clear();
                 }
+#ifdef _WIN32
+                else {
+                    const auto path = chooseSceneFile(window.get(), action == ModelAction::Save);
+                    if (!path.empty()) {
+                        if (action == ModelAction::Save) {
+                            saveScene(path, model.scene);
+                            status = "Saved " + path.filename().u8string();
+                            std::cout << "Saved scene: " << path.u8string() << std::endl;
+                        } else {
+                            replaceModel(loadScene(path), path.filename().u8string());
+                            status.clear();
+                        }
+                    }
+                }
+#endif
             } catch (const std::exception& failure) {
-                error = failure.what();
-                std::cerr << error << '\n';
+                status = failure.what();
+                std::cerr << status << '\n';
             }
         }
-#else
-        (void)openModel;
-#endif
+    }
+    if (options.smokeTest) {
+        if (frame < 12) throw std::runtime_error("GPU smoke test ended before all modes were submitted.");
+        std::cout << "GPU smoke passed: Draw All, cluster colors, SSBO bounds, scene replacement." << std::endl;
     }
     return 0;
 }

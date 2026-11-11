@@ -2,13 +2,14 @@
 #include <GLFW/glfw3.h>
 
 #include "MeshSource.h"
-#include "ObjLoader.h"
+#include "SceneData.h"
 #include "Viewer.h"
 
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -118,12 +119,58 @@ int wmain(int argc, wchar_t** argv)
 int main(int argc, char** argv)
 #endif
 {
-    const std::filesystem::path argument = argc == 2 ? std::filesystem::path(argv[1]) : std::filesystem::path{};
-    const bool checkEnvironment = argument == "--check-environment";
-    const bool useCube = argument == "--cube";
-    const bool loadFile = argc == 2 && !argument.empty() && argument.u8string().front() != '-';
-    if (argc != 1 && !checkEnvironment && !useCube && !loadFile) {
-        std::cerr << "Usage: AdaptiveClusterRendering [model.obj | --cube | --check-environment]\n";
+    const auto argument = [&](int i) { return std::filesystem::path(argv[i]); };
+    const auto usage = [] {
+        std::cout << "Usage: AdaptiveClusterRendering [model.obj | model.acr | --cube | --mock]\n"
+                     "       [--cluster-colors] [--bounds] [--verify-gpu] [--smoke-test]\n"
+                     "       --preprocess input.obj output.acr\n"
+                     "       --make-mock output.acr\n"
+                     "       --validate model.acr\n"
+                     "       --check-environment\n";
+    };
+    const bool checkEnvironment = argc == 2 && argument(1) == "--check-environment";
+    bool useCube = false, useMock = false;
+    std::filesystem::path inputPath;
+    ViewerOptions options;
+    try {
+        if (argc == 2 && argument(1) == "--help") { usage(); return 0; }
+        if (argc == 4 && argument(1) == "--preprocess") {
+            const auto scene = loadScene(argument(2));
+            saveScene(argument(3), scene);
+            std::cout << "Saved " << scene.dataset.clusters.size() << " clusters to " << argument(3).u8string() << '\n';
+            return 0;
+        }
+        if (argc == 3 && argument(1) == "--make-mock") {
+            saveScene(argument(2), makeMockScene());
+            std::cout << "Saved fixed 4-cluster mock scene.\n";
+            return 0;
+        }
+        if (argc == 3 && argument(1) == "--validate") {
+            const auto scene = loadScene(argument(2));
+            std::cout << "Scene validation passed: " << scene.mesh.vertices.size() << " vertices, "
+                      << scene.dataset.indices.size() / 3 << " triangles, " << scene.dataset.clusters.size()
+                      << " clusters.\n";
+            return 0;
+        }
+        if (!checkEnvironment) {
+            for (int i = 1; i < argc; ++i) {
+                const auto option = argument(i);
+                if (option == "--cluster-colors") options.clusterColors = true;
+                else if (option == "--bounds") options.showBounds = true;
+                else if (option == "--verify-gpu") options.verifyGpu = true;
+                else if (option == "--smoke-test") options.smokeTest = true;
+                else {
+                    if (useCube || useMock || !inputPath.empty()) throw std::runtime_error("Choose only one scene source.");
+                    if (option == "--cube") useCube = true;
+                    else if (option == "--mock") useMock = true;
+                    else if (!option.empty() && option.u8string().front() != '-') inputPath = option;
+                    else throw std::runtime_error("Unknown option: " + option.u8string());
+                }
+            }
+        }
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        usage();
         return 1;
     }
 
@@ -149,11 +196,13 @@ int main(int argc, char** argv)
     } else {
         try {
             if (useCube) {
-                exitCode = runViewer(makeCube(), "Cube");
+                exitCode = runViewer(buildScene(makeCube()), "Cube", options);
+            } else if (useMock) {
+                exitCode = runViewer(makeMockScene(), "Mock (4 clusters)", options);
             } else {
-                const auto path = loadFile ? argument :
+                const auto path = !inputPath.empty() ? inputPath :
                     std::filesystem::absolute(argv[0]).parent_path() / "assets" / "suzanne.obj";
-                exitCode = runViewer(loadObj(path), path.filename().u8string());
+                exitCode = runViewer(loadScene(path), path.filename().u8string(), options);
             }
         } catch (const std::exception& error) {
             std::cerr << error.what() << '\n';
