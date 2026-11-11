@@ -4,6 +4,15 @@ UPenn CIS 5650, Fall 2026, Group 16.
 
 A C++ and Vulkan renderer for experimenting with cluster-based geometry. The first milestone loads a static mesh, groups its triangles on the CPU, and displays the groups in a Vulkan viewer.
 
+## Presentations
+
+Presentation files are stored in the `presentations/` folder.
+
+- [Milestone 1](presentations/Milestone1.pptx) — November 11, 2026
+- Milestone 2 — Coming soon
+- Milestone 3 — Coming soon
+- Final Presentation — Coming soon
+
 ## Build on Windows
 
 - Visual Studio 2022 with **Desktop development with C++** and a Windows SDK
