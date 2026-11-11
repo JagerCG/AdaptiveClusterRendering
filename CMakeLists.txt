@@ -63,6 +63,8 @@ source_group("Generated Shaders" REGULAR_EXPRESSION "[.]inc$")
 add_library(acr_scene STATIC
     src/ClusterBuilder.cpp
     src/ClusterBuilder.h
+    src/QemClusterBuilder.cpp
+    src/QemClusterBuilder.h
     src/MeshSource.cpp
     src/MeshSource.h
     src/ObjLoader.cpp
@@ -116,7 +118,7 @@ option(ACR_ENABLE_GPU_TESTS "Run Vulkan smoke tests (requires a working GPU/wind
 if(BUILD_TESTING)
     add_executable(scene_tests tests/SceneTests.cpp)
     target_link_libraries(scene_tests PRIVATE acr_scene)
-    foreach(CASE IN ITEMS mock roundtrip real-model invalid-scene corrupt-file)
+    foreach(CASE IN ITEMS mock roundtrip real-model invalid-scene corrupt-file qem-guided)
         add_test(NAME scene-${CASE} COMMAND scene_tests ${CASE} "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
                  "${CMAKE_CURRENT_BINARY_DIR}/test-data/${CASE}")
     endforeach()
