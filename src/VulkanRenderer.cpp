@@ -3,6 +3,7 @@
 #include "ClusterBuilder.h"
 #include "MeshSource.h"
 #include "OrbitCamera.h"
+#include "SceneData.h"
 
 #include <GLFW/glfw3.h>
 #include <glm/common.hpp>
@@ -37,6 +38,12 @@ constexpr uint32_t kVertexShader[] = {
 };
 constexpr uint32_t kFragmentShader[] = {
 #include "mesh.frag.inc"
+};
+constexpr uint32_t kBoundsVertexShader[] = {
+#include "bounds.vert.inc"
+};
+constexpr uint32_t kBoundsFragmentShader[] = {
+#include "bounds.frag.inc"
 };
 
 void check(VkResult result, const char* operation)
@@ -86,12 +93,16 @@ VulkanRenderer::~VulkanRenderer()
         shutdownUi();
         destroySwapchain();
         vkDestroyPipeline(device_, pipeline_, nullptr);
+        vkDestroyPipeline(device_, boundsPipeline_, nullptr);
         vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+        vkDestroyDescriptorPool(device_, scenePool_, nullptr);
+        vkDestroyDescriptorSetLayout(device_, sceneLayout_, nullptr);
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         vkDestroyFence(device_, frameFence_, nullptr);
         vkDestroySemaphore(device_, imageAvailable_, nullptr);
         vkDestroyCommandPool(device_, commandPool_, nullptr);
         destroyBuffer(meshBuffer_);
+        destroyBuffer(clusterBuffer_);
         vkDestroyDevice(device_, nullptr);
     }
     if (surface_ != VK_NULL_HANDLE) {
@@ -319,8 +330,31 @@ void VulkanRenderer::createFrameResources()
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     check(vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailable_), "vkCreateSemaphore");
 
+    const VkDescriptorSetLayoutBinding clusterBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                                      VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo sceneLayout{};
+    sceneLayout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    sceneLayout.bindingCount = 1;
+    sceneLayout.pBindings = &clusterBinding;
+    check(vkCreateDescriptorSetLayout(device_, &sceneLayout, nullptr, &sceneLayout_), "vkCreateDescriptorSetLayout");
+    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    VkDescriptorPoolCreateInfo scenePool{};
+    scenePool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    scenePool.maxSets = 1;
+    scenePool.poolSizeCount = 1;
+    scenePool.pPoolSizes = &poolSize;
+    check(vkCreateDescriptorPool(device_, &scenePool, nullptr, &scenePool_), "vkCreateDescriptorPool");
+    VkDescriptorSetAllocateInfo descriptor{};
+    descriptor.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    descriptor.descriptorPool = scenePool_;
+    descriptor.descriptorSetCount = 1;
+    descriptor.pSetLayouts = &sceneLayout_;
+    check(vkAllocateDescriptorSets(device_, &descriptor, &sceneGpu_.clusterSet), "vkAllocateDescriptorSets");
+
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &sceneLayout_;
     const VkPushConstantRange ranges[] = {
         {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4)},
         {VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(glm::mat4), sizeof(glm::vec4)}
@@ -374,23 +408,33 @@ void VulkanRenderer::destroyBuffer(const Buffer& buffer)
     vkFreeMemory(device_, buffer.memory, nullptr);
 }
 
-void VulkanRenderer::uploadMesh(const MeshSource& mesh, const std::vector<uint32_t>& indices)
+void VulkanRenderer::uploadScene(const SceneData& scene)
 {
-    if (mesh.vertices.empty() || indices.empty() || indices.size() > std::numeric_limits<uint32_t>::max()) {
-        throw std::runtime_error("Mesh must contain vertices and a drawable index list.");
-    }
-
-    // The index list follows the vertices in the same buffer.
+    validateScene(scene);
+    const auto& mesh = scene.mesh;
+    const auto& indices = scene.dataset.indices;
+    const auto clusters = packClusters(scene.dataset);
+    auto drawClusters = scene.dataset.clusters;
     const size_t vertexBytes = mesh.vertices.size() * sizeof(Vertex);
     const size_t indexBytes = indices.size() * sizeof(uint32_t);
-    const VkDeviceSize bufferSize = vertexBytes + indexBytes;
-    const auto meshUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    const size_t meshBytes = vertexBytes + indexBytes;
+    const size_t clusterBytes = clusters.size() * sizeof(GpuClusterDesc);
+    const VkDeviceSize bufferSize = meshBytes + clusterBytes;
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(gpu_, &properties);
+    if (clusterBytes > properties.limits.maxStorageBufferRange) {
+        throw std::runtime_error("Cluster buffer exceeds this GPU's maxStorageBufferRange.");
+    }
+    const auto storageUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const auto meshUsage = storageUsage | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
     Buffer replacement;
+    Buffer replacementClusters;
     Buffer staging;
     try {
-        createBuffer(replacement, bufferSize, meshUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        createBuffer(replacement, meshBytes, meshUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        createBuffer(replacementClusters, clusterBytes, storageUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         const auto stagingMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         createBuffer(staging, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stagingMemory);
         void* mapped = nullptr;
@@ -398,6 +442,7 @@ void VulkanRenderer::uploadMesh(const MeshSource& mesh, const std::vector<uint32
         auto* bytes = static_cast<char*>(mapped);
         std::memcpy(bytes, mesh.vertices.data(), vertexBytes);
         std::memcpy(bytes + vertexBytes, indices.data(), indexBytes);
+        std::memcpy(bytes + meshBytes, clusters.data(), clusterBytes);
         vkUnmapMemory(device_, staging.memory);
 
         check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
@@ -405,19 +450,26 @@ void VulkanRenderer::uploadMesh(const MeshSource& mesh, const std::vector<uint32
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(commandBuffer_, &begin), "vkBeginCommandBuffer");
-        const VkBufferCopy copy{0, 0, bufferSize};
+        const VkBufferCopy copy{0, 0, meshBytes};
         vkCmdCopyBuffer(commandBuffer_, staging.handle, replacement.handle, 1, &copy);
+        const VkBufferCopy clusterCopy{meshBytes, 0, clusterBytes};
+        vkCmdCopyBuffer(commandBuffer_, staging.handle, replacementClusters.handle, 1, &clusterCopy);
 
-        VkBufferMemoryBarrier barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.buffer = replacement.handle;
-        barrier.size = bufferSize;
-        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
-                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+        VkBufferMemoryBarrier barriers[2]{};
+        for (auto& barrier : barriers) {
+            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.size = VK_WHOLE_SIZE;
+        }
+        barriers[0].buffer = replacement.handle;
+        barriers[0].dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+        barriers[1].buffer = replacementClusters.handle;
+        barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                             0, 0, nullptr, 2, barriers, 0, nullptr);
         check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
 
         VkSubmitInfo submit{};
@@ -429,13 +481,87 @@ void VulkanRenderer::uploadMesh(const MeshSource& mesh, const std::vector<uint32
     } catch (...) {
         destroyBuffer(staging);
         destroyBuffer(replacement);
+        destroyBuffer(replacementClusters);
         throw;
     }
     destroyBuffer(staging);
     destroyBuffer(meshBuffer_);
+    destroyBuffer(clusterBuffer_);
     meshBuffer_ = replacement;
-    indexOffset_ = vertexBytes;
-    indexCount_ = static_cast<uint32_t>(indices.size());
+    clusterBuffer_ = replacementClusters;
+    sceneGpu_.vertexBuffer = sceneGpu_.indexBuffer = meshBuffer_.handle;
+    sceneGpu_.clusterBuffer = clusterBuffer_.handle;
+    sceneGpu_.indexOffset = vertexBytes;
+    sceneGpu_.vertexCount = static_cast<uint32_t>(mesh.vertices.size());
+    sceneGpu_.indexCount = static_cast<uint32_t>(indices.size());
+    sceneGpu_.clusterCount = static_cast<uint32_t>(clusters.size());
+    drawClusters_ = std::move(drawClusters);
+    const VkDescriptorBufferInfo clusterInfo{clusterBuffer_.handle, 0, clusterBytes};
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = sceneGpu_.clusterSet;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &clusterInfo;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+}
+
+void VulkanRenderer::verifyUpload(const SceneData& scene)
+{
+    const auto clusters = packClusters(scene.dataset);
+    const size_t vertexBytes = scene.mesh.vertices.size() * sizeof(Vertex);
+    const size_t indexBytes = scene.dataset.indices.size() * sizeof(uint32_t);
+    const size_t meshBytes = vertexBytes + indexBytes;
+    const size_t clusterBytes = clusters.size() * sizeof(GpuClusterDesc);
+    if (sceneGpu_.vertexCount != scene.mesh.vertices.size() || sceneGpu_.indexCount != scene.dataset.indices.size() ||
+        sceneGpu_.clusterCount != clusters.size()) throw std::runtime_error("GPU scene counts do not match.");
+    check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
+    Buffer readback;
+    try {
+        createBuffer(readback, meshBytes + clusterBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(commandBuffer_, &begin), "vkBeginCommandBuffer");
+        VkMemoryBarrier before{};
+        before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &before, 0, nullptr, 0, nullptr);
+        const VkBufferCopy meshCopy{0, 0, meshBytes}, clusterCopy{0, meshBytes, clusterBytes};
+        vkCmdCopyBuffer(commandBuffer_, meshBuffer_.handle, readback.handle, 1, &meshCopy);
+        vkCmdCopyBuffer(commandBuffer_, clusterBuffer_.handle, readback.handle, 1, &clusterCopy);
+        VkMemoryBarrier after{};
+        after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &after, 0, nullptr, 0, nullptr);
+        check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commandBuffer_;
+        check(vkQueueSubmit(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
+        check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle");
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, readback.memory, 0, meshBytes + clusterBytes, 0, &mapped), "vkMapMemory");
+        const auto* bytes = static_cast<const char*>(mapped);
+        const bool equal = std::memcmp(bytes, scene.mesh.vertices.data(), vertexBytes) == 0 &&
+            std::memcmp(bytes + vertexBytes, scene.dataset.indices.data(), indexBytes) == 0 &&
+            std::memcmp(bytes + meshBytes, clusters.data(), clusterBytes) == 0;
+        vkUnmapMemory(device_, readback.memory);
+        if (!equal) throw std::runtime_error("GPU readback differs from the scene data.");
+    } catch (...) {
+        destroyBuffer(readback);
+        throw;
+    }
+    destroyBuffer(readback);
+    std::cout << "GPU readback passed: vertices, indices, clusters (48-byte stride)." << std::endl;
 }
 
 void VulkanRenderer::selectDepthFormat()
@@ -558,6 +684,8 @@ void VulkanRenderer::recreateSwapchain(int width, int height)
         shutdownUi();
         vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = VK_NULL_HANDLE;
+        vkDestroyPipeline(device_, boundsPipeline_, nullptr);
+        boundsPipeline_ = VK_NULL_HANDLE;
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         renderPass_ = VK_NULL_HANDLE;
         colorFormat_ = format.format;
@@ -746,6 +874,30 @@ void VulkanRenderer::createPipeline()
     vkDestroyShaderModule(device_, fragment, nullptr);
     vkDestroyShaderModule(device_, vertex, nullptr);
     check(result, "vkCreateGraphicsPipelines");
+
+    vertex = createShaderModule(device_, kBoundsVertexShader, sizeof(kBoundsVertexShader));
+    fragment = VK_NULL_HANDLE;
+    try {
+        fragment = createShaderModule(device_, kBoundsFragmentShader, sizeof(kBoundsFragmentShader));
+        stages[0].module = vertex;
+        stages[1].module = fragment;
+        vertexInput.vertexBindingDescriptionCount = 0;
+        vertexInput.vertexAttributeDescriptionCount = 0;
+        assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        depthTest.depthWriteEnable = VK_FALSE;
+        depthTest.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        rasterization.depthBiasEnable = VK_TRUE;
+        rasterization.depthBiasConstantFactor = -1.0f;
+        rasterization.depthBiasSlopeFactor = -1.0f;
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &boundsPipeline_),
+              "vkCreateGraphicsPipelines(bounds)");
+    } catch (...) {
+        vkDestroyShaderModule(device_, fragment, nullptr);
+        vkDestroyShaderModule(device_, vertex, nullptr);
+        throw;
+    }
+    vkDestroyShaderModule(device_, fragment, nullptr);
+    vkDestroyShaderModule(device_, vertex, nullptr);
 }
 
 void VulkanRenderer::destroySwapchain()
@@ -806,8 +958,8 @@ void VulkanRenderer::shutdownUi()
     uiMinImageCount_ = 0;
 }
 
-void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, const ClusterDataset& dataset,
-                                bool clusterColors, ImDrawData* ui)
+void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
+                                bool clusterColors, bool showBounds, int boundsCluster, ImDrawData* ui)
 {
     check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo begin{};
@@ -839,12 +991,11 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, 
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
                        sizeof(viewProjection), &viewProjection);
 
-    const VkDeviceSize vertexOffset = 0;
-    vkCmdBindVertexBuffers(commandBuffer_, 0, 1, &meshBuffer_.handle, &vertexOffset);
-    vkCmdBindIndexBuffer(commandBuffer_, meshBuffer_.handle, indexOffset_, VK_INDEX_TYPE_UINT32);
+    vkCmdBindVertexBuffers(commandBuffer_, 0, 1, &sceneGpu_.vertexBuffer, &sceneGpu_.vertexOffset);
+    vkCmdBindIndexBuffer(commandBuffer_, sceneGpu_.indexBuffer, sceneGpu_.indexOffset, VK_INDEX_TYPE_UINT32);
     if (clusterColors) {
-        for (uint32_t id = 0; id < dataset.clusters.size(); ++id) {
-            const Cluster& cluster = dataset.clusters[id];
+        for (uint32_t id = 0; id < drawClusters_.size(); ++id) {
+            const Cluster& cluster = drawClusters_[id];
             const glm::vec4 color = clusterColor(id);
             vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
                                sizeof(glm::mat4), sizeof(color), &color);
@@ -853,7 +1004,15 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, 
     } else {
         vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
                            sizeof(glm::mat4), sizeof(kShadedColor), &kShadedColor);
-        vkCmdDrawIndexed(commandBuffer_, indexCount_, 1, 0, 0, 0);
+        vkCmdDrawIndexed(commandBuffer_, sceneGpu_.indexCount, 1, 0, 0, 0);
+    }
+    if (showBounds) {
+        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundsPipeline_);
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
+                                0, 1, &sceneGpu_.clusterSet, 0, nullptr);
+        const bool selected = boundsCluster >= 0 && static_cast<uint32_t>(boundsCluster) < sceneGpu_.clusterCount;
+        vkCmdDraw(commandBuffer_, 24, selected ? 1u : sceneGpu_.clusterCount, 0,
+                  selected ? static_cast<uint32_t>(boundsCluster) : 0u);
     }
 
     ImGui_ImplVulkan_RenderDrawData(ui, commandBuffer_);
@@ -861,8 +1020,8 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, 
     check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
 }
 
-void VulkanRenderer::drawFrame(const OrbitCamera& camera, const ClusterDataset& dataset, bool clusterColors,
-                               ImDrawData* ui)
+bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bool showBounds,
+                               int boundsCluster, ImDrawData* ui)
 {
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
 
@@ -871,16 +1030,16 @@ void VulkanRenderer::drawFrame(const OrbitCamera& camera, const ClusterDataset& 
         device_, swapchain_, kAcquireTimeoutNs, imageAvailable_, VK_NULL_HANDLE, &imageIndex);
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
         rebuildSwapchain_ = true;
-        return;
+        return false;
     }
     if (acquire == VK_TIMEOUT) {
-        return;
+        return false;
     }
     if (acquire != VK_SUBOPTIMAL_KHR) {
         check(acquire, "vkAcquireNextImageKHR");
     }
 
-    recordDraw(imageIndex, camera, dataset, clusterColors, ui);
+    recordDraw(imageIndex, camera, clusterColors, showBounds, boundsCluster, ui);
     // Reset only when a submission will signal the fence again.
     check(vkResetFences(device_, 1, &frameFence_), "vkResetFences");
     const VkSemaphore renderFinished = swapchainImages_[imageIndex].renderFinished;
@@ -906,8 +1065,9 @@ void VulkanRenderer::drawFrame(const OrbitCamera& camera, const ClusterDataset& 
     const VkResult result = vkQueuePresentKHR(presentQueue_, &present);
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         rebuildSwapchain_ = true;
-        return;
+        return true;
     }
     check(result, "vkQueuePresentKHR");
     rebuildSwapchain_ = acquire == VK_SUBOPTIMAL_KHR;
+    return true;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include "SceneGpuData.h"
 
 #include <vector>
 
@@ -8,6 +9,7 @@ struct GLFWwindow;
 struct ClusterDataset;
 struct ImDrawData;
 struct MeshSource;
+struct SceneData;
 class OrbitCamera;
 
 class VulkanRenderer {
@@ -19,9 +21,11 @@ public:
     VulkanRenderer& operator=(const VulkanRenderer&) = delete;
 
     void initialize(GLFWwindow* window);
-    void uploadMesh(const MeshSource& mesh, const std::vector<uint32_t>& indices);
+    void uploadScene(const SceneData& scene);
+    void verifyUpload(const SceneData& scene);
+    const SceneGpuData& sceneGpuData() const { return sceneGpu_; }
     bool prepareFrame(GLFWwindow* window);
-    void drawFrame(const OrbitCamera& camera, const ClusterDataset& dataset, bool clusterColors, ImDrawData* ui);
+    bool drawFrame(const OrbitCamera& camera, bool clusterColors, bool showBounds, int boundsCluster, ImDrawData* ui);
 
 private:
     struct Buffer {
@@ -49,8 +53,8 @@ private:
     void destroySwapchain();
     void initializeUi(uint32_t minImageCount, uint32_t imageCount);
     void shutdownUi();
-    void recordDraw(uint32_t imageIndex, const OrbitCamera& camera, const ClusterDataset& dataset,
-                    bool clusterColors, ImDrawData* ui);
+    void recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
+                    bool clusterColors, bool showBounds, int boundsCluster, ImDrawData* ui);
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
@@ -69,6 +73,9 @@ private:
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline boundsPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout sceneLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool scenePool_ = VK_NULL_HANDLE;
     uint32_t uiImageCount_ = 0;
     uint32_t uiMinImageCount_ = 0;
     int framebufferWidth_ = 0;
@@ -81,8 +88,9 @@ private:
     VkImageView depthView_ = VK_NULL_HANDLE;
 
     Buffer meshBuffer_;
-    VkDeviceSize indexOffset_ = 0;
-    uint32_t indexCount_ = 0;
+    Buffer clusterBuffer_;
+    SceneGpuData sceneGpu_;
+    std::vector<Cluster> drawClusters_;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
