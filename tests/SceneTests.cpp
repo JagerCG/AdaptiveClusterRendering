@@ -1,8 +1,12 @@
 #include "SceneData.h"
 #include "ClusterGpu.h"
+#include "QemClusterBuilder.h"
+#include "ObjLoader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -76,6 +80,35 @@ int main(int argc, char** argv)
             expect(again.dataset.indices == scene.dataset.indices &&
                    again.dataset.clusters.size() == scene.dataset.clusters.size(), "Clustering is not deterministic.");
             validateScene(buildScene(scene.mesh, 128));
+        } else if (test == "qem-guided") {
+            const auto mesh = loadObj(argv[2]);
+            const auto baselineStart = std::chrono::steady_clock::now();
+            const auto baseline = buildClusters(mesh);
+            const auto baselineTime = std::chrono::steady_clock::now() - baselineStart;
+            const auto qemStart = std::chrono::steady_clock::now();
+            const auto qem = buildQemGuidedClusters(mesh);
+            const auto qemTime = std::chrono::steady_clock::now() - qemStart;
+            const auto repeated = buildQemGuidedClusters(mesh);
+            expect(qem.dataset.indices == repeated.dataset.indices &&
+                   qem.dataset.clusters.size() == repeated.dataset.clusters.size(),
+                   "QEM-guided clustering is not deterministic.");
+            expect(qem.dataset.clusters.size() == baseline.clusters.size(),
+                   "QEM-guided grouping changed the cluster count for the same capacity.");
+            validateScene(SceneData{mesh, qem.dataset, 64});
+            const auto baselineError = measureQemInternalEdgeError(mesh, baseline);
+            expect(qem.errorStats.internalAdjacencyCount > 0 && baselineError.internalAdjacencyCount > 0,
+                   "Expected Suzanne clusters to contain adjacent triangle pairs.");
+            expect(qem.errorStats.meanInternalEdgeError ==
+                       measureQemInternalEdgeError(mesh, qem.dataset).meanInternalEdgeError,
+                   "QEM grouping reported inconsistent internal-edge error.");
+            const auto baselineMs = std::chrono::duration<double, std::milli>(baselineTime).count();
+            const auto qemMs = std::chrono::duration<double, std::milli>(qemTime).count();
+            std::cout << std::fixed << std::setprecision(3)
+                      << "baseline clusters=" << baseline.clusters.size() << " build_ms=" << baselineMs
+                      << " mean_internal_QEM_error=" << baselineError.meanInternalEdgeError << '\n'
+                      << "QEM clusters=" << qem.dataset.clusters.size() << " build_ms=" << qemMs
+                      << " mean_internal_QEM_error=" << qem.errorStats.meanInternalEdgeError << '\n'
+                      << "Geometry is unchanged; geometric deviation is zero by construction.\n";
         } else if (test == "invalid-scene") {
             auto damaged = mock;
             damaged.dataset.indices[0] = 99999;
