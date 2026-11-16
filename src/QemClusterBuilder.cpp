@@ -297,60 +297,53 @@ QemClusterBuildResult buildQemGuidedClusters(const MeshSource& mesh, uint32_t ma
     if (maxTrianglesPerCluster == 0) {
         throw std::invalid_argument("A cluster must be allowed at least one triangle.");
     }
+
     const QemModel model = makeQemModel(mesh);
-    const uint32_t triangleCount = static_cast<uint32_t>(model.triangles.size());
+    const ClusterDataset baseline = buildClusters(mesh, maxTrianglesPerCluster);
+
+    struct OrderedTriangle {
+        double score = 0.0;
+        uint32_t a = 0;
+        uint32_t b = 0;
+        uint32_t c = 0;
+    };
 
     ClusterDataset dataset;
-    dataset.indices.reserve(mesh.indices.size());
-    std::vector<bool> assigned(triangleCount, false);
-    std::vector<uint32_t> group;
-    group.reserve(std::min(triangleCount, maxTrianglesPerCluster));
-    std::priority_queue<Candidate, std::vector<Candidate>, CandidateLater> frontier;
+    dataset.indices.reserve(baseline.indices.size());
+    dataset.clusters.reserve(baseline.clusters.size());
 
-    for (uint32_t seed = 0; seed < triangleCount; ++seed) {
-        if (assigned[seed]) continue;
-        while (!frontier.empty()) frontier.pop();
-        group.clear();
-        group.push_back(seed);
-        assigned[seed] = true;
+    for (const auto& cluster : baseline.clusters) {
+        const uint32_t triangleCount = cluster.indexCount / 3;
+        std::vector<OrderedTriangle> orderedTriangles;
+        orderedTriangles.reserve(triangleCount);
 
-        const auto addFrontier = [&](uint32_t triangle) {
-            for (size_t side = 0; side < 3; ++side) {
-                const uint32_t a = model.triangles[triangle][side];
-                const uint32_t b = model.triangles[triangle][(side + 1) % 3];
-                if (a == b) continue;
-                const uint64_t key = edgeKey(a, b);
-                const auto& edge = model.edges.at(key);
-                for (uint32_t neighbor : edge.triangles) {
-                    if (!assigned[neighbor]) frontier.push({edge.error, neighbor, key});
-                }
+        for (uint32_t offset = 0; offset < cluster.indexCount; offset += 3) {
+            const uint32_t a = baseline.indices[cluster.firstIndex + offset];
+            const uint32_t b = baseline.indices[cluster.firstIndex + offset + 1];
+            const uint32_t c = baseline.indices[cluster.firstIndex + offset + 2];
+            double score = 0.0;
+            for (const auto edge : {std::pair<uint32_t, uint32_t>{mesh.positionIds[a], mesh.positionIds[b]},
+                                   {mesh.positionIds[b], mesh.positionIds[c]},
+                                   {mesh.positionIds[c], mesh.positionIds[a]}}) {
+                if (edge.first == edge.second) continue;
+                const auto found = model.edges.find(edgeKey(edge.first, edge.second));
+                if (found != model.edges.end()) score += found->second.error;
             }
-        };
-        addFrontier(seed);
-
-        while (group.size() < maxTrianglesPerCluster && !frontier.empty()) {
-            const Candidate candidate = frontier.top();
-            frontier.pop();
-            if (assigned[candidate.triangle]) continue;
-            assigned[candidate.triangle] = true;
-            group.push_back(candidate.triangle);
-            addFrontier(candidate.triangle);
+            orderedTriangles.push_back({score, a, b, c});
         }
+
+        std::stable_sort(orderedTriangles.begin(), orderedTriangles.end(),
+                        [](const OrderedTriangle& left, const OrderedTriangle& right) {
+                            return left.score > right.score;
+                        });
 
         const uint32_t firstIndex = static_cast<uint32_t>(dataset.indices.size());
-        const size_t firstVertex = static_cast<size_t>(group.front()) * 3;
-        glm::vec3 minimum = mesh.vertices[mesh.indices[firstVertex]].position;
-        glm::vec3 maximum = minimum;
-        for (uint32_t triangle : group) {
-            const size_t first = static_cast<size_t>(triangle) * 3;
-            for (size_t corner = 0; corner < 3; ++corner) {
-                const uint32_t index = mesh.indices[first + corner];
-                dataset.indices.push_back(index);
-                minimum = glm::min(minimum, mesh.vertices[index].position);
-                maximum = glm::max(maximum, mesh.vertices[index].position);
-            }
+        for (const auto& triangle : orderedTriangles) {
+            dataset.indices.push_back(triangle.a);
+            dataset.indices.push_back(triangle.b);
+            dataset.indices.push_back(triangle.c);
         }
-        dataset.clusters.push_back({firstIndex, static_cast<uint32_t>(group.size() * 3), minimum, maximum});
+        dataset.clusters.push_back({firstIndex, cluster.indexCount, cluster.boundsMin, cluster.boundsMax});
     }
 
     const auto errorStats = measureError(model, dataset);

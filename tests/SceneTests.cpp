@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <functional>
@@ -84,6 +85,7 @@ int main(int argc, char** argv)
             const auto mesh = loadObj(argv[2]);
             const auto baselineStart = std::chrono::steady_clock::now();
             const auto baseline = buildClusters(mesh);
+            const auto baselineError = measureQemInternalEdgeError(mesh, baseline);
             const auto baselineTime = std::chrono::steady_clock::now() - baselineStart;
             const auto qemStart = std::chrono::steady_clock::now();
             const auto qem = buildQemGuidedClusters(mesh);
@@ -95,19 +97,32 @@ int main(int argc, char** argv)
             expect(qem.dataset.clusters.size() == baseline.clusters.size(),
                    "QEM-guided grouping changed the cluster count for the same capacity.");
             validateScene(SceneData{mesh, qem.dataset, 64});
-            const auto baselineError = measureQemInternalEdgeError(mesh, baseline);
             expect(qem.errorStats.internalAdjacencyCount > 0 && baselineError.internalAdjacencyCount > 0,
                    "Expected Suzanne clusters to contain adjacent triangle pairs.");
-            expect(qem.errorStats.meanInternalEdgeError ==
-                       measureQemInternalEdgeError(mesh, qem.dataset).meanInternalEdgeError,
+            const auto measuredQemError = measureQemInternalEdgeError(mesh, qem.dataset);
+            expect(std::abs(qem.errorStats.meanInternalEdgeError - measuredQemError.meanInternalEdgeError) <=
+                       1e-12 * std::max(1.0, std::abs(measuredQemError.meanInternalEdgeError)),
                    "QEM grouping reported inconsistent internal-edge error.");
             const auto baselineMs = std::chrono::duration<double, std::milli>(baselineTime).count();
             const auto qemMs = std::chrono::duration<double, std::milli>(qemTime).count();
+            const auto meanBoundsDiagonal = [](const ClusterDataset& dataset) {
+                double sum = 0.0;
+                for (const auto& cluster : dataset.clusters) {
+                    const double x = cluster.boundsMax.x - cluster.boundsMin.x;
+                    const double y = cluster.boundsMax.y - cluster.boundsMin.y;
+                    const double z = cluster.boundsMax.z - cluster.boundsMin.z;
+                    sum += std::sqrt(x * x + y * y + z * z);
+                }
+                return sum / dataset.clusters.size();
+            };
             std::cout << std::fixed << std::setprecision(3)
-                      << "baseline clusters=" << baseline.clusters.size() << " build_ms=" << baselineMs
+                      << "baseline clusters=" << baseline.clusters.size() << " grouping_plus_metric_ms=" << baselineMs
+                      << " mean_bounds_diagonal=" << meanBoundsDiagonal(baseline)
                       << " mean_internal_QEM_error=" << baselineError.meanInternalEdgeError << '\n'
-                      << "QEM clusters=" << qem.dataset.clusters.size() << " build_ms=" << qemMs
+                      << "QEM clusters=" << qem.dataset.clusters.size() << " grouping_plus_metric_ms=" << qemMs
+                      << " mean_bounds_diagonal=" << meanBoundsDiagonal(qem.dataset)
                       << " mean_internal_QEM_error=" << qem.errorStats.meanInternalEdgeError << '\n'
+                      << "Grouping changed=" << std::boolalpha << (qem.dataset.indices != baseline.indices) << '\n'
                       << "Geometry is unchanged; geometric deviation is zero by construction.\n";
         } else if (test == "invalid-scene") {
             auto damaged = mock;

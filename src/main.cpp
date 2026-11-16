@@ -5,6 +5,7 @@
 #include "SceneData.h"
 #include "Viewer.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -123,6 +124,7 @@ int main(int argc, char** argv)
     const auto usage = [] {
         std::cout << "Usage: AdaptiveClusterRendering [model.obj | model.acr | --cube | --mock]\n"
                      "       [--cluster-colors] [--bounds] [--verify-gpu] [--smoke-test]\n"
+                     "       [--lod] [--lod-error value] [--cull] [--cull-mode distance|frustum]\n"
                      "       --preprocess input.obj output.acr\n"
                      "       --make-mock output.acr\n"
                      "       --validate model.acr\n"
@@ -159,7 +161,20 @@ int main(int argc, char** argv)
                 else if (option == "--bounds") options.showBounds = true;
                 else if (option == "--verify-gpu") options.verifyGpu = true;
                 else if (option == "--smoke-test") options.smokeTest = true;
-                else {
+                else if (option == "--lod") options.lodEnabled = true;
+                else if (option == "--cull") options.cullingEnabled = true;
+                else if (option == "--lod-error") {
+                    if (i + 1 >= argc) throw std::runtime_error("--lod-error requires a float value.");
+                    options.lodError = static_cast<float>(std::strtod(argument(++i).u8string().c_str(), nullptr));
+                    options.lodEnabled = true;
+                } else if (option == "--cull-mode") {
+                    if (i + 1 >= argc) throw std::runtime_error("--cull-mode requires a value.");
+                    const auto mode = argument(++i).u8string();
+                    if (mode == "frustum") options.cullingMode = 0;
+                    else if (mode == "distance") options.cullingMode = 1;
+                    else throw std::runtime_error("Unknown culling mode: " + mode);
+                    options.cullingEnabled = true;
+                } else {
                     if (useCube || useMock || !inputPath.empty()) throw std::runtime_error("Choose only one scene source.");
                     if (option == "--cube") useCube = true;
                     else if (option == "--mock") useMock = true;

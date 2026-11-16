@@ -9,6 +9,13 @@ struct ViewerOptions {
     bool showBounds = false;
     bool verifyGpu = false;
     bool smokeTest = false; // hidden, bounded run with scene replacement and all draw modes
+    bool lodEnabled = false;
+    bool cullingEnabled = false;
+    float lodError = 0.35f;
+    int cullingMode = 1; // 0 = frustum, 1 = distance-based culling
+    bool shadowsEnabled = false;
+    bool shadowMapView = false;
+    float shadowBias = 0.02f;
 };
 
 int runViewer(SceneData scene, std::string modelName, ViewerOptions options = {});
