@@ -42,7 +42,7 @@ target_link_libraries(imgui PRIVATE glfw Vulkan::Vulkan)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>")
 set(SHADER_SOURCES)
 set(COMPILED_SHADERS)
-foreach(SHADER IN ITEMS mesh.vert mesh.frag bounds.vert bounds.frag)
+foreach(SHADER IN ITEMS mesh.vert mesh.frag shadow.vert shadow.frag bounds.vert bounds.frag)
     set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}")
     set(SHADER_OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER}.inc")
     add_custom_command(

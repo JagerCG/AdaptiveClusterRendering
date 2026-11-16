@@ -40,6 +40,17 @@ void OrbitCamera::reset()
     pitch_ = std::asin(kInitialDirection.y / glm::length(kInitialDirection));
 }
 
+glm::vec3 OrbitCamera::eyePosition() const
+{
+    const float horizontal = std::cos(pitch_);
+    const glm::vec3 direction{
+        horizontal * std::sin(yaw_),
+        std::sin(pitch_),
+        horizontal * std::cos(yaw_)
+    };
+    return target_ + distance_ * direction;
+}
+
 glm::mat4 OrbitCamera::viewProjection(float aspectRatio) const
 {
     const float horizontal = std::cos(pitch_);

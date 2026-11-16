@@ -186,7 +186,9 @@ void showModelInfo(GLFWwindow* window, const ViewerModel& model)
 enum class ModelAction { None, Open, Save, Mock };
 
 ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds, int& boundsCluster,
-                      const std::string& status)
+                      bool& lodEnabled, bool& cullingEnabled, float& lodError, int& cullingMode,
+                      bool& shadowsEnabled, bool& shadowMapView, float& shadowBias,
+                      bool& wireframe, bool& depthDisplay, int& drawMode, const std::string& status)
 {
     ModelAction action = ModelAction::None;
     ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f));
@@ -200,11 +202,39 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
         ImGui::Separator();
         ImGui::Checkbox("Cluster colors", &clusterColors);
         ImGui::Checkbox("Cluster bounds", &showBounds);
+        ImGui::Checkbox("Wireframe", &wireframe);
+        ImGui::Checkbox("Depth view", &depthDisplay);
+        const char* drawModes[] = {"All", "Subset", "Empty"};
+        ImGui::Combo("Raster mode", &drawMode, drawModes, IM_ARRAYSIZE(drawModes));
+        if (drawMode == 1) {
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##bounds", &boundsCluster, 0,
+                             static_cast<int>(std::max<size_t>(1, model.scene.dataset.clusters.size()) - 1),
+                             "Cluster %d");
+        }
+        ImGui::Separator();
+        ImGui::Checkbox("LOD selection", &lodEnabled);
+        if (lodEnabled) {
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("LOD error", &lodError, 0.05f, 1.5f, "%.2f");
+        }
+        ImGui::Checkbox("Visibility culling", &cullingEnabled);
+        if (cullingEnabled) {
+            ImGui::SetNextItemWidth(-1);
+            const char* modes[] = {"Frustum", "Distance"};
+            ImGui::Combo("Cull mode", &cullingMode, modes, IM_ARRAYSIZE(modes));
+        }
         if (showBounds) {
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderInt("##bounds", &boundsCluster, -1,
+            ImGui::SliderInt("##boundsAll", &boundsCluster, -1,
                              static_cast<int>(model.scene.dataset.clusters.size() - 1), "Cluster %d");
             ImGui::TextUnformatted("-1: all cluster bounds");
+        }
+        ImGui::Separator();
+        ImGui::Checkbox("Shadows", &shadowsEnabled);
+        if (shadowsEnabled) {
+            ImGui::Checkbox("Shadow map view", &shadowMapView);
+            ImGui::SliderFloat("Shadow bias", &shadowBias, 0.0f, 0.08f, "%.3f");
         }
         if (ImGui::Button("Reset camera")) {
             model.camera.reset();
@@ -282,6 +312,16 @@ int runViewer(SceneData scene, std::string modelName, ViewerOptions options)
     bool clusterColors = options.clusterColors;
     bool showBounds = options.showBounds;
     int boundsCluster = -1;
+    bool lodEnabled = options.lodEnabled;
+    bool cullingEnabled = options.cullingEnabled;
+    float lodError = options.lodError;
+    int cullingMode = options.cullingMode;
+    bool shadowsEnabled = options.shadowsEnabled;
+    bool shadowMapView = options.shadowMapView;
+    float shadowBias = options.shadowBias;
+    bool wireframe = false;
+    bool depthDisplay = false;
+    int drawMode = 0;
     std::string status;
     unsigned frame = 0;
     auto replaceModel = [&](SceneData replacement, const std::string& name) {
@@ -315,9 +355,17 @@ int runViewer(SceneData scene, std::string modelName, ViewerOptions options)
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         updateCamera(input, model.camera);
-        const auto action = drawPanel(model, clusterColors, showBounds, boundsCluster, status);
+        const auto action = drawPanel(model, clusterColors, showBounds, boundsCluster,
+                                      lodEnabled, cullingEnabled, lodError, cullingMode,
+                                      shadowsEnabled, shadowMapView, shadowBias,
+                                      wireframe, depthDisplay, drawMode, status);
         ImGui::Render();
-        if (renderer.drawFrame(model.camera, clusterColors, showBounds, boundsCluster, ImGui::GetDrawData())) ++frame;
+        if (renderer.drawFrame(model.camera, clusterColors, showBounds, boundsCluster,
+                              lodEnabled, cullingEnabled, lodError, cullingMode,
+                              shadowsEnabled, shadowMapView, shadowBias,
+                              wireframe, depthDisplay, drawMode, ImGui::GetDrawData())) {
+            ++frame;
+        }
         if (options.smokeTest && frame >= 12) break;
 
         if (action != ModelAction::None) {

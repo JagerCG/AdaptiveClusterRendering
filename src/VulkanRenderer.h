@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include "SceneGpuData.h"
 
+#include <glm/mat4x4.hpp>
 #include <vector>
 
 struct GLFWwindow;
@@ -25,7 +26,10 @@ public:
     void verifyUpload(const SceneData& scene);
     const SceneGpuData& sceneGpuData() const { return sceneGpu_; }
     bool prepareFrame(GLFWwindow* window);
-    bool drawFrame(const OrbitCamera& camera, bool clusterColors, bool showBounds, int boundsCluster, ImDrawData* ui);
+    bool drawFrame(const OrbitCamera& camera, bool clusterColors, bool showBounds, int boundsCluster,
+                   bool lodEnabled, bool cullingEnabled, float lodError, int cullingMode,
+                   bool shadowsEnabled, bool shadowMapView, float shadowBias,
+                   bool wireframe, bool depthDisplay, int drawMode, ImDrawData* ui);
 
 private:
     struct Buffer {
@@ -54,7 +58,14 @@ private:
     void initializeUi(uint32_t minImageCount, uint32_t imageCount);
     void shutdownUi();
     void recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
-                    bool clusterColors, bool showBounds, int boundsCluster, ImDrawData* ui);
+                    bool clusterColors, bool showBounds, int boundsCluster,
+                    bool shadowsEnabled, bool shadowMapView, float shadowBias,
+                    bool wireframe, bool depthDisplay, int drawMode, ImDrawData* ui);
+    void createShadowResources();
+    void destroyShadowResources();
+    void createShadowRenderPass();
+    void createShadowPipeline();
+    glm::mat4 buildShadowViewProjection(const OrbitCamera& camera) const;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
@@ -71,11 +82,22 @@ private:
     VkExtent2D extent_{};
     std::vector<SwapchainImage> swapchainImages_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
+    VkRenderPass shadowRenderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline wireframePipeline_ = VK_NULL_HANDLE;
     VkPipeline boundsPipeline_ = VK_NULL_HANDLE;
+    VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout sceneLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout shadowLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool scenePool_ = VK_NULL_HANDLE;
+    VkDescriptorSet shadowSet_ = VK_NULL_HANDLE;
+    VkImage shadowImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory shadowMemory_ = VK_NULL_HANDLE;
+    VkImageView shadowView_ = VK_NULL_HANDLE;
+    VkSampler shadowSampler_ = VK_NULL_HANDLE;
+    VkFramebuffer shadowFramebuffer_ = VK_NULL_HANDLE;
+    uint32_t shadowMapSize_ = 1024;
     uint32_t uiImageCount_ = 0;
     uint32_t uiMinImageCount_ = 0;
     int framebufferWidth_ = 0;
@@ -90,6 +112,7 @@ private:
     Buffer meshBuffer_;
     Buffer clusterBuffer_;
     SceneGpuData sceneGpu_;
+    std::vector<Cluster> sourceClusters_;
     std::vector<Cluster> drawClusters_;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;

@@ -22,16 +22,16 @@ Presentation files are stored in the `presentations/` folder.
 Open a new PowerShell after installing the Vulkan SDK. From the repository root:
 
 ```powershell
-cmake --preset windows-vs2022
+cmake --preset windows-ninja
 cmake --build --preset debug
-.\build\Debug\AdaptiveClusterRendering.exe
+.\build-ninja\AdaptiveClusterRendering.exe
 ```
 
-CMake downloads the pinned dependencies on the first configure, compiles the shaders, and places Suzanne next to the executable. Build files and downloaded dependencies are kept in `build/`.
+CMake downloads the pinned dependencies on the first configure, compiles the shaders, and places Suzanne next to the executable. This preset uses Ninja with the MSVC toolchain; build files and downloaded dependencies are kept in `build-ninja/`.
 
-To run from Visual Studio, open `build/AdaptiveClusterRendering.sln` and select **Debug / x64**. If `ALL_BUILD` is selected for startup, right-click `AdaptiveClusterRendering` in Solution Explorer and choose **Set as Startup Project**. Press **F5** to run.
+This Ninja preset does not generate a Visual Studio solution. Open the repository folder in VS Code with the CMake Tools extension to configure and run the project.
 
-Use `cmake --build --preset release` to build the Release version in `build/Release/`.
+Use `cmake --build --preset release` to build the Release version in `build-ninja-release/`.
 
 ## M1 demo
 
@@ -47,7 +47,7 @@ Use `cmake --build --preset release` to build the Release version in `build/Rele
 You can also pass an OBJ path on startup:
 
 ```powershell
-.\build\Debug\AdaptiveClusterRendering.exe "C:\path\to\model.obj"
+.\build-ninja\AdaptiveClusterRendering.exe "C:\path\to\model.obj"
 ```
 
 Use `--cube` for the built-in cube or `--check-environment` to list available Vulkan devices and validation-layer support.
@@ -55,16 +55,16 @@ Use `--cube` for the built-in cube or `--check-environment` to list available Vu
 For the fixed mock with colors and bounds already enabled:
 
 ```powershell
-.\build\Debug\AdaptiveClusterRendering.exe --mock --cluster-colors --bounds
+.\build-ninja\AdaptiveClusterRendering.exe --mock --cluster-colors --bounds
 ```
 
 Preprocess and validate without creating a Vulkan device or a window:
 
 ```powershell
-.\build\Debug\AdaptiveClusterRendering.exe --preprocess assets/suzanne.obj build/suzanne.acr
-.\build\Debug\AdaptiveClusterRendering.exe --validate build/suzanne.acr
-.\build\Debug\AdaptiveClusterRendering.exe --make-mock build/mock.acr
-.\build\Debug\AdaptiveClusterRendering.exe build/suzanne.acr --verify-gpu
+.\build-ninja\AdaptiveClusterRendering.exe --preprocess assets/suzanne.obj build-ninja/suzanne.acr
+.\build-ninja\AdaptiveClusterRendering.exe --validate build-ninja/suzanne.acr
+.\build-ninja\AdaptiveClusterRendering.exe --make-mock build-ninja/mock.acr
+.\build-ninja\AdaptiveClusterRendering.exe build-ninja/suzanne.acr --verify-gpu
 ```
 
 `--verify-gpu` reads the uploaded vertices, indices and cluster records back and compares them byte-for-byte. It is a debugging option, not part of performance measurements. Scene files use the versioned `.acr` format documented in [the M1 interface contract](docs/milestone-1-interface.md); they are not a general-purpose asset format or compatible with other repositories' binary caches.
@@ -72,21 +72,22 @@ Preprocess and validate without creating a Vulkan device or a window:
 ## Validation
 
 ```powershell
-cmake --preset windows-vs2022 -DACR_ENABLE_GPU_TESTS=ON
+cmake --preset windows-ninja -DACR_ENABLE_GPU_TESTS=ON
 cmake --build --preset debug
-ctest --test-dir build -C Debug --output-on-failure
+ctest --test-dir build-ninja --output-on-failure
 ```
 
-CPU tests cover the fixed mock, lossless roundtrip, real OBJ geometry, deterministic clustering, invalid scene data, and malformed/version-mismatched files. Optional GPU tests run hidden windows, verify uploads, replace real/mock scenes, and submit Draw All, cluster color, all-bounds and selected-bounds draws. The GPU tests need a working Vulkan window system. They fail on validation warnings/errors; use **Debug** and install the Khronos validation layer to obtain that coverage. `ACR_ENABLE_GPU_TESTS` is off by default on other machines.
+CPU tests cover the fixed mock, lossless roundtrip, real OBJ geometry, deterministic clustering, invalid scene data, malformed/version-mismatched files, and the QEM-guided grouping prototype. The `scene-qem-guided` case prints a baseline comparison of elapsed grouping-plus-metric time, mean bounds diagonal, and mean internal-edge QEM error; since grouping preserves all triangles, geometric deviation is zero by construction. Optional GPU tests run hidden windows, verify uploads, replace real/mock scenes, and submit Draw All, cluster color, all-bounds and selected-bounds draws. The GPU tests need a working Vulkan window system. They fail on validation warnings/errors; use **Debug** and install the Khronos validation layer to obtain that coverage. `ACR_ENABLE_GPU_TESTS` is off by default on other machines.
 
-For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-failure`. The cached-scene preprocessing test is also CPU-only. No FPS or GPU speedup is asserted by these checks.
+For the CPU tests only: `ctest --test-dir build-ninja -LE gpu --output-on-failure`. The cached-scene preprocessing test is also CPU-only. No FPS or GPU speedup is asserted by these checks.
 
 ## Source layout
 
 | File | Responsibility |
 | --- | --- |
 | `src/ObjLoader.cpp`, `src/MeshSource.h` | Read OBJ positions, normals and UVs into an indexed mesh. Supply a face normal for corners that lack one. |
-| `src/ClusterBuilder.cpp` | Group edge-connected triangles on the CPU. Each cluster has at most 64 triangles, a contiguous index range, and a model-space bounding box. |
+| `src/ClusterBuilder.cpp` | Production M1 grouping: edge-connected triangles, at most 64 per cluster, contiguous index ranges, and model-space bounds. |
+| `src/QemClusterBuilder.cpp` | Experimental QEM-guided grouping and comparison metrics. It changes cluster membership only; it does not simplify or alter geometry. |
 | `src/SceneData.*` | Shared scene handoff, fixed mock, strict validation, OBJ/ACR loading, and versioned persistence. |
 | `src/ClusterGpu.h`, `src/SceneGpuData.h` | Explicit 48-byte std430 cluster records and the non-owning GPU scene view. |
 | `src/VulkanRenderer.cpp`, `shaders/` | Upload geometry and cluster descriptors; depth-tested mesh and SSBO-driven bounds. In cluster color mode, draw each index range with its own color. |

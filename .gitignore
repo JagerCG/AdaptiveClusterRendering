@@ -1,6 +1,23 @@
 /build/
+/build-ninja/
+/build-*/
 /.vs/
 /.idea/
 /CMakeUserPresets.json
 *.user
 *.suo
+
+# Local compiler outputs accidentally emitted at the repository root.
+/*.obj
+/*.o
+/*.pdb
+/*.ilk
+/*.exe
+/*.dll
+/*.lib
+
+# Editor and operating-system metadata.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
