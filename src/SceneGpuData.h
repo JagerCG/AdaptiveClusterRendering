@@ -11,16 +11,28 @@ static_assert(sizeof(Vertex) == 32 && offsetof(Vertex, normal) == 12 && offsetof
 // Last successful upload; excludes verifyUpload() readback and rendering.
 struct SceneUploadStats {
     ScenePayloadBytes payload;
-    uint64_t residentAllocationBytes = 0; // mesh + clusters, incl. alignment; excludes staging
+    uint64_t residentAllocationBytes = 0; // all geometry and hierarchy, incl. alignment; excludes staging
     double cpuUploadMs = 0.0; // validation, packing, allocation, staging, submission + wait
     std::optional<double> gpuTransferMs; // GPU timestamps around the two buffer copies
+};
+
+// All levels share the vertex array. Bind the cluster storage buffer at zero;
+// the three metadata offsets below are in 32-bit words. LodLevel / LodNode are
+// std430 records. Traversal uses absolute node/cluster IDs and index ranges.
+struct ResidentHierarchy {
+    VkDeviceSize allIndexOffset = 0;
+    uint32_t totalIndices = 0, totalClusters = 0;
+    uint32_t levelWord = 0, nodeWord = 0, childWord = 0;
+    uint32_t levelCount = 0, nodeCount = 0, childCount = 0;
 };
 
 // Non-owning view. VulkanRenderer owns these fully resident resources. Handles
 // remain valid until the next successful uploadScene() or renderer destruction.
 // Vertex and index views may share an allocation; offsets must be respected.
 struct SceneGpuData {
-    SceneRevision sceneRevision = 0; // increments on every successful source upload
+    SceneRevision sceneRevision = 0; // active partition identity, including manual level changes
+    ResidentHierarchy hierarchy;
+    uint32_t activeLevel = 0, firstCluster = 0; // local draw IDs + firstCluster = absolute IDs
     VkBuffer vertexBuffer = VK_NULL_HANDLE;
     VkBuffer indexBuffer = VK_NULL_HANDLE;
     VkBuffer clusterBuffer = VK_NULL_HANDLE;

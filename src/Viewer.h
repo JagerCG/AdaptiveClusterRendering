@@ -11,6 +11,7 @@ struct LoadedScene;
 struct ViewerOptions {
     RenderSettings renderSettings;
     bool renderSmoke = false;
+    uint32_t geometryLevel = 0;
     bool clusterColors = false;
     bool showBounds = false;
     bool verifyGpu = false;
@@ -25,6 +26,7 @@ struct ViewerOptions {
     std::filesystem::path reportDirectory; // interactive exports
     bool smokeTest = false; // hidden, bounded run with scene replacement and all draw modes
     std::filesystem::path smokeRoundtripPath; // optional on-disk save/mock/reload verification
+    std::filesystem::path hierarchyRoundtripPath;
 };
 
 int runViewer(LoadedScene loaded, ViewerOptions options = {});

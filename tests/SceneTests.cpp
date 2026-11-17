@@ -143,14 +143,18 @@ int main(int argc, char** argv)
             expect(saved.fileBytes == 1216 && saved.fileBytes == std::filesystem::file_size(path),
                    "ACR v1 file bytes must include CPU indices, position IDs and the header.");
             auto restored = loadSceneWithStats(path);
-            expect(restored.source.kind == SceneSourceKind::Acr && restored.source.fileVersion == kSceneFileVersion &&
+            expect(restored.source.kind == SceneSourceKind::Acr && restored.source.fileVersion == 1 &&
                    restored.source.fileBytes == saved.fileBytes && restored.source.path.is_absolute() &&
                    sameSceneData(restored.scene, generated.scene), "ACR summary / exact roundtrip mismatch.");
             const auto obj = loadSceneWithStats(argv[2]);
             expect(obj.source.kind == SceneSourceKind::Obj && !obj.source.fileVersion &&
                    obj.source.fileBytes == std::filesystem::file_size(argv[2]), "OBJ source metadata mismatch.");
             const auto realSaved = saveSceneVerified(dir / "suzanne.acr", obj.scene);
-            expect(realSaved.fileBytes == 172576 && scenePayloadBytes(obj.scene).total() == 117232,
+            const auto& h = obj.scene.hierarchy;
+            const uint64_t extra = 4*h.coarse.indices.size() + 48*h.coarse.clusters.size() +
+                32*h.levels.size() + 48*h.nodes.size() + 4*h.children.size();
+            expect(h.levels.size() > 1 && realSaved.fileBytes == 172576 + 8 + extra &&
+                   scenePayloadBytes(obj.scene).total() == 117232 + extra,
                    "Unexpected Suzanne storage / GPU payload size.");
             const auto cube = makeCubeSceneWithStats();
             expect(cube.source.kind == SceneSourceKind::Cube && !cube.source.fileBytes &&
@@ -217,7 +221,8 @@ int main(int argc, char** argv)
                 rejected([&] { (void)loadScene(bad); });
             };
             auto bytes = original; bytes[0] = 'X'; checkBytes(bytes);
-            bytes = original; bytes[8] = 2; checkBytes(bytes); // version
+            bytes = original; bytes[8] = 2; checkBytes(bytes); // v2 needs the extended header
+            bytes = original; bytes[8] = 3; checkBytes(bytes); // unknown version
             bytes = original; bytes[36] = 16; checkBytes(bytes); // vertex stride
             bytes = original; bytes[16] = char(0xff); checkBytes(bytes); // count/length mismatch
             bytes = original; bytes.pop_back(); checkBytes(bytes);

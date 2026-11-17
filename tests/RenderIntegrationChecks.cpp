@@ -33,6 +33,70 @@ void checkPlaneDepth(const std::vector<float>& depth, const glm::mat4& light, fl
 }
 }
 
+int runHierarchyChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& scene, const OrbitCamera& camera,
+                       const std::filesystem::path& output)
+{
+    const auto saved = saveSceneVerified(output, scene);
+    const auto restored = loadSceneWithStats(saved.path);
+    expect(restored.source.fileVersion == 2 && scene.hierarchy.levels.size() > 1 &&
+               sameSceneData(scene, restored.scene),
+           "Expected a verified, multi-level ACR v2.");
+    RenderSettings settings;
+    settings.shadows = settings.groupColors = true;
+    r.setRenderSettings(settings);
+    const auto draw = [&](bool generated, bool wire) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (;;) {
+            glfwPollEvents();
+            expect(std::chrono::steady_clock::now() < until, "Hierarchy frame timed out.");
+            if (r.prepareFrame(window) && r.drawFrame(camera, false, true, -1, generated, wire, nullptr)) break;
+        }
+    };
+    std::vector<std::vector<float>> images;
+    for (const auto* source : {&scene, &restored.scene}) {
+        if (source != &scene) r.uploadScene(*source);
+        const auto originalBuffer = r.sceneGpuData().indexBuffer;
+        for (uint32_t i = 0; i < source->hierarchy.levels.size(); ++i) {
+            const auto l = sceneLevel(*source, i);
+            r.setHierarchyLevel(i);
+            r.verifyUpload(*source);
+            const auto& gpu = r.sceneGpuData();
+            const auto& h = gpu.hierarchy;
+            expect(gpu.indexBuffer == originalBuffer && h.levelCount == source->hierarchy.levels.size() &&
+                       h.nodeCount == source->hierarchy.nodes.size() &&
+                       h.childCount == source->hierarchy.children.size() && h.levelWord == 12 * h.totalClusters &&
+                       h.nodeWord == h.levelWord + 8 * h.levelCount && h.childWord == h.nodeWord + 12 * h.nodeCount,
+                   "Resident hierarchy addressing changed.");
+            draw(false, i % 2 && r.supportsWireframe());
+            const auto& stats = r.lastRecordedDraw();
+            expect(stats.triangles == l.indexCount / 3 && stats.shadowTriangles == stats.triangles &&
+                       stats.meshDrawCalls == l.clusterCount && stats.boundsInstances == l.clusterCount,
+                   "Level draw counts or bounds do not match the hierarchy.");
+            auto image = r.readShadowDepth();
+            expect(std::any_of(image.begin(), image.end(), [](float d) { return d < 1; }), "Empty hierarchy image.");
+            if (source == &scene)
+                images.push_back(std::move(image));
+            else
+                expect(images.at(i) == image, "Rendered light depth changed after ACR reload.");
+        }
+        expect(images.front() != images.back(), "Fine and coarse geometry rendered identically.");
+        r.setHierarchyLevel(1);
+        r.setClusterSelection({r.sceneGpuData().sceneRevision, ClusterSelectionMode::Explicit, {0}});
+        r.setEdgeSegments(2);
+        r.ensureGeneratedGeometry();
+        r.verifyGeneratedGeometry(*source);
+        draw(true, false);
+        expect(r.lastRecordedDraw().triangles == r.clusterSelection().triangleCount() * 4,
+               "Subdivision did not use active coarse cluster geometry.");
+        r.setHierarchyLevel(0);
+        expect(!r.generatedGeometry().valid && r.clusterSelection().allClusters,
+               "Stale coarse result survived a level switch.");
+    }
+    std::cout << "GPU hierarchy roundtrip passed: " << images.size()
+              << " levels, all device records and equal fixed-view light-depth images after ACR reload.\n";
+    return 0;
+}
+
 int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window)
 {
     OrbitCamera camera({0, 0, 0}, 2);

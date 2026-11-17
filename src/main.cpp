@@ -137,12 +137,14 @@ int main(int argc, char** argv)
                      "       [--fixture triangle|plane|grid|shadow (instead of another source)]\n"
                      "       [--cluster-colors] [--bounds] [--compute-copy] [--verify-gpu] [--smoke-test]\n"
                      "       [--subdivision 1|2|4|8] [--wireframe]\n"
+                     "       [--geometry-level N] [--group-colors]\n"
                      "       [--shadows] [--shadow-bias 0..0.08] [--depth-view | --shadow-map]\n"
                      "       [--frustum-preview] [--max-distance model_units] [--render-smoke]\n"
                      "       [--displacement amplitude (0..1000)] [--heightmap file.pgm]\n"
                      "       [--selection all|first-last|empty|last-first]\n"
                      "       [--benchmark output.json [--benchmark-warmup 10] [--benchmark-samples 50]]\n"
                      "       --smoke-roundtrip output.acr (hidden save/mock/reload test)\n"
+                     "       --hierarchy-roundtrip output.acr (verify all levels on the GPU)\n"
                      "       --preprocess input.obj output.acr\n"
                      "       --make-mock output.acr\n"
                      "       --validate model.acr\n"
@@ -161,7 +163,7 @@ int main(int argc, char** argv)
             const auto loaded = loadSceneWithStats(argument(2));
             printSceneSummary(std::cout, loaded);
             const auto saved = saveSceneVerified(argument(3), loaded.scene);
-            std::cout << "Saved + verified ACR v1: " << saved.path.u8string() << " | " << saved.fileBytes
+            std::cout << "Saved + verified ACR v" << sceneFileVersion(loaded.scene) << ": " << saved.path.u8string() << " | " << saved.fileBytes
                       << " bytes | CPU save (ms): " << saved.cpuSaveMs << " | CPU reload (ms): " << saved.cpuReloadMs << '\n';
             return 0;
         }
@@ -182,6 +184,16 @@ int main(int argc, char** argv)
             for (int i = 1; i < argc; ++i) {
                 const auto option = argument(i);
                 if (option == "--cluster-colors") options.clusterColors = true;
+                else if (option == "--group-colors") options.renderSettings.groupColors = true;
+                else if (option == "--geometry-level") {
+                    if (++i >= argc) throw std::runtime_error("Missing geometry level.");
+                    const auto value = argument(i).u8string();
+                    if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                        throw std::runtime_error("Geometry level must be a nonnegative integer.");
+                    const auto parsed = std::stoull(value);
+                    if (parsed > INT32_MAX) throw std::runtime_error("Geometry level is out of range.");
+                    options.geometryLevel = static_cast<uint32_t>(parsed);
+                }
                 else if (option == "--bounds") options.showBounds = true;
                 else if (option == "--verify-gpu") options.verifyGpu = true;
                 else if (option == "--compute-copy") options.computeGeometry = true;
@@ -248,6 +260,10 @@ int main(int argc, char** argv)
                     options.computeGeometry = true;
                 }
                 else if (option == "--smoke-test") options.smokeTest = true;
+                else if (option == "--hierarchy-roundtrip") {
+                    if (++i >= argc) throw std::runtime_error("Missing hierarchy roundtrip output path.");
+                    options.hierarchyRoundtripPath = argument(i);
+                }
                 else if (option == "--smoke-roundtrip") {
                     if (++i >= argc) throw std::runtime_error("--smoke-roundtrip requires an output ACR path.");
                     options.smokeTest = true;
@@ -266,6 +282,8 @@ int main(int argc, char** argv)
                 }
             }
             validateRenderSettings(options.renderSettings);
+            if (!options.hierarchyRoundtripPath.empty() && (options.renderSmoke || options.smokeTest || !options.benchmarkPath.empty()))
+                throw std::runtime_error("Run the hierarchy roundtrip separately from other test modes.");
             validateBenchmarkOptions(options.benchmarkOptions);
             if (benchmarkCountsSpecified && options.benchmarkPath.empty()) throw std::runtime_error("Benchmark counts require --benchmark.");
             if (!options.benchmarkPath.empty() && options.smokeTest) throw std::runtime_error("Choose either benchmark or smoke test.");

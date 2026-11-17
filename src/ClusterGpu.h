@@ -17,14 +17,14 @@ static_assert(std::is_standard_layout_v<GpuClusterDesc> && std::is_trivially_cop
 static_assert(sizeof(GpuClusterDesc) == 48 && alignof(GpuClusterDesc) == 16);
 static_assert(offsetof(GpuClusterDesc, boundsMax) == 16 && offsetof(GpuClusterDesc, indexRange) == 32);
 
-inline std::vector<GpuClusterDesc> packClusters(const ClusterDataset& dataset)
+inline std::vector<GpuClusterDesc> packClusters(const ClusterDataset& dataset, uint32_t firstId = 0)
 {
     std::vector<GpuClusterDesc> result;
     result.reserve(dataset.clusters.size());
     for (size_t id = 0; id < dataset.clusters.size(); ++id) {
         const auto& c = dataset.clusters[id];
         result.push_back({glm::vec4(c.boundsMin, 0.0f), glm::vec4(c.boundsMax, 0.0f),
-                          {c.firstIndex, c.indexCount, static_cast<uint32_t>(id), 0}});
+                          {c.firstIndex, c.indexCount, firstId + static_cast<uint32_t>(id), 0}});
     }
     return result;
 }

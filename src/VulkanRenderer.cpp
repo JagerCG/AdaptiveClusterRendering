@@ -397,7 +397,7 @@ void VulkanRenderer::createFrameResources()
     check(vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailable_), "vkCreateSemaphore");
 
     const VkDescriptorSetLayoutBinding clusterBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                                      VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+                                                      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sceneLayout{};
     sceneLayout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     sceneLayout.bindingCount = 1;
@@ -484,6 +484,43 @@ void VulkanRenderer::destroyBuffer(const Buffer& buffer)
     vkFreeMemory(device_, buffer.memory, nullptr);
 }
 
+namespace {
+struct PackedSource {
+    std::vector<uint32_t> indices, records;
+    ResidentHierarchy layout;
+};
+
+PackedSource packSource(const SceneData& scene)
+{
+    PackedSource result;
+    const auto& h = scene.hierarchy;
+    result.indices = scene.dataset.indices;
+    result.indices.insert(result.indices.end(), h.coarse.indices.begin(), h.coarse.indices.end());
+    const auto append = [&](const auto& values) {
+        const size_t start = result.records.size();
+        const size_t bytes = values.size() * sizeof(values[0]);
+        if (bytes) {
+            result.records.resize(start + bytes / sizeof(uint32_t));
+            std::memcpy(result.records.data() + start, values.data(), bytes);
+        }
+        return static_cast<uint32_t>(start);
+    };
+    append(packClusters(scene.dataset));
+    append(packClusters(h.coarse, static_cast<uint32_t>(scene.dataset.clusters.size())));
+    auto& view = result.layout;
+    view.allIndexOffset = scene.mesh.vertices.size() * sizeof(Vertex);
+    view.totalIndices = static_cast<uint32_t>(result.indices.size());
+    view.totalClusters = static_cast<uint32_t>(scene.dataset.clusters.size() + h.coarse.clusters.size());
+    view.levelWord = append(h.levels);
+    view.nodeWord = append(h.nodes);
+    view.childWord = append(h.children);
+    view.levelCount = static_cast<uint32_t>(h.levels.size());
+    view.nodeCount = static_cast<uint32_t>(h.nodes.size());
+    view.childCount = static_cast<uint32_t>(h.children.size());
+    return result;
+}
+} // namespace
+
 void VulkanRenderer::uploadScene(const SceneData& scene)
 {
     const auto cpuStart = std::chrono::steady_clock::now();
@@ -498,19 +535,33 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
         {nextRevision, ClusterSelectionMode::All, {}});
     nextStats.payload = scenePayloadBytes(scene);
     const auto& mesh = scene.mesh;
-    const auto& indices = scene.dataset.indices;
-    const auto clusters = packClusters(scene.dataset);
+    const auto packed = packSource(scene);
+    const auto& indices = packed.indices;
     auto drawClusters = scene.dataset.clusters;
+    auto allClusters = drawClusters;
+    allClusters.insert(allClusters.end(), scene.hierarchy.coarse.clusters.begin(),
+                       scene.hierarchy.coarse.clusters.end());
+    auto levels = scene.hierarchy.levels;
+    if (levels.empty()) levels.push_back(sceneLevel(scene, 0));
+    std::vector<uint32_t> groups(allClusters.size());
+    for (uint32_t i = 0; i < groups.size(); ++i)
+        groups[i] = i;
+    for (uint32_t i = 0; i < scene.hierarchy.nodes.size(); ++i) {
+        const auto& n = scene.hierarchy.nodes[i];
+        std::fill_n(groups.begin() + n.firstCluster, n.clusterCount, n.parent == kNoParent ? i : n.parent);
+    }
     const size_t vertexBytes = mesh.vertices.size() * sizeof(Vertex);
     const size_t indexBytes = indices.size() * sizeof(uint32_t);
     const size_t meshBytes = vertexBytes + indexBytes;
-    const size_t clusterBytes = clusters.size() * sizeof(GpuClusterDesc);
+    const size_t clusterBytes = packed.records.size() * sizeof(uint32_t);
     const VkDeviceSize bufferSize = meshBytes + clusterBytes;
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(gpu_, &properties);
     if (clusterBytes > properties.limits.maxStorageBufferRange) {
-        throw std::runtime_error("Cluster buffer exceeds this GPU's maxStorageBufferRange.");
+        throw std::runtime_error("Cluster and hierarchy buffer exceeds this GPU's maxStorageBufferRange.");
     }
+    if (!scene.hierarchy.levels.empty() && meshBytes > properties.limits.maxStorageBufferRange)
+        throw std::runtime_error("Resident multi-level geometry exceeds this GPU's storage-buffer range.");
     const auto storageUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     const auto meshUsage = storageUsage | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
@@ -528,7 +579,7 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
         auto* bytes = static_cast<char*>(mapped);
         std::memcpy(bytes, mesh.vertices.data(), vertexBytes);
         std::memcpy(bytes + vertexBytes, indices.data(), indexBytes);
-        std::memcpy(bytes + meshBytes, clusters.data(), clusterBytes);
+        std::memcpy(bytes + meshBytes, packed.records.data(), clusterBytes);
         vkUnmapMemory(device_, staging.memory);
 
         check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
@@ -597,8 +648,13 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     sceneGpu_.clusterBuffer = clusterBuffer_.handle;
     sceneGpu_.indexOffset = vertexBytes;
     sceneGpu_.vertexCount = static_cast<uint32_t>(mesh.vertices.size());
-    sceneGpu_.indexCount = static_cast<uint32_t>(indices.size());
-    sceneGpu_.clusterCount = static_cast<uint32_t>(clusters.size());
+    sceneGpu_.indexCount = levels[0].indexCount;
+    sceneGpu_.clusterCount = levels[0].clusterCount;
+    sceneGpu_.hierarchy = packed.layout;
+    sceneGpu_.activeLevel = sceneGpu_.firstCluster = 0;
+    residentClusters_ = std::move(allClusters);
+    residentLevels_ = std::move(levels);
+    clusterGroups_ = std::move(groups);
     drawClusters_ = std::move(drawClusters);
     const VkDescriptorBufferInfo clusterInfo{clusterBuffer_.handle, 0, clusterBytes};
     VkWriteDescriptorSet write{};
@@ -615,6 +671,30 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     uploadStats_ = nextStats;
     sceneGpu_.sceneRevision = nextRevision;
     selection_ = std::move(nextSelection);
+    compute_->invalidate();
+}
+
+void VulkanRenderer::setHierarchyLevel(uint32_t level)
+{
+    const auto& l = residentLevels_.at(level);
+    if (sceneGpu_.activeLevel == level) return;
+    if (sceneGpu_.sceneRevision == std::numeric_limits<SceneRevision>::max())
+        throw std::runtime_error("Scene revision exhausted.");
+    const auto revision = sceneGpu_.sceneRevision + 1;
+    auto begin = residentClusters_.begin() + l.firstCluster;
+    std::vector<Cluster> active(begin, begin + l.clusterCount);
+    for (auto& c : active)
+        c.firstIndex -= l.firstIndex;
+    auto selection =
+        resolveClusterSelection(active, l.indexCount, revision, {revision, ClusterSelectionMode::All, {}});
+    sceneGpu_.activeLevel = level;
+    sceneGpu_.firstCluster = l.firstCluster;
+    sceneGpu_.indexOffset = sceneGpu_.hierarchy.allIndexOffset + VkDeviceSize(l.firstIndex) * sizeof(uint32_t);
+    sceneGpu_.indexCount = l.indexCount;
+    sceneGpu_.clusterCount = l.clusterCount;
+    sceneGpu_.sceneRevision = revision;
+    drawClusters_ = std::move(active);
+    selection_ = std::move(selection);
     compute_->invalidate();
 }
 
@@ -747,7 +827,7 @@ void VulkanRenderer::verifyGeneratedGeometry(const SceneData& scene)
         std::memcpy(outputIndices.data(), indices, static_cast<size_t>(output.indexBytes));
         vkUnmapMemory(device_, readback.memory);
         const auto stats = validateGeneratedGeometry(scene, selection_, edgeSegments_, vertices, outputIndices,
-                                                     &compute_->heightField(), displacement_);
+                                                     &compute_->heightField(), displacement_,sceneGpu_.activeLevel);
         std::cout << "GPU geometry readback passed: n=" << edgeSegments_ << ", " << output.vertexCount << " vertices, "
                   << stats.triangles << " triangles, " << stats.sharedEdgeChecks << " exact shared-edge checks, max attribute error "
                   << stats.maxAttributeError << ", max normal error " << stats.maxNormalError
@@ -763,20 +843,24 @@ void VulkanRenderer::verifyUpload(const SceneData& scene)
 {
     const auto expected = scenePayloadBytes(scene);
     if (uploadStats_.payload.vertices != expected.vertices || uploadStats_.payload.indices != expected.indices ||
-        uploadStats_.payload.clusters != expected.clusters || uploadStats_.residentAllocationBytes < expected.total() ||
+        uploadStats_.payload.clusters != expected.clusters || uploadStats_.payload.hierarchy != expected.hierarchy ||
+        uploadStats_.residentAllocationBytes < expected.total() ||
         !std::isfinite(uploadStats_.cpuUploadMs) || uploadStats_.cpuUploadMs < 0.0 ||
         (uploadStats_.gpuTransferMs &&
          (!std::isfinite(*uploadStats_.gpuTransferMs) || *uploadStats_.gpuTransferMs < 0.0)) ||
         uploadStats_.gpuTransferMs.has_value() != (uploadQueries_ != VK_NULL_HANDLE)) {
         throw std::runtime_error("Upload diagnostics do not match the resident scene / timestamp support.");
     }
-    const auto clusters = packClusters(scene.dataset);
+    const auto packed = packSource(scene);
     const size_t vertexBytes = scene.mesh.vertices.size() * sizeof(Vertex);
-    const size_t indexBytes = scene.dataset.indices.size() * sizeof(uint32_t);
+    const size_t indexBytes = packed.indices.size() * sizeof(uint32_t);
     const size_t meshBytes = vertexBytes + indexBytes;
-    const size_t clusterBytes = clusters.size() * sizeof(GpuClusterDesc);
-    if (sceneGpu_.vertexCount != scene.mesh.vertices.size() || sceneGpu_.indexCount != scene.dataset.indices.size() ||
-        sceneGpu_.clusterCount != clusters.size()) throw std::runtime_error("GPU scene counts do not match.");
+    const size_t clusterBytes = packed.records.size()*sizeof(uint32_t);
+    const auto active = sceneLevel(scene,sceneGpu_.activeLevel);
+    if (sceneGpu_.vertexCount != scene.mesh.vertices.size() || sceneGpu_.indexCount != active.indexCount ||
+        sceneGpu_.clusterCount != active.clusterCount || sceneGpu_.firstCluster != active.firstCluster ||
+        sceneGpu_.indexOffset != vertexBytes + VkDeviceSize(active.firstIndex)*4)
+        throw std::runtime_error("GPU scene counts or level offsets do not match.");
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
     Buffer readback;
     try {
@@ -813,8 +897,8 @@ void VulkanRenderer::verifyUpload(const SceneData& scene)
         check(vkMapMemory(device_, readback.memory, 0, meshBytes + clusterBytes, 0, &mapped), "vkMapMemory");
         const auto* bytes = static_cast<const char*>(mapped);
         const bool equal = std::memcmp(bytes, scene.mesh.vertices.data(), vertexBytes) == 0 &&
-            std::memcmp(bytes + vertexBytes, scene.dataset.indices.data(), indexBytes) == 0 &&
-            std::memcmp(bytes + meshBytes, clusters.data(), clusterBytes) == 0;
+            std::memcmp(bytes + vertexBytes, packed.indices.data(), indexBytes) == 0 &&
+            std::memcmp(bytes + meshBytes, packed.records.data(), clusterBytes) == 0;
         vkUnmapMemory(device_, readback.memory);
         if (!equal) throw std::runtime_error("GPU readback differs from the scene data.");
     } catch (...) {
@@ -822,7 +906,7 @@ void VulkanRenderer::verifyUpload(const SceneData& scene)
         throw;
     }
     destroyBuffer(readback);
-    std::cout << "GPU readback passed: vertices, indices, clusters (48-byte stride)." << std::endl;
+    std::cout << "GPU readback passed: vertices, all indices, clusters, levels, nodes and children." << std::endl;
 }
 
 void VulkanRenderer::selectDepthFormat()
@@ -1271,7 +1355,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
     stats.boundsPadding = computeGeometry ? compute_->output().maxDisplacement : 0;
     const float aspect = float(extent_.width) / float(extent_.height);
     const auto viewProjection = camera.viewProjection(aspect);
-    lightMatrix_ = shadowViewProjection(drawClusters_, stats.boundsPadding, renderSettings_.lightDirection);
+    lightMatrix_ = shadowViewProjection(residentClusters_, stats.boundsPadding, renderSettings_.lightDirection);
     const LightingUniform lighting{lightMatrix_, glm::vec4(glm::normalize(renderSettings_.lightDirection), 0)};
     void* mapped = nullptr;
     check(vkMapMemory(device_, lightingBuffer_.memory, 0, sizeof(lighting), 0, &mapped), "vkMapMemory(lighting)");
@@ -1311,13 +1395,15 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         auto& triangles = shadow ? stats.shadowTriangles : stats.triangles;
         const auto draw = [&](uint32_t first, uint32_t count, uint32_t id) {
             if (!shadow) {
-                push.baseColor = clusterColors ? clusterColor(id) : kShadedColor;
+                const auto global = sceneGpu_.firstCluster + id;
+                push.baseColor = renderSettings_.groupColors ? clusterColor(clusterGroups_[global]) :
+                                 clusterColors ? clusterColor(global) : kShadedColor;
                 vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                    64, sizeof(glm::vec4), &push.baseColor);
             }
             vkCmdDrawIndexed(commandBuffer_, count, 1, first, 0, 0); ++calls; triangles += count / 3;
         };
-        if (contiguous && (shadow || (!clusterColors && !filtered))) draw(0, geometry.indexCount, 0);
+        if (contiguous && (shadow || (!clusterColors && !renderSettings_.groupColors && !filtered))) draw(0, geometry.indexCount, 0);
         else for (const auto& range : ranges)
             if (shadow || visible[range.sourceClusterId]) draw(range.firstIndex, range.indexCount, range.sourceClusterId);
     };
@@ -1366,7 +1452,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
             vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundsPipeline_);
             for (const auto& range : selection_.ranges) {
                 if (!visible[range.sourceClusterId] || (boundsCluster >= 0 && range.sourceClusterId != uint32_t(boundsCluster))) continue;
-                vkCmdDraw(commandBuffer_, 24, 1, 0, range.sourceClusterId); ++stats.boundsInstances;
+                vkCmdDraw(commandBuffer_, 24, 1, 0, sceneGpu_.firstCluster + range.sourceClusterId); ++stats.boundsInstances;
             }
         }
     }

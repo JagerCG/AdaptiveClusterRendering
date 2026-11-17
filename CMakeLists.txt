@@ -69,6 +69,10 @@ add_library(acr_scene STATIC
     src/ClusterBuilder.h
     src/QemClusterBuilder.cpp
     src/QemClusterBuilder.h
+    src/MeshHierarchy.cpp
+    src/MeshHierarchy.h
+    src/QemSimplifier.cpp
+    src/QemSimplifier.h
     src/MeshSource.cpp
     src/MeshSource.h
     src/ObjLoader.cpp
@@ -158,6 +162,10 @@ if(BUILD_TESTING)
         add_test(NAME scene-${CASE} COMMAND scene_tests ${CASE} "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
                  "${CMAKE_CURRENT_BINARY_DIR}/test-data/${CASE}")
     endforeach()
+    add_executable(hierarchy_tests tests/HierarchyTests.cpp)
+    target_link_libraries(hierarchy_tests PRIVATE acr_scene)
+    add_test(NAME scene-hierarchy COMMAND hierarchy_tests "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
+             "${CMAKE_CURRENT_BINARY_DIR}/test-data/hierarchy")
     add_executable(fixture_tests tests/FixtureTests.cpp)
     target_link_libraries(fixture_tests PRIVATE acr_scene)
     foreach(CASE IN ITEMS triangle plane grid selection)
@@ -183,6 +191,10 @@ if(BUILD_TESTING)
         set_tests_properties(gpu-render-integration PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS "gpu"
             FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu")
+        add_test(NAME gpu-hierarchy-roundtrip COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
+                 --hierarchy-roundtrip "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/hierarchy.acr")
+        set_tests_properties(gpu-hierarchy-roundtrip PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS "gpu"
+            FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         foreach(CASE IN ITEMS all partial empty source shadows shadow-map)
             add_test(NAME gpu-benchmark-${CASE} COMMAND "${CMAKE_COMMAND}"
                 "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>" "-DCONFIG=$<CONFIG>" "-DMODE=${CASE}"

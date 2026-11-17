@@ -39,6 +39,7 @@ public:
     void initialize(GLFWwindow* window);
     void uploadScene(const SceneData& scene);
     void verifyUpload(const SceneData& scene);
+    void setHierarchyLevel(uint32_t level);
     bool ensureGeneratedGeometry(bool force = false); // false: reuse cached output
     void verifyGeneratedGeometry(const SceneData& scene);
     void setEdgeSegments(uint32_t segments);
@@ -159,6 +160,9 @@ private:
     SceneGpuData sceneGpu_;
     SceneUploadStats uploadStats_;
     std::vector<Cluster> drawClusters_;
+    std::vector<Cluster> residentClusters_;
+    std::vector<LodLevel> residentLevels_;
+    std::vector<uint32_t> clusterGroups_; // absolute cluster ID -> parent group for coloring
     ResolvedClusterSelection selection_;
     SourceDrawStats lastDraw_;
     std::unique_ptr<ComputeGeometry> compute_;

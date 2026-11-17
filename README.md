@@ -6,10 +6,9 @@ A C++ and Vulkan renderer for experimenting with cluster-based geometry. Milesto
 
 ## Development handoff
 
-Part 2 and member 3's rendering update are now integrated. Start with the
-[rendering integration and shadow demo](docs/milestone-2-render-integration.md)
-for the current state, build commands and remaining GPU LOD/hierarchy dependencies.
-
+OBJ import now builds a resident mesh hierarchy. See **M2 mesh hierarchy and ACR v2**
+below for the 01/02 demo. The [rendering integration and shadow demo](docs/milestone-2-render-integration.md)
+covers the geometry, depth and shadow paths.
 
 The [M2 Part 2 foundation and integration contract](docs/milestone-2-part2-contract.md)
 defines the working interfaces for storage and compute-based tessellation/displacement,
@@ -89,7 +88,20 @@ Preprocess and validate without creating a Vulkan device or a window:
 .\build\Debug\AdaptiveClusterRendering.exe build/suzanne.acr --verify-gpu
 ```
 
-`--verify-gpu` reads the uploaded vertices, indices and cluster records back and compares them byte-for-byte. It is a debugging option, not part of performance measurements. Scene files use the versioned `.acr` format documented in [the M1 interface contract](docs/milestone-1-interface.md); they are not a general-purpose asset format or compatible with other repositories' binary caches.
+`--verify-gpu` compares the resident vertex, index, cluster and hierarchy buffers against the CPU records byte for byte. The [M1 interface contract](docs/milestone-1-interface.md) describes the flat ACR v1 layout.
+
+## M2 mesh hierarchy and ACR v2
+
+1. Launch the viewer with Suzanne. Compare **Cluster colors** and **Group colors** at L0. Group colors give adjacent clusters belonging to the same parent one color.
+2. Open **Mesh hierarchy** and choose a **Geometry level**. Keep the camera fixed and toggle **Wireframe** to compare the silhouette and edges. The panel shows the active triangle and cluster counts, node count, model-space error bound and original build time for that level.
+3. Use **Save + verify ACR...**, then **Reload saved ACR**. This restores the whole hierarchy and preserves the current camera, displayed level and cluster selection. **Storage** shows the serialized size, GPU payload and timings.
+4. Run `--hierarchy-roundtrip build/suzanne-check.acr` with the bundled OBJ to draw every level, read all resident records back and compare fixed-view light-depth images before and after reloading. Use `--geometry-level 2 --wireframe` to start a manual demo on a coarser level.
+
+With the default capacity of 64 triangles per cluster, the bundled Suzanne has 3,936, 1,982, 1,014, 556, 314 and 230 triangles at L0 through L5. L0 and L2 make a clear same-camera wireframe comparison.
+
+Preprocessing grows connected groups across shared position edges and simplifies each group with endpoint QEM contractions. It protects open boundaries, inter-group borders and split UV/normal seams, and keeps extremal vertices along the axes and body diagonals to preserve the width of thin features. Coarse clusters reuse the original vertices. Each parent records its child IDs, conservative descendant bounds and a model-space error bound including the maximum inherited error. Disconnected components can form separate roots.
+
+ACR v2 stores the original v1 payload and adds coarse index/cluster arrays, level records, hierarchy nodes and child IDs. A versioned 72-byte header gives all counts. ACR v1 still loads as one level, and the fixed mock retains its original format. All levels are uploaded once. `MeshHierarchy.h` defines the 32-byte level and 48-byte node records. `SceneGpuData::hierarchy` gives their word offsets in the storage buffer, the total geometry counts and the shared index-buffer offset. Each node covers contiguous global cluster IDs. Its children index the next finer level. The last level holds the roots. The viewer switches its active index range on the same buffers.
 
 ## M2 Part 2: storage diagnostics demo
 
@@ -101,7 +113,7 @@ Preprocess and validate without creating a Vulkan device or a window:
    geometry, UVs/normals, original/reordered indices, position IDs, cluster ranges,
    bounds and capacity. A success message appears only after that comparison passes.
 3. Click **Reload saved ACR**. This uploads the saved data while preserving the
-   current camera and cluster selection. The source changes to **ACR v1** and the
+   current camera, level and cluster selection. The source displays its ACR version and the
    load/upload measurements refresh. A file that no longer matches is rejected;
    use **Open OBJ / ACR...** to deliberately load it as a different scene.
 4. Click **Load mock**, then open the saved ACR through the file picker. Confirm
@@ -115,13 +127,13 @@ Preprocess and validate without creating a Vulkan device or a window:
 | Display | What it measures |
 | --- | --- |
 | Source file | Actual OBJ/ACR bytes on disk; N/A for generated Mock/Cube. |
-| GPU payload | Valid vertices + reordered rendering indices + 48-byte cluster records. |
+| GPU payload | Shared vertices, render indices and cluster records for all levels, plus hierarchy records. |
 | Resident allocation | Vulkan allocation sizes for the mesh and cluster buffers, including alignment. Excludes staging, UI and framebuffer allocations. |
 | CPU prepare | File read + validation; OBJ also includes CPU clustering. Generated scenes include creation + validation. Excludes framing/upload. |
 | CPU upload + wait | Upload validation/packing, buffer allocation, staging, submission, synchronization/wait and descriptor update. |
 | GPU copies | GPU timestamp interval around the two buffer copies. N/A if the selected queue does not support timestamps. |
 
-For bundled Suzanne, the ACR file is **172,576 bytes** and the GPU payload is
+For the original single-level Suzanne v1 cache, the ACR file is **172,576 bytes** and the GPU payload is
 **117,232 bytes** (64,384 vertices + 47,232 indices + 5,616 cluster records).
 The file additionally retains the original indices, position IDs and header.
 The fixed Mock uses a 1,216-byte ACR file and an 896-byte GPU payload.
@@ -419,6 +431,7 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/ObjLoader.cpp`, `src/MeshSource.h` | Read OBJ positions, normals and UVs into an indexed mesh. Supply a face normal for corners that lack one. |
 | `src/ClusterBuilder.cpp` | Group edge-connected triangles on the CPU. Each cluster has at most 64 triangles, a contiguous index range, and a model-space bounding box. |
 | `src/QemClusterBuilder.*` | Experimental QEM-based ordering within baseline clusters and internal-edge score measurement. Geometry is unchanged; this library/test path is not selected by the viewer. |
+| `src/MeshHierarchy.*`, `src/QemSimplifier.*` | Connected region grouping, constrained QEM contractions, reclustering, hierarchy construction and validation. |
 | `src/SceneData.*` | Shared scene handoff, fixed mock, strict validation, OBJ/ACR loading, and versioned persistence. |
 | `src/SceneDiagnostics.*` | Runtime source/file summaries, CPU preparation timing, payload byte counts and exact save/reload verification. Leaves ACR v1 unchanged. |
 | `src/TessellationFixtures.*` | Authored triangle, continuous-UV plane and four-cluster grid for module 07 correctness checks. |
@@ -432,7 +445,7 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/VulkanRenderer.cpp`, `shaders/` | Upload geometry and cluster descriptors; depth-tested mesh and SSBO-driven bounds. In cluster color mode, draw each index range with its own color. |
 | `src/Viewer.cpp`, `src/OrbitCamera.cpp` | Manage model loading, camera controls, and the Model panel. |
 
-The default path draws all source triangles; the test-input panel can preview a fixed subset or an empty selection. Clustering, selection resolution, compute work-list preparation and mesh draw submission remain on the CPU; optional uniform subdivision and height displacement write independent output geometry on the GPU. The bounds shader consumes source cluster descriptors plus conservative displacement padding. The current experimental QEM builder sorts triangles within baseline groups only. Source/generated rendering now includes matched directional shadows and camera/light depth views; optional CPU visibility previews affect main draws without removing shadow casters. Geometry simplification, hierarchy construction/traversal, GPU LOD/culling, Hi-Z, streaming, adaptive subdivision, general displaced seam repair are not yet implemented. The next milestone can extend `SceneGpuData` and the descriptor layout once its hierarchy contract is agreed.
+The viewer starts with the original geometry. Each manually selected level supports source drawing, subdivision, displacement, shadows and cluster bounds. Module 03 can now traverse the resident hierarchy to choose regional detail automatically. Module 04 can use its conservative bounds for GPU visibility tests.
 
 ## Credits
 

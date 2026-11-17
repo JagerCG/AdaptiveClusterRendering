@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -16,6 +17,7 @@
 namespace {
 constexpr std::array<char, 8> kMagic{'A', 'C', 'R', 'M', '1', '\r', '\n', '\0'};
 constexpr uint32_t kHeaderBytes = 64;
+constexpr uint32_t kHierarchyHeaderBytes = 72;
 constexpr uint32_t kVertexBytes = 32;
 constexpr uint32_t kClusterBytes = 48;
 constexpr uint64_t kMaxFileBytes = 512ull * 1024 * 1024;
@@ -78,6 +80,37 @@ uint64_t fileBytes(uint32_t vertices, uint32_t sourceIndices, uint32_t indices, 
            uint64_t(indices) * 4 + uint64_t(clusters) * kClusterBytes;
 }
 
+uint64_t hierarchyFileBytes(uint32_t levels, uint32_t nodes, uint32_t children, uint32_t indices, uint32_t clusters)
+{
+    return 8 + uint64_t(levels) * 32 + uint64_t(nodes) * 48 + uint64_t(children) * 4 + uint64_t(indices) * 4 +
+           uint64_t(clusters) * kClusterBytes;
+}
+
+void writeCluster(std::ostream& out, const Cluster& c, uint32_t id)
+{
+    writeVec3(out, c.boundsMin);
+    writeU32(out, 0);
+    writeVec3(out, c.boundsMax);
+    writeU32(out, 0);
+    writeU32(out, c.firstIndex);
+    writeU32(out, c.indexCount);
+    writeU32(out, id);
+    writeU32(out, 0);
+}
+
+Cluster readCluster(std::istream& in, uint32_t id)
+{
+    Cluster c{};
+    c.boundsMin = readVec3(in);
+    require(readU32(in) == 0, "Invalid ACR bounds padding.");
+    c.boundsMax = readVec3(in);
+    require(readU32(in) == 0, "Invalid ACR bounds padding.");
+    c.firstIndex = readU32(in);
+    c.indexCount = readU32(in);
+    require(readU32(in) == id && readU32(in) == 0, "Invalid ACR cluster ID or reserved field.");
+    return c;
+}
+
 using Triangle = std::array<uint32_t, 3>;
 std::vector<Triangle> triangles(const std::vector<uint32_t>& indices)
 {
@@ -96,15 +129,16 @@ std::vector<Triangle> triangles(const std::vector<uint32_t>& indices)
 SceneData readScene(const std::filesystem::path& path)
 {
     const uint64_t size = std::filesystem::file_size(path);
-    require(size >= kHeaderBytes && size <= kMaxFileBytes, "Invalid ACR file size (M1 limit: 512 MiB).");
+    require(size >= kHeaderBytes && size <= kMaxFileBytes, "Invalid ACR file size (512 MiB limit).");
     std::ifstream in(path, std::ios::binary);
     require(bool(in), "Cannot open ACR file.");
     in.exceptions(std::ios::failbit | std::ios::badbit);
     std::array<char, 8> magic{};
     in.read(magic.data(), magic.size());
     require(magic == kMagic, "Invalid ACR file signature.");
-    require(readU32(in) == kSceneFileVersion, "Unsupported ACR file version.");
-    require(readU32(in) == kHeaderBytes, "Unsupported ACR header size.");
+    const auto version = readU32(in);
+    require(version == 1 || version == kSceneFileVersion, "Unsupported ACR file version.");
+    require(readU32(in) == (version == 1 ? kHeaderBytes : kHierarchyHeaderBytes), "Unsupported ACR header size.");
     const uint32_t vertexCount = readU32(in);
     const uint32_t sourceCount = readU32(in);
     const uint32_t indexCount = readU32(in);
@@ -113,12 +147,24 @@ SceneData readScene(const std::filesystem::path& path)
     require(readU32(in) == kVertexBytes && readU32(in) == kClusterBytes, "Unsupported ACR record layout.");
     require(readU32(in) == 0, "Unsupported ACR flags.");
     require(readU32(in) == vertexCount, "Invalid ACR position ID count.");
-    for (int i = 0; i < 3; ++i) require(readU32(in) == 0, "Nonzero ACR reserved header field.");
+    const uint32_t levels = readU32(in), nodes = readU32(in), children = readU32(in);
+    uint32_t coarseIndices = 0, coarseClusters = 0;
+    if (version == 1)
+        require(levels == 0 && nodes == 0 && children == 0, "Nonzero ACR v1 reserved field.");
+    else {
+        coarseIndices = readU32(in);
+        coarseClusters = readU32(in);
+        require(levels > 0 && levels <= nodes && nodes >= clusterCount && children < nodes &&
+                    coarseIndices % 3 == 0 && coarseClusters <= coarseIndices / 3,
+                "Invalid ACR hierarchy counts.");
+    }
     require(vertexCount > 0 && sourceCount > 0 && sourceCount % 3 == 0 && indexCount == sourceCount &&
-            clusterCount > 0 && clusterCount <= indexCount / 3, "Invalid ACR element counts.");
+                clusterCount > 0 && clusterCount <= indexCount / 3,
+            "Invalid ACR element counts.");
     require(capacity > 0 && capacity <= std::numeric_limits<uint32_t>::max() / 3, "Invalid cluster capacity.");
     // Check lengths BEFORE allocating anything controlled by the file.
-    require(fileBytes(vertexCount, sourceCount, indexCount, clusterCount) == size,
+    const auto extraBytes = version == 1 ? 0 : hierarchyFileBytes(levels,nodes,children,coarseIndices,coarseClusters);
+    require(fileBytes(vertexCount, sourceCount, indexCount, clusterCount) + extraBytes == size,
             "ACR payload size does not match its header (truncated or trailing data).");
     SceneData scene;
     scene.maxTrianglesPerCluster = capacity;
@@ -134,15 +180,28 @@ SceneData readScene(const std::filesystem::path& path)
     for (auto& i : scene.mesh.indices) i = readU32(in);
     for (auto& i : scene.dataset.indices) i = readU32(in);
     for (auto& id : scene.mesh.positionIds) id = readU32(in);
-    for (uint32_t id = 0; id < clusterCount; ++id) {
-        auto& c = scene.dataset.clusters[id];
-        c.boundsMin = readVec3(in);
-        require(readU32(in) == 0, "Invalid ACR bounds padding.");
-        c.boundsMax = readVec3(in);
-        require(readU32(in) == 0, "Invalid ACR bounds padding.");
-        c.firstIndex = readU32(in); c.indexCount = readU32(in);
-        require(readU32(in) == id && readU32(in) == 0, "Invalid ACR cluster ID or reserved field.");
+    for (uint32_t id = 0; id < clusterCount; ++id)
+        scene.dataset.clusters[id] = readCluster(in, id);
+    auto& h = scene.hierarchy;
+    h.coarse.indices.resize(coarseIndices);
+    for (auto& v : h.coarse.indices)
+        v = readU32(in);
+    h.coarse.clusters.reserve(coarseClusters);
+    for (uint32_t i = 0; i < coarseClusters; ++i)
+        h.coarse.clusters.push_back(readCluster(in, clusterCount + i));
+    h.levels.reserve(levels);
+    for (uint32_t i = 0; i < levels; ++i) {
+        h.levels.push_back({readU32(in), readU32(in), readU32(in), readU32(in), readU32(in), readU32(in),
+                            readFloat(in), readU32(in)});
     }
+    h.nodes.reserve(nodes);
+    for (uint32_t i = 0; i < nodes; ++i) {
+        h.nodes.push_back({readVec3(in), readFloat(in), readVec3(in), readU32(in), readU32(in), readU32(in),
+                           readU32(in), readU32(in)});
+    }
+    h.children.resize(children);
+    for (auto& child : h.children)
+        child = readU32(in);
     validateScene(scene);
     return scene;
 }
@@ -186,13 +245,18 @@ void validateScene(const SceneData& scene)
     }
     require(next == data.indices.size(), "Cluster ranges leave indices uncovered.");
     require(triangles(mesh.indices) == triangles(data.indices), "Cluster indices changed source triangles or winding.");
+    validateMeshHierarchy(scene);
 }
 
 SceneData buildScene(MeshSource mesh, uint32_t maxTrianglesPerCluster)
 {
+    const auto start = std::chrono::steady_clock::now();
     auto dataset = buildClusters(mesh, maxTrianglesPerCluster);
-    SceneData result{std::move(mesh), std::move(dataset), maxTrianglesPerCluster};
+    const auto ms = std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now() - start).count();
+    SceneData result{std::move(mesh), std::move(dataset), maxTrianglesPerCluster, {}};
     validateScene(result);
+    buildMeshHierarchy(result, ms);
+    validateMeshHierarchy(result);
     return result;
 }
 
@@ -237,15 +301,26 @@ void saveScene(const std::filesystem::path& path, const SceneData& scene)
     const auto sourceIndices = static_cast<uint32_t>(scene.mesh.indices.size());
     const auto indices = static_cast<uint32_t>(scene.dataset.indices.size());
     const auto clusters = static_cast<uint32_t>(scene.dataset.clusters.size());
-    require(fileBytes(vertices, sourceIndices, indices, clusters) <= kMaxFileBytes, "ACR exceeds the M1 512 MiB limit.");
+    const auto version = sceneFileVersion(scene);
+    const auto& h = scene.hierarchy;
+    const auto levels = static_cast<uint32_t>(h.levels.size()), nodes = static_cast<uint32_t>(h.nodes.size());
+    const auto children = static_cast<uint32_t>(h.children.size());
+    const auto coarseIndices = static_cast<uint32_t>(h.coarse.indices.size());
+    const auto coarseClusters = static_cast<uint32_t>(h.coarse.clusters.size());
+    const auto extraBytes =
+        version == 1 ? 0 : hierarchyFileBytes(levels, nodes, children, coarseIndices, coarseClusters);
+    require(fileBytes(vertices, sourceIndices, indices, clusters) + extraBytes <= kMaxFileBytes,
+            "ACR exceeds 512 MiB.");
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     require(bool(out), "Cannot create ACR output file.");
     out.exceptions(std::ios::badbit | std::ios::failbit);
     out.write(kMagic.data(), kMagic.size());
-    for (uint32_t value : {kSceneFileVersion, kHeaderBytes, vertices, sourceIndices, indices, clusters,
-                           scene.maxTrianglesPerCluster, kVertexBytes, kClusterBytes, 0u, vertices, 0u, 0u, 0u}) {
+    for (uint32_t value :
+         {version, version == 1 ? kHeaderBytes : kHierarchyHeaderBytes, vertices, sourceIndices, indices, clusters,
+          scene.maxTrianglesPerCluster, kVertexBytes, kClusterBytes, 0u, vertices, levels, nodes, children}) {
         writeU32(out, value);
     }
+    if (version == 2) { writeU32(out,coarseIndices); writeU32(out,coarseClusters); }
     for (const auto& v : scene.mesh.vertices) {
         writeVec3(out, v.position); writeVec3(out, v.normal);
         writeFloat(out, v.texcoord.x); writeFloat(out, v.texcoord.y);
@@ -253,11 +328,21 @@ void saveScene(const std::filesystem::path& path, const SceneData& scene)
     for (uint32_t i : scene.mesh.indices) writeU32(out, i);
     for (uint32_t i : scene.dataset.indices) writeU32(out, i);
     for (uint32_t id : scene.mesh.positionIds) writeU32(out, id);
-    for (uint32_t id = 0; id < clusters; ++id) {
-        const auto& c = scene.dataset.clusters[id];
-        writeVec3(out, c.boundsMin); writeU32(out, 0);
-        writeVec3(out, c.boundsMax); writeU32(out, 0);
-        writeU32(out, c.firstIndex); writeU32(out, c.indexCount); writeU32(out, id); writeU32(out, 0);
+    for (uint32_t id = 0; id < clusters; ++id) writeCluster(out,scene.dataset.clusters[id],id);
+    for (auto v : h.coarse.indices) writeU32(out,v);
+    for (uint32_t id = 0; id < coarseClusters; ++id) writeCluster(out,h.coarse.clusters[id],clusters+id);
+    for (const auto& l : h.levels) {
+        for (auto v : {l.firstNode,l.nodeCount,l.firstCluster,l.clusterCount,l.firstIndex,l.indexCount}) writeU32(out,v);
+        writeFloat(out,l.buildMs); writeU32(out,l.reserved);
     }
+    for (const auto& n : h.nodes) {
+        writeVec3(out, n.boundsMin);
+        writeFloat(out, n.error);
+        writeVec3(out, n.boundsMax);
+        for (auto v : {n.parent, n.firstCluster, n.clusterCount, n.firstChild, n.childCount})
+            writeU32(out, v);
+    }
+    for (auto child : h.children)
+        writeU32(out, child);
     out.close();
 }

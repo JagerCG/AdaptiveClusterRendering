@@ -10,6 +10,7 @@ struct RenderSettings {
     glm::vec3 lightDirection{0.6f, 0.8f, 1.0f}; // surface toward directional light
     bool frustumPreview = false; // CPU draw-only preview, NOT GPU LOD selection
     float maxDistance = 0; // model units; zero disables the CPU distance filter
+    bool groupColors = false;
 };
 void validateRenderSettings(const RenderSettings& settings);
 bool clusterVisible(const Cluster& cluster, float padding, const glm::mat4& viewProjection,

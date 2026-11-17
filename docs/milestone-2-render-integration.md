@@ -1,5 +1,7 @@
 # M2 Part 2 and rendering integration
 
+The subsequent [01/02 hierarchy handoff](../README.md#m2-mesh-hierarchy-and-acr-v2) implements the 01 → 02 dependency below. GPU-produced visibility and LOD selections remain the next integration step.
+
 Updated 2026-11-16. This integrates the standalone Part 2 checkpoint `f5e9e8d`
 with member 3's PR #3, upstream `5224108`. No GPU LOD or hierarchy completion is
 implied by this integration.

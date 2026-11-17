@@ -26,7 +26,8 @@ struct ScenePayloadBytes {
     uint64_t vertices = 0;
     uint64_t indices = 0; // reordered rendering indices, not original CPU indices
     uint64_t clusters = 0;
-    uint64_t total() const { return vertices + indices + clusters; }
+    uint64_t hierarchy = 0; // level, node and child records
+    uint64_t total() const { return vertices + indices + clusters + hierarchy; }
 };
 
 struct SceneSaveResult {

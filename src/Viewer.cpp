@@ -35,6 +35,8 @@
 #include <utility>
 
 int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window);
+int runHierarchyChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene,
+                       const OrbitCamera& camera, const std::filesystem::path& output);
 
 namespace {
 
@@ -53,6 +55,7 @@ struct ViewerModel {
     OrbitCamera camera;
     std::string name;
     std::optional<SceneSaveResult> lastSave;
+    int geometryLevel = 0;
 };
 
 class ViewerUi {
@@ -189,7 +192,7 @@ void showModelInfo(GLFWwindow* window, const ViewerModel& model, const SceneUplo
     const std::string title = "Adaptive Cluster Rendering - " + model.name;
     glfwSetWindowTitle(window, title.c_str());
     printSceneSummary(std::cout, model.loaded);
-    std::cout << "Resident allocation bytes (mesh + clusters): " << upload.residentAllocationBytes
+    std::cout << "Resident allocation bytes (all geometry + hierarchy): " << upload.residentAllocationBytes
               << "\nCPU upload + wait (ms): " << upload.cpuUploadMs << "\nGPU buffer copies (ms): ";
     if (upload.gpuTransferMs) std::cout << *upload.gpuTransferMs;
     else std::cout << "N/A (timestamps unsupported)";
@@ -240,11 +243,12 @@ void drawStorageInfo(const ViewerModel& model, const SceneUploadStats& upload)
         else ImGui::TextUnformatted("Source file: N/A (generated)");
         showBytes("GPU payload", upload.payload.total());
         showBytes("Resident allocation", upload.residentAllocationBytes);
-        ImGui::SetItemTooltip("Mesh + cluster allocations, including alignment. Excludes staging, UI and framebuffer memory.");
+        ImGui::SetItemTooltip("All geometry levels and hierarchy records, including allocation alignment.");
         if (ImGui::TreeNode("Payload breakdown")) {
             showBytes("Vertices", upload.payload.vertices);
             showBytes("Render indices", upload.payload.indices);
             showBytes("Cluster records", upload.payload.clusters);
+            showBytes("Hierarchy records", upload.payload.hierarchy);
             ImGui::TreePop();
         }
     }
@@ -259,10 +263,10 @@ void drawStorageInfo(const ViewerModel& model, const SceneUploadStats& upload)
     }
     if (model.lastSave && ImGui::TreeNode("Last verified save")) {
         ImGui::TextWrapped("%s", model.lastSave->path.filename().u8string().c_str());
-        showBytes("ACR v1 file", model.lastSave->fileBytes);
+        showBytes("Saved ACR", model.lastSave->fileBytes);
         ImGui::Text("CPU save: %.3f ms", model.lastSave->cpuSaveMs);
         ImGui::Text("CPU reload: %.3f ms", model.lastSave->cpuReloadMs);
-        ImGui::TextWrapped("Exact geometry / partition match.");
+        ImGui::TextWrapped("Verified geometry, cluster IDs and hierarchy.");
         ImGui::TreePop();
     }
 }
@@ -366,6 +370,9 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
         {"app_enabled_validation", renderer.validationEnabled()}, {"gpu_timestamps_supported", renderer.supportsTimestamps()},
         {"ui_rendered", uiRendered}, {"readback_excluded", true}, {"reallocates_each_generation", generated}};
     context.counts["display_mode"] = static_cast<uint32_t>(settings.display);
+    context.counts["geometry_level"] = source.activeLevel;
+    context.counts["first_cluster_id"] = source.firstCluster;
+    context.flags["group_colors"] = settings.groupColors;
     context.counts["shadow_triangles"] = renderer.lastRecordedDraw().shadowTriangles;
     context.counts["shadow_draw_calls"] = renderer.lastRecordedDraw().shadowDrawCalls;
     context.counts["visible_clusters"] = renderer.lastRecordedDraw().visibleClusters;
@@ -403,17 +410,40 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
     if (ImGui::Begin("Model", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
         ImGui::TextWrapped("%s", model.name.c_str());
         ImGui::Text("Vertices: %zu", scene.mesh.vertices.size());
-        ImGui::Text("Triangles: %zu", scene.dataset.indices.size() / 3);
-        ImGui::Text("Clusters: %zu", scene.dataset.clusters.size());
+        const auto active = sceneLevel(scene,model.geometryLevel);
+        ImGui::Text("Triangles: %u", active.indexCount / 3);
+        ImGui::Text("Clusters: %u", active.clusterCount);
         ImGui::Text("Triangles / cluster: <= %u", scene.maxTrianglesPerCluster);
         drawBenchmarkPanel(benchmark, benchmarkOptions, exported, startBenchmark, status);
         ImGui::Separator();
         ImGui::BeginDisabled(benchmark.active() || startBenchmark);
-        ImGui::Checkbox("Cluster colors", &clusterColors);
+        if (ImGui::Checkbox("Cluster colors", &clusterColors) && clusterColors) renderSettings.groupColors = false;
         ImGui::BeginDisabled(!wireframeSupported);
         ImGui::Checkbox("Wireframe", &wireframe);
         ImGui::EndDisabled();
         if (!wireframeSupported) ImGui::TextWrapped("Wireframe unavailable on this GPU.");
+        if (!scene.hierarchy.levels.empty() &&
+            ImGui::CollapsingHeader("Mesh hierarchy", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::Checkbox("Group colors", &renderSettings.groupColors) && renderSettings.groupColors)
+                clusterColors = false;
+            ImGui::TextUnformatted("Geometry level (L0 is original)");
+            ImGui::SetNextItemWidth(-1);
+            const auto label = [](int i, const LodLevel& l) {
+                return "L" + std::to_string(i) + "  |  " + std::to_string(l.indexCount / 3) + " triangles";
+            };
+            if (ImGui::BeginCombo("##geometryLevel", label(model.geometryLevel, active).c_str())) {
+                for (int i = 0; i < static_cast<int>(scene.hierarchy.levels.size()); ++i) {
+                    if (ImGui::Selectable(label(i, scene.hierarchy.levels[i]).c_str(), i == model.geometryLevel))
+                        model.geometryLevel = i;
+                }
+                ImGui::EndCombo();
+            }
+            float error = 0;
+            for (uint32_t i = 0; i < active.nodeCount; ++i)
+                error = std::max(error, scene.hierarchy.nodes[active.firstNode + i].error);
+            ImGui::Text("Nodes: %u   Build: %.2f ms", active.nodeCount, active.buildMs);
+            ImGui::Text("Max error bound: %.4g units", error);
+        }
         if (ImGui::CollapsingHeader("Rendering and shadows")) {
             int display = static_cast<int>(renderSettings.display);
             ImGui::SetNextItemWidth(-1);
@@ -439,7 +469,7 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
         if (showBounds) {
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderInt("##bounds", &boundsCluster, -1,
-                             static_cast<int>(scene.dataset.clusters.size() - 1), "Cluster %d");
+                             static_cast<int>(active.clusterCount - 1), "Cluster %d");
             ImGui::TextUnformatted("-1: all selected bounds");
         }
         if (ImGui::Button("Reset camera")) {
@@ -463,7 +493,7 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
             ImGui::TextUnformatted("Preview selection");
             ImGui::SetNextItemWidth(-1);
             ImGui::Combo("##selection", &selectionPreset, "All clusters\0First + last cluster\0Empty list\0Last + first cluster\0");
-            ImGui::Text("Selected: %zu / %zu clusters", selection.ranges.size(), scene.dataset.clusters.size());
+            ImGui::Text("Selected: %zu / %u clusters", selection.ranges.size(), active.clusterCount);
             ImGui::Text("Selected triangles: %llu", static_cast<unsigned long long>(selection.triangleCount()));
             if (!selection.allClusters && !selection.ranges.empty()) {
                 ImGui::Text("Source IDs: %u", selection.ranges.front().sourceClusterId);
@@ -586,7 +616,8 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     }
     ViewerInput input;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_VISIBLE, (options.smokeTest || options.renderSmoke || cliBenchmark) ? GLFW_FALSE : GLFW_TRUE);
+    glfwWindowHint(GLFW_VISIBLE, (options.smokeTest || options.renderSmoke || cliBenchmark ||
+                   !options.hierarchyRoundtripPath.empty()) ? GLFW_FALSE : GLFW_TRUE);
     std::unique_ptr<GLFWwindow, decltype(&glfwDestroyWindow)> window(
         glfwCreateWindow(960, 640, "Adaptive Cluster Rendering", nullptr, nullptr), glfwDestroyWindow);
     if (!window) {
@@ -607,7 +638,12 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     if (!options.heightMapPath.empty()) renderer.setHeightField(loadHeightField(options.heightMapPath));
     if (options.wireframe && !renderer.supportsWireframe()) throw std::runtime_error("Wireframe is not supported by this GPU.");
     renderer.uploadScene(model.loaded.scene);
+    renderer.setHierarchyLevel(options.geometryLevel);
+    model.geometryLevel = static_cast<int>(options.geometryLevel);
+    if (model.loaded.scene.hierarchy.levels.empty()) options.renderSettings.groupColors = false;
     renderer.setRenderSettings(options.renderSettings);
+    if (!options.hierarchyRoundtripPath.empty())
+        return runHierarchyChecks(renderer,window.get(),model.loaded.scene,model.camera,options.hierarchyRoundtripPath);
     if (options.renderSmoke) return runRenderIntegrationChecks(renderer, window.get());
     if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(model.loaded.scene);
     showModelInfo(window.get(), model, renderer.uploadStats());
@@ -634,8 +670,9 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     uint32_t benchmarkSerial = 0;
     auto benchmarkStarted = std::chrono::steady_clock::now();
     unsigned frame = 0;
-    auto replaceModel = [&](LoadedScene replacement, bool preserveView = false) {
+    auto replaceModel = [&](LoadedScene replacement, bool preserveView = false, int level = 0) {
         auto next = makeModel(std::move(replacement));
+        next.geometryLevel = level;
         auto previousSelection = selectionRequest(renderer.clusterSelection());
         if (preserveView) {
             if (!sameSceneData(model.loaded.scene, next.loaded.scene)) {
@@ -643,14 +680,17 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
             }
             next.camera = model.camera;
             next.lastSave = model.lastSave;
+            next.geometryLevel = model.geometryLevel;
         }
         renderer.uploadScene(next.loaded.scene);
+        renderer.setHierarchyLevel(static_cast<uint32_t>(next.geometryLevel));
         model = std::move(next);
+        if (model.loaded.scene.hierarchy.levels.empty()) renderSettings.groupColors = false;
         if (options.smokeTest) {
             bool rejected = false;
             try { renderer.setClusterSelection(previousSelection); } catch (const std::exception&) { rejected = true; }
             if (!rejected || renderer.generatedGeometry().valid || !renderer.clusterSelection().allClusters ||
-                renderer.sceneGpuData().sceneRevision != previousSelection.sceneRevision + 1) {
+                renderer.sceneGpuData().sceneRevision != previousSelection.sceneRevision + 1 + (model.geometryLevel != 0)) {
                 throw std::runtime_error("Source replacement did not invalidate the previous selection revision.");
             }
         }
@@ -679,7 +719,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
             if (!sameSceneData(smokeOriginal->scene, restored.scene)) {
                 throw std::runtime_error("Smoke save/mock/reload changed the source scene.");
             }
-            replaceModel(std::move(restored));
+            replaceModel(std::move(restored), false, static_cast<int>(options.geometryLevel));
             model.camera = originalCamera;
             boundsCluster = 0;
         } else if (options.smokeTest && frame == 10) {
@@ -794,6 +834,11 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                                       displacement, heightPreset, renderer.heightField(), renderer.heightAllocationBytes(),
                                       renderer.uploadStats(), status, benchmark, options.benchmarkOptions, exportedBenchmark, benchmarkRequested, renderSettings, renderer.lastRecordedDraw());
         if (benchmarkRequested && !alreadyRequested) benchmarkStarted = std::chrono::steady_clock::now();
+        if (static_cast<uint32_t>(model.geometryLevel) != renderer.sceneGpuData().activeLevel) {
+            renderer.setHierarchyLevel(static_cast<uint32_t>(model.geometryLevel));
+            appliedPreset = -1;
+            boundsCluster = -1;
+        }
         if (selectionPreset != appliedPreset) {
             renderer.setClusterSelection(previewSelection(renderer.sceneGpuData(), selectionPreset));
             appliedPreset = selectionPreset;
@@ -921,7 +966,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                     }
                 }
                 const auto expectedCalls = selected.ranges.empty() ? 0u :
-                    (!clusterColors && (computeGeometry || selected.allClusters) ? 1u : static_cast<uint32_t>(selected.ranges.size()));
+                    (!clusterColors && !renderSettings.groupColors && (computeGeometry || selected.allClusters) ? 1u : static_cast<uint32_t>(selected.ranges.size()));
                 const auto expectedTriangles = selected.triangleCount() * (computeGeometry ? uint64_t(renderer.edgeSegments()) * renderer.edgeSegments() : 1);
                 if (recorded.triangles != expectedTriangles || recorded.meshDrawCalls != expectedCalls || recorded.wireframe != wireframe ||
                     recorded.boundsInstances != expectedBounds || recorded.usesGeneratedGeometry != computeGeometry ||
@@ -953,7 +998,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                 }
                 else if (action == ModelAction::ReloadSaved) {
                     replaceModel(loadSceneWithStats(model.lastSave->path), true);
-                    status = "Reload matched; camera and cluster selection preserved.";
+                    status = "Reload matched; camera, geometry level and selection preserved.";
                 }
 #ifdef _WIN32
                 else {
@@ -968,7 +1013,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                         else if (action == ModelAction::Save) {
                             model.lastSave = saveSceneVerified(path, model.loaded.scene);
                             status = "Saved + verified: " + path.filename().u8string() +
-                                     ". Geometry and cluster partition match exactly.";
+                                     ". Geometry, partition and hierarchy match exactly.";
                             std::cout << status << " File bytes: " << model.lastSave->fileBytes << std::endl;
                         } else {
                             replaceModel(loadSceneWithStats(path));

@@ -2,6 +2,7 @@
 
 #include "ClusterGpu.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -26,6 +27,32 @@ std::string lowerExtension(const std::filesystem::path& path)
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return extension;
 }
+
+// Reserve a private sibling directory atomically, even across processes.
+// Renaming within the same filesystem publishes only a fully verified file.
+class PendingSave {
+  public:
+    explicit PendingSave(const std::filesystem::path& target)
+    {
+        static std::atomic<uint64_t> serial{0};
+        do {
+            directory =
+                target.parent_path() / (".acr-save-" + std::to_string(Clock::now().time_since_epoch().count()) + "-" +
+                                        std::to_string(serial.fetch_add(1)));
+            file = directory / "scene.acr";
+        } while (!std::filesystem::create_directory(directory));
+    }
+    ~PendingSave()
+    {
+        std::error_code ignored;
+        std::filesystem::remove(file, ignored);
+        std::filesystem::remove(directory, ignored);
+    }
+    std::filesystem::path file;
+
+  private:
+    std::filesystem::path directory;
+};
 } // namespace
 
 LoadedScene loadSceneWithStats(const std::filesystem::path& path)
@@ -35,7 +62,7 @@ LoadedScene loadSceneWithStats(const std::filesystem::path& path)
     result.source.path = std::filesystem::absolute(path).lexically_normal();
     result.scene = loadScene(result.source.path); // rejects unsupported formats / versions
     result.source.kind = lowerExtension(path) == ".acr" ? SceneSourceKind::Acr : SceneSourceKind::Obj;
-    if (result.source.kind == SceneSourceKind::Acr) result.source.fileVersion = kSceneFileVersion;
+    if (result.source.kind == SceneSourceKind::Acr) result.source.fileVersion = sceneFileVersion(result.scene);
     result.source.fileBytes = std::filesystem::file_size(result.source.path);
     result.source.cpuPrepareMs = elapsedMs(start);
     return result;
@@ -103,8 +130,10 @@ const char* scenePrepareLabel(SceneSourceKind kind)
 ScenePayloadBytes scenePayloadBytes(const SceneData& scene)
 {
     return {uint64_t(scene.mesh.vertices.size()) * sizeof(Vertex),
-            uint64_t(scene.dataset.indices.size()) * sizeof(uint32_t),
-            uint64_t(scene.dataset.clusters.size()) * sizeof(GpuClusterDesc)};
+            uint64_t(scene.dataset.indices.size() + scene.hierarchy.coarse.indices.size()) * sizeof(uint32_t),
+            uint64_t(scene.dataset.clusters.size() + scene.hierarchy.coarse.clusters.size()) * sizeof(GpuClusterDesc),
+            scene.hierarchy.levels.size() * sizeof(LodLevel) + scene.hierarchy.nodes.size() * sizeof(LodNode) +
+                scene.hierarchy.children.size() * sizeof(uint32_t)};
 }
 
 void printSceneSummary(std::ostream& out, const LoadedScene& loaded)
@@ -115,19 +144,33 @@ void printSceneSummary(std::ostream& out, const LoadedScene& loaded)
     if (source.fileVersion) out << " v" << *source.fileVersion;
     if (!source.path.empty()) out << " | " << source.path.u8string();
     out << "\nFile bytes: ";
-    if (source.fileBytes) out << *source.fileBytes;
-    else out << "N/A (generated scene)";
-    out << "\nVertices: " << scene.mesh.vertices.size() << " | triangles: "
-        << scene.dataset.indices.size() / 3 << " | clusters: " << scene.dataset.clusters.size()
-        << " | capacity: " << scene.maxTrianglesPerCluster << '\n'
+    if (source.fileBytes)
+        out << *source.fileBytes;
+    else
+        out << "N/A (generated scene)";
+    out << "\nVertices: " << scene.mesh.vertices.size() << " | triangles: " << scene.dataset.indices.size() / 3
+        << " | clusters: " << scene.dataset.clusters.size() << " | capacity: " << scene.maxTrianglesPerCluster << '\n'
         << scenePrepareLabel(source.kind) << " (ms): " << source.cpuPrepareMs << '\n';
     const auto bytes = scenePayloadBytes(scene);
-    out << "GPU payload bytes (vertices / indices / clusters / total): " << bytes.vertices
-        << " / " << bytes.indices << " / " << bytes.clusters << " / " << bytes.total() << '\n';
+    out << "GPU payload bytes (vertices / indices / clusters / hierarchy / total): " << bytes.vertices << " / "
+        << bytes.indices << " / " << bytes.clusters << " / " << bytes.hierarchy << " / " << bytes.total() << '\n';
+    for (size_t i = 0; i < scene.hierarchy.levels.size(); ++i) {
+        const auto& l = scene.hierarchy.levels[i];
+        float error = 0;
+        for (uint32_t j = 0; j < l.nodeCount; ++j) error = std::max(error,scene.hierarchy.nodes[l.firstNode+j].error);
+        out << "LOD " << i << " | " << l.indexCount/3 << " triangles | " << l.clusterCount << " clusters | "
+            << l.nodeCount << " nodes | max error " << error << " | build " << l.buildMs << " ms\n";
+    }
 }
 
 bool sameSceneData(const SceneData& a, const SceneData& b)
 {
+    const auto sameRecords = [](const auto& x, const auto& y) {
+        return x.size() == y.size() && (x.empty() || std::memcmp(x.data(),y.data(),x.size()*sizeof(x[0])) == 0);
+    };
+    if (!sameRecords(a.hierarchy.levels,b.hierarchy.levels) || !sameRecords(a.hierarchy.nodes,b.hierarchy.nodes) ||
+        a.hierarchy.children != b.hierarchy.children || a.hierarchy.coarse.indices != b.hierarchy.coarse.indices ||
+        a.hierarchy.coarse.clusters.size() != b.hierarchy.coarse.clusters.size()) return false;
     if (a.maxTrianglesPerCluster != b.maxTrianglesPerCluster ||
         a.mesh.indices != b.mesh.indices || a.mesh.positionIds != b.mesh.positionIds ||
         a.dataset.indices != b.dataset.indices || a.mesh.vertices.size() != b.mesh.vertices.size() ||
@@ -138,9 +181,9 @@ bool sameSceneData(const SceneData& a, const SceneData& b)
         if (!sameVec3(x.position, y.position) || !sameVec3(x.normal, y.normal) ||
             std::memcmp(&x.texcoord.x, &y.texcoord.x, 2 * sizeof(float)) != 0) return false;
     }
-    for (size_t i = 0; i < a.dataset.clusters.size(); ++i) {
-        const auto& x = a.dataset.clusters[i];
-        const auto& y = b.dataset.clusters[i];
+    for (uint32_t i = 0; i < a.dataset.clusters.size() + a.hierarchy.coarse.clusters.size(); ++i) {
+        const auto& x = sceneCluster(a,i);
+        const auto& y = sceneCluster(b,i);
         if (x.firstIndex != y.firstIndex || x.indexCount != y.indexCount ||
             !sameVec3(x.boundsMin, y.boundsMin) || !sameVec3(x.boundsMax, y.boundsMax)) return false;
     }
@@ -155,12 +198,14 @@ SceneSaveResult saveSceneVerified(const std::filesystem::path& path, const Scene
     SceneSaveResult result;
     result.path = std::filesystem::absolute(path).lexically_normal();
     const auto start = Clock::now();
-    saveScene(result.path, scene);
+    PendingSave pending(result.path);
+    saveScene(pending.file, scene);
     result.cpuSaveMs = elapsedMs(start);
-    const auto restored = loadSceneWithStats(result.path);
+    const auto restored = loadSceneWithStats(pending.file);
     if (!sameSceneData(scene, restored.scene)) {
-        throw std::runtime_error("Saved ACR does not match the source geometry / cluster partition.");
+        throw std::runtime_error("Saved ACR does not match the source geometry, clusters or hierarchy.");
     }
+    std::filesystem::rename(pending.file,result.path);
     result.fileBytes = *restored.source.fileBytes;
     result.cpuReloadMs = restored.source.cpuPrepareMs;
     return result;

@@ -13,4 +13,4 @@ struct GeometryValidationStats {
 GeometryValidationStats validateGeneratedGeometry(const SceneData& source,
     const ResolvedClusterSelection& selection, uint32_t edgeSegments,
     const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices,
-    const HeightField* height = nullptr, DisplacementSettings displacement = {});
+    const HeightField* height = nullptr, DisplacementSettings displacement = {}, uint32_t geometryLevel = 0);

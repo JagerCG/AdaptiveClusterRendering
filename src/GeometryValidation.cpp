@@ -31,7 +31,7 @@ glm::dvec3 unitOrZero(glm::dvec3 v)
 GeometryValidationStats validateGeneratedGeometry(const SceneData& source,
     const ResolvedClusterSelection& selection, uint32_t n,
     const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices,
-    const HeightField* height, DisplacementSettings displacement)
+    const HeightField* height, DisplacementSettings displacement, uint32_t geometryLevel)
 {
     validateDisplacement(displacement);
     require(!displacement.enabled || height, "Displacement verification requires a height map.");
@@ -41,21 +41,24 @@ GeometryValidationStats validateGeneratedGeometry(const SceneData& source,
     require(vertices.size() == selection.indexCount * n * n && indices.size() == vertices.size(),
             "Generated counts do not equal selected source triangles times n squared.");
     GeometryValidationStats stats;
+    const auto level = sceneLevel(source,geometryLevel);
+    const auto& sourceIndices = geometryLevel ? source.hierarchy.coarse.indices : source.dataset.indices;
+    const size_t levelOffset = geometryLevel ? level.firstIndex - source.dataset.indices.size() : 0;
     size_t cursor = 0;
     // Shared source-index edges have a canonical sample number from low to high
     // index. Even across cluster boundaries, matching samples must be bit-identical.
     std::map<std::array<uint32_t, 3>, Vertex> edgeSamples;
     for (const auto& range : selection.ranges) {
-        require(range.sourceClusterId < source.dataset.clusters.size(), "Invalid source cluster in verification.");
-        const auto& cluster = source.dataset.clusters[range.sourceClusterId];
-        require(uint64_t(range.firstIndex) + range.indexCount <= source.dataset.indices.size() && range.indexCount % 3 == 0,
+        require(range.sourceClusterId < level.clusterCount, "Invalid source cluster in verification.");
+        const auto& cluster = sceneCluster(source,level.firstCluster+range.sourceClusterId);
+        require(uint64_t(range.firstIndex) + range.indexCount <= level.indexCount && range.indexCount % 3 == 0,
                 "Invalid source range in geometry verification.");
         for (uint32_t first = range.firstIndex; first < range.firstIndex + range.indexCount; first += 3) {
             std::array<uint32_t, 3> ids;
             std::array<Vertex, 3> original;
             std::array<std::array<float, 8>, 3> fields;
             for (uint32_t k = 0; k < 3; ++k) {
-                ids[k] = source.dataset.indices[first + k];
+                ids[k] = sourceIndices[levelOffset + first + k];
                 require(ids[k] < source.mesh.vertices.size(), "Invalid source vertex in geometry verification.");
                 original[k] = source.mesh.vertices[ids[k]];
                 fields[k] = attributes(original[k]);
