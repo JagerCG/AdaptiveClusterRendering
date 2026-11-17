@@ -42,7 +42,7 @@ target_link_libraries(imgui PRIVATE glfw Vulkan::Vulkan)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>")
 set(SHADER_SOURCES)
 set(COMPILED_SHADERS)
-foreach(SHADER IN ITEMS mesh.vert mesh.frag bounds.vert bounds.frag generate_geometry.comp)
+foreach(SHADER IN ITEMS mesh.vert mesh.frag shadow.vert shadow.frag shadow_debug.vert shadow_debug.frag bounds.vert bounds.frag generate_geometry.comp)
     set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}")
     set(SHADER_OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER}.inc")
     add_custom_command(
@@ -61,6 +61,8 @@ source_group("Shaders" FILES ${SHADER_SOURCES})
 source_group("Generated Shaders" REGULAR_EXPRESSION "[.]inc$")
 
 add_library(acr_scene STATIC
+    src/RenderPlanning.cpp
+    src/RenderPlanning.h
     src/Benchmark.cpp
     src/Benchmark.h
     src/ClusterBuilder.cpp
@@ -98,6 +100,8 @@ add_executable(AdaptiveClusterRendering
     src/Viewer.cpp
     src/Viewer.h
     src/VulkanRenderer.cpp
+    src/VulkanRendererShadow.cpp
+    tests/RenderIntegrationChecks.cpp
     src/VulkanRenderer.h
     src/SceneGpuData.h
     src/ComputeGeometry.cpp
@@ -137,6 +141,9 @@ endif()
 include(CTest)
 option(ACR_ENABLE_GPU_TESTS "Run Vulkan smoke tests (requires a working GPU/window system)" OFF)
 if(BUILD_TESTING)
+    add_executable(render_planning_tests tests/RenderPlanningTests.cpp)
+    target_link_libraries(render_planning_tests PRIVATE acr_scene)
+    add_test(NAME render-planning COMMAND render_planning_tests)
     add_executable(benchmark_tests tests/BenchmarkTests.cpp)
     target_link_libraries(benchmark_tests PRIVATE acr_scene)
     if(MSVC)
@@ -172,8 +179,11 @@ if(BUILD_TESTING)
         add_test(NAME displacement-${CASE} COMMAND displacement_tests ${CASE} "${CMAKE_CURRENT_BINARY_DIR}/test-data/heights")
     endforeach()
     if(ACR_ENABLE_GPU_TESTS)
+        add_test(NAME gpu-render-integration COMMAND AdaptiveClusterRendering --mock --render-smoke)
+        set_tests_properties(gpu-render-integration PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS "gpu"
+            FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu")
-        foreach(CASE IN ITEMS all partial empty source)
+        foreach(CASE IN ITEMS all partial empty source shadows shadow-map)
             add_test(NAME gpu-benchmark-${CASE} COMMAND "${CMAKE_COMMAND}"
                 "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>" "-DCONFIG=$<CONFIG>" "-DMODE=${CASE}"
                 "-DREPORT=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/benchmark-${CASE}.json"
@@ -191,11 +201,11 @@ if(BUILD_TESTING)
         add_test(NAME gpu-cached COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/suzanne.acr"
                  --smoke-roundtrip "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/cached-roundtrip.acr")
         set_tests_properties(gpu-cached PROPERTIES FIXTURES_REQUIRED cached_scene)
-        foreach(FIXTURE IN ITEMS triangle plane grid)
+        foreach(FIXTURE IN ITEMS triangle plane grid shadow)
             add_test(NAME gpu-fixture-${FIXTURE} COMMAND AdaptiveClusterRendering --fixture ${FIXTURE}
                      --smoke-roundtrip "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/${FIXTURE}-roundtrip.acr")
         endforeach()
-        set_tests_properties(gpu-mock gpu-obj gpu-cached gpu-fixture-triangle gpu-fixture-plane gpu-fixture-grid PROPERTIES
+        set_tests_properties(gpu-mock gpu-obj gpu-cached gpu-fixture-triangle gpu-fixture-plane gpu-fixture-grid gpu-fixture-shadow PROPERTIES
             TIMEOUT 60 RUN_SERIAL TRUE LABELS "gpu"
             FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         add_test(NAME gpu-copy-mock COMMAND AdaptiveClusterRendering --mock --compute-copy

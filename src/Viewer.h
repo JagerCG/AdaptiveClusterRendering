@@ -4,10 +4,13 @@
 #include <cstdint>
 #include "HeightField.h"
 #include "Benchmark.h"
+#include "RenderPlanning.h"
 
 struct LoadedScene;
 
 struct ViewerOptions {
+    RenderSettings renderSettings;
+    bool renderSmoke = false;
     bool clusterColors = false;
     bool showBounds = false;
     bool verifyGpu = false;

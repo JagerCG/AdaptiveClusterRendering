@@ -95,8 +95,13 @@ int main(int argc, char** argv)
             expect(qem.dataset.indices == repeated.dataset.indices &&
                    qem.dataset.clusters.size() == repeated.dataset.clusters.size(),
                    "QEM-guided clustering is not deterministic.");
-            // Different growth orders can leave different-sized remainder groups.
-            // Capacity and complete coverage are required; equal group counts are not.
+            // PR #3 retains baseline membership and only sorts triangles within each cluster.
+            expect(qem.dataset.clusters.size() == baseline.clusters.size(), "QEM ordering changed baseline membership.");
+            for (size_t id = 0; id < baseline.clusters.size(); ++id) {
+                const auto& a = baseline.clusters[id]; const auto& b = qem.dataset.clusters[id];
+                expect(a.firstIndex == b.firstIndex && a.indexCount == b.indexCount &&
+                       a.boundsMin == b.boundsMin && a.boundsMax == b.boundsMax, "QEM ordering changed cluster bounds/ranges.");
+            }
             const size_t triangleCount = mesh.indices.size() / 3;
             const size_t minimumClusters = (triangleCount + capacity - 1) / capacity;
             expect(qem.dataset.clusters.size() >= minimumClusters &&
@@ -113,8 +118,9 @@ int main(int argc, char** argv)
                    "Expected finite, nonnegative QEM error statistics.");
             expect(qem.errorStats.internalAdjacencyCount > 0 && baselineError.internalAdjacencyCount > 0,
                    "Expected Suzanne clusters to contain adjacent triangle pairs.");
-            expect(qem.errorStats.meanInternalEdgeError ==
-                       measureQemInternalEdgeError(mesh, qem.dataset).meanInternalEdgeError,
+            expect(std::abs(qem.errorStats.meanInternalEdgeError -
+                       measureQemInternalEdgeError(mesh, qem.dataset).meanInternalEdgeError) <=
+                       1e-12 * std::max(1.0, std::abs(qem.errorStats.meanInternalEdgeError)),
                    "QEM grouping reported inconsistent internal-edge error.");
             const auto baselineMs = std::chrono::duration<double, std::milli>(baselineTime).count();
             const auto qemMs = std::chrono::duration<double, std::milli>(qemTime).count();

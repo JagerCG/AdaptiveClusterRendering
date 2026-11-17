@@ -49,6 +49,27 @@ SceneData makeTessellationFixture(TessellationFixture fixture)
         validateScene(scene);
         return scene;
     }
+    case TessellationFixture::ShadowStage: {
+        SceneData scene;
+        scene.maxTrianglesPerCluster = 2;
+        const auto quad = [&](float halfSize, float z, bool receiver) {
+            const uint32_t base = static_cast<uint32_t>(scene.mesh.vertices.size());
+            const glm::vec2 corners[] = {{0,0}, {1,0}, {1,1}, {0,1}};
+            for (const auto& uv : corners) {
+                scene.mesh.positionIds.push_back(static_cast<uint32_t>(scene.mesh.vertices.size()));
+                // The receiver samples neutral at UV (0,0) for Waves/Mound.
+                scene.mesh.vertices.push_back({{(2*uv.x-1)*halfSize, (2*uv.y-1)*halfSize, z}, {0,0,1}, receiver ? glm::vec2(0) : uv});
+            }
+            const auto first = static_cast<uint32_t>(scene.mesh.indices.size());
+            scene.mesh.indices.insert(scene.mesh.indices.end(), {base,base+1,base+2, base,base+2,base+3});
+            scene.dataset.clusters.push_back({first,6,{-halfSize,-halfSize,z},{halfSize,halfSize,z}});
+        };
+        quad(1.8f, -.65f, true);
+        quad(.6f, .3f, false);
+        scene.dataset.indices = scene.mesh.indices;
+        validateScene(scene);
+        return scene;
+    }
     case TessellationFixture::Plane: return makePatchGrid(1);
     case TessellationFixture::ClusterGrid: return makePatchGrid(2);
     }

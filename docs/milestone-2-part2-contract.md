@@ -1,5 +1,7 @@
 # Milestone 2 Part 2 foundation and integration contract
 
+Current integration update (2026-11-16): see [the rendering integration handoff](milestone-2-render-integration.md). Main/depth/displaced-shadow rendering and pass timing now work together. Hierarchy and actual GPU-produced selection remain pending. Historical Steps 1-7 below retain their original implementation/measurement dates.
+
 Prepared: 2026-11-13. Scope: member 2, modules 02 and 07.
 
 This is the working contract for developing Part 2 from the synchronized M1

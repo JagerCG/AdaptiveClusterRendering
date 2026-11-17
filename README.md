@@ -6,6 +6,11 @@ A C++ and Vulkan renderer for experimenting with cluster-based geometry. Milesto
 
 ## Development handoff
 
+Part 2 and member 3's rendering update are now integrated. Start with the
+[rendering integration and shadow demo](docs/milestone-2-render-integration.md)
+for the current state, build commands and remaining GPU LOD/hierarchy dependencies.
+
+
 The [M2 Part 2 foundation and integration contract](docs/milestone-2-part2-contract.md)
 defines the working interfaces for storage and compute-based tessellation/displacement,
 including resource ownership and the handoff to rendering. It records the synchronized
@@ -47,6 +52,8 @@ CMake downloads the pinned dependencies on the first configure, compiles the sha
 To run from Visual Studio, open `build/AdaptiveClusterRendering.sln` and select **Debug / x64**. If `ALL_BUILD` is selected for startup, right-click `AdaptiveClusterRendering` in Solution Explorer and choose **Set as Startup Project**. Press **F5** to run.
 
 Use `cmake --build --preset release` to build the Release version in `build/Release/`.
+The upstream Ninja configure presets remain available with build presets `ninja-debug`
+and `ninja-release`; configure each matching preset in an MSVC developer environment first.
 
 ## M1 demo
 
@@ -346,7 +353,7 @@ cmake --build --preset debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CPU tests cover the fixed mock, lossless roundtrip, real OBJ geometry, deterministic baseline/QEM-guided clustering, invalid scene data, and malformed/version-mismatched files. QEM-guided partitions must preserve source triangles and capacity, but may contain a different number of clusters than the baseline. Optional GPU tests run hidden windows, verify uploads, replace real/mock scenes, and submit Draw All, cluster color, all-bounds and selected-bounds draws. The GPU tests need a working Vulkan window system. They fail on validation warnings/errors; use **Debug** and install the Khronos validation layer to obtain that coverage. `ACR_ENABLE_GPU_TESTS` is off by default on other machines.
+CPU tests cover the fixed mock, lossless roundtrip, real OBJ geometry, deterministic baseline/QEM-guided clustering, invalid scene data, and malformed/version-mismatched files. The current QEM experiment retains baseline cluster membership, ranges and bounds, sorting triangles only within each cluster; tests also retain determinism, coverage and roundtrip checks. Optional GPU tests run hidden windows, verify uploads, replace real/mock scenes, and submit Draw All, cluster color, all-bounds and selected-bounds draws. The GPU tests need a working Vulkan window system. They fail on validation warnings/errors; use **Debug** and install the Khronos validation layer to obtain that coverage. `ACR_ENABLE_GPU_TESTS` is off by default on other machines.
 
 The `scene-storage-stats` case checks source metadata, exact file/payload sizes,
 CPU timings, field-level roundtrip comparison and failed-load preservation.
@@ -411,7 +418,7 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | --- | --- |
 | `src/ObjLoader.cpp`, `src/MeshSource.h` | Read OBJ positions, normals and UVs into an indexed mesh. Supply a face normal for corners that lack one. |
 | `src/ClusterBuilder.cpp` | Group edge-connected triangles on the CPU. Each cluster has at most 64 triangles, a contiguous index range, and a model-space bounding box. |
-| `src/QemClusterBuilder.*` | Experimental QEM-guided grouping and internal-edge score measurement. Geometry is unchanged; this library/test path is not selected by the viewer. |
+| `src/QemClusterBuilder.*` | Experimental QEM-based ordering within baseline clusters and internal-edge score measurement. Geometry is unchanged; this library/test path is not selected by the viewer. |
 | `src/SceneData.*` | Shared scene handoff, fixed mock, strict validation, OBJ/ACR loading, and versioned persistence. |
 | `src/SceneDiagnostics.*` | Runtime source/file summaries, CPU preparation timing, payload byte counts and exact save/reload verification. Leaves ACR v1 unchanged. |
 | `src/TessellationFixtures.*` | Authored triangle, continuous-UV plane and four-cluster grid for module 07 correctness checks. |
@@ -425,7 +432,7 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/VulkanRenderer.cpp`, `shaders/` | Upload geometry and cluster descriptors; depth-tested mesh and SSBO-driven bounds. In cluster color mode, draw each index range with its own color. |
 | `src/Viewer.cpp`, `src/OrbitCamera.cpp` | Manage model loading, camera controls, and the Model panel. |
 
-The default path draws all source triangles; the test-input panel can preview a fixed subset or an empty selection. Clustering, selection resolution, compute work-list preparation and mesh draw submission remain on the CPU; optional uniform subdivision and height displacement write independent output geometry on the GPU. The bounds shader consumes source cluster descriptors plus conservative displacement padding. The experimental QEM-guided builder changes grouping only. Geometry simplification, hierarchy construction/traversal, GPU LOD/culling, Hi-Z, streaming, adaptive subdivision, general displaced seam repair and shadows are not yet implemented. The next milestone can extend `SceneGpuData` and the descriptor layout once its hierarchy contract is agreed.
+The default path draws all source triangles; the test-input panel can preview a fixed subset or an empty selection. Clustering, selection resolution, compute work-list preparation and mesh draw submission remain on the CPU; optional uniform subdivision and height displacement write independent output geometry on the GPU. The bounds shader consumes source cluster descriptors plus conservative displacement padding. The current experimental QEM builder sorts triangles within baseline groups only. Source/generated rendering now includes matched directional shadows and camera/light depth views; optional CPU visibility previews affect main draws without removing shadow casters. Geometry simplification, hierarchy construction/traversal, GPU LOD/culling, Hi-Z, streaming, adaptive subdivision, general displaced seam repair are not yet implemented. The next milestone can extend `SceneGpuData` and the descriptor layout once its hierarchy contract is agreed.
 
 ## Credits
 

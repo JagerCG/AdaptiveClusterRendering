@@ -10,6 +10,7 @@ public:
     void orbit(float deltaX, float deltaY);
     void zoom(float scrollSteps);
     void reset();
+    glm::vec3 eyePosition(float aspectRatio = 1.0f) const;
     glm::mat4 viewProjection(float aspectRatio) const;
 
 private:

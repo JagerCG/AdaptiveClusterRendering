@@ -2,7 +2,7 @@
 
 #include "SceneData.h"
 
-enum class TessellationFixture { Triangle, Plane, ClusterGrid };
+enum class TessellationFixture { Triangle, Plane, ClusterGrid, ShadowStage };
 
 // Deterministic source geometry for module 07, not tessellated output.
 // All fixtures lie in XY at z=0, with +Z unit normals and CCW winding.

@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include "SceneGpuData.h"
 #include "ComputeGeometry.h"
+#include "RenderPlanning.h"
 
 #include <memory>
 #include <vector>
@@ -21,6 +22,10 @@ struct SourceDrawStats {
     uint32_t meshDrawCalls = 0;
     uint32_t boundsInstances = 0;
     float boundsPadding = 0;
+    uint64_t shadowTriangles = 0;
+    uint32_t shadowDrawCalls = 0, visibleClusters = 0;
+    RenderDisplay display = RenderDisplay::Shaded;
+    bool shadowPass = false;
 };
 
 class VulkanRenderer {
@@ -43,6 +48,7 @@ public:
     const HeightField& heightField() const { return compute_->heightField(); }
     uint64_t heightRevision() const { return compute_->heightRevision(); }
     uint64_t heightAllocationBytes() const { return compute_->heightAllocationBytes(); }
+    float plannedDisplacementBound() const { return displacementBound(heightField(), displacement_); }
     bool supportsWireframe() const { return wireframeSupported_; }
     const GeneratedGeometry& generatedGeometry() const { return compute_->output(); }
     const SceneGpuData& sceneGpuData() const { return sceneGpu_; }
@@ -57,6 +63,14 @@ public:
     VkExtent2D renderExtent() const { return extent_; }
     // Valid only for the most recently submitted measured frame; waits outside the GPU interval.
     std::optional<double> finishRenderMeasurement();
+    std::optional<double> lastMainMs() const { return mainMs_; }
+    std::optional<double> lastShadowMs() const { return shadowMs_; }
+    void setRenderSettings(const RenderSettings& settings);
+    const RenderSettings& renderSettings() const { return renderSettings_; }
+    // Readbacks are validation only, outside measured intervals.
+    std::vector<float> readShadowDepth();
+    const glm::mat4& lastLightMatrix() const { return lightMatrix_; }
+    static constexpr uint32_t shadowMapSize = 1024;
     bool prepareFrame(GLFWwindow* window);
     bool drawFrame(const OrbitCamera& camera, bool clusterColors, bool showBounds, int boundsCluster,
                    bool computeGeometry, bool wireframe, ImDrawData* ui, bool measure = false);
@@ -82,6 +96,8 @@ private:
     void destroyBuffer(const Buffer& buffer);
     void selectDepthFormat();
     void createDepthResources();
+    void createShadowResources();
+    void destroyShadowResources();
     void recreateSwapchain(int width, int height);
     void createRenderPass();
     void createPipeline();
@@ -113,6 +129,18 @@ private:
     VkPipeline wireframePipeline_ = VK_NULL_HANDLE;
     bool wireframeSupported_ = false;
     VkPipeline boundsPipeline_ = VK_NULL_HANDLE;
+    VkPipeline shadowPipeline_ = VK_NULL_HANDLE, shadowDebugPipeline_ = VK_NULL_HANDLE;
+    VkRenderPass shadowRenderPass_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout shadowLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSet shadowSet_ = VK_NULL_HANDLE;
+    VkImage shadowImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory shadowMemory_ = VK_NULL_HANDLE;
+    VkImageView shadowView_ = VK_NULL_HANDLE;
+    VkSampler shadowSampler_ = VK_NULL_HANDLE;
+    VkFramebuffer shadowFramebuffer_ = VK_NULL_HANDLE;
+    Buffer lightingBuffer_;
+    RenderSettings renderSettings_;
+    glm::mat4 lightMatrix_{1};
     VkDescriptorSetLayout sceneLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool scenePool_ = VK_NULL_HANDLE;
     uint32_t uiImageCount_ = 0;
@@ -144,6 +172,7 @@ private:
     VkQueryPool uploadQueries_ = VK_NULL_HANDLE;
     VkQueryPool renderQueries_ = VK_NULL_HANDLE;
     bool renderMeasurementPending_ = false;
+    std::optional<double> mainMs_, shadowMs_;
     uint32_t timestampValidBits_ = 0;
     float timestampPeriod_ = 0.0f;
 };

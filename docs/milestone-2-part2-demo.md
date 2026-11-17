@@ -2,7 +2,9 @@
 
 Updated 2026-11-14. Member 2: module 02 storage and module 07 GPU subdivision /
 height displacement. This is the standalone M2 deliverable; integration with the
-other members' hierarchy, visibility and shadow paths is still pending.
+other members' hierarchy and actual GPU visibility paths is still pending. The
+2026-11-16 [rendering integration](milestone-2-render-integration.md) adds matched
+displaced shadows, depth views and separate pass timings; use it for the current demo.
 
 ## Start the demo
 
@@ -111,9 +113,9 @@ access error, so paste support was not verified.
 | --- | --- | --- |
 | Module 01 -> 02 | Validated source scene, ACR v1, upload diagnostics and exact roundtrip | Define and version hierarchy, coarse/fine meshes, geometric error and new bounds before extending the cache format. |
 | Modules 03/04 -> 07 | Revision-bound ordered All/Explicit source cluster selection; empty selection supported | Real GPU-produced selection/count buffers, work expansion, capacity policy, indirect dispatch and synchronization. The current producer/work list is CPU-authored. |
-| Module 07 -> 05 | Borrowed generated vertex/index view, source-ID ranges, counts, generation identity and bounds padding | Coordinate renderer ownership/lifetime, transform handling and final pass timing; match displaced geometry in shadows. |
+| Module 07 -> 05 | Borrowed generated vertex/index view, source-ID ranges, counts, generation identity and bounds padding | Integrated for current identity transforms: main/shadow passes borrow matching geometry and expose separate timings. Future transforms and GPU-produced visibility still require agreement. |
 | Module 07 -> 04 | `displacementBound(height, settings)` before generation; conservative object-space AABB padding | Apply the same bound before visibility tests, with appropriate transforms. Displaying padded boxes alone does not implement culling. |
 
 The implementation uses uniform n and flat displaced face normals. Per-cluster
 adaptive levels, arbitrary UV/normal seam repair, smooth displaced normals, demand
-paging, GPU LOD/culling and shadows are not completed by this Part 2 milestone.
+paging and GPU LOD/culling remain outside this baseline. Displaced shadows are implemented in the subsequent rendering integration.

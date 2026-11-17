@@ -21,8 +21,9 @@ TessellationFixture parseFixtureName(const std::filesystem::path& name)
 {
     if (name == "triangle") return TessellationFixture::Triangle;
     if (name == "plane") return TessellationFixture::Plane;
+    if (name == "shadow") return TessellationFixture::ShadowStage;
     if (name == "grid") return TessellationFixture::ClusterGrid;
-    throw std::runtime_error("Unknown fixture; choose triangle, plane, or grid.");
+    throw std::runtime_error("Unknown fixture; choose triangle, plane, grid, or shadow.");
 }
 
 void printGlfwError(int code, const char* description)
@@ -133,9 +134,11 @@ int main(int argc, char** argv)
     const auto argument = [&](int i) { return std::filesystem::path(argv[i]); };
     const auto usage = [] {
         std::cout << "Usage: AdaptiveClusterRendering [model.obj | model.acr | --cube | --mock]\n"
-                     "       [--fixture triangle|plane|grid (instead of another source)]\n"
+                     "       [--fixture triangle|plane|grid|shadow (instead of another source)]\n"
                      "       [--cluster-colors] [--bounds] [--compute-copy] [--verify-gpu] [--smoke-test]\n"
                      "       [--subdivision 1|2|4|8] [--wireframe]\n"
+                     "       [--shadows] [--shadow-bias 0..0.08] [--depth-view | --shadow-map]\n"
+                     "       [--frustum-preview] [--max-distance model_units] [--render-smoke]\n"
                      "       [--displacement amplitude (0..1000)] [--heightmap file.pgm]\n"
                      "       [--selection all|first-last|empty|last-first]\n"
                      "       [--benchmark output.json [--benchmark-warmup 10] [--benchmark-samples 50]]\n"
@@ -183,6 +186,19 @@ int main(int argc, char** argv)
                 else if (option == "--verify-gpu") options.verifyGpu = true;
                 else if (option == "--compute-copy") options.computeGeometry = true;
                 else if (option == "--wireframe") options.wireframe = true;
+                else if (option == "--shadows") options.renderSettings.shadows = true;
+                else if (option == "--depth-view") options.renderSettings.display = RenderDisplay::Depth;
+                else if (option == "--shadow-map") options.renderSettings.display = RenderDisplay::ShadowMap;
+                else if (option == "--frustum-preview") options.renderSettings.frustumPreview = true;
+                else if (option == "--render-smoke") options.renderSmoke = true;
+                else if (option == "--shadow-bias" || option == "--max-distance") {
+                    if (++i >= argc) throw std::runtime_error("Missing render setting value.");
+                    const auto value = argument(i).u8string(); size_t consumed = 0;
+                    const float number = std::stof(value, &consumed);
+                    if (consumed != value.size()) throw std::runtime_error("Invalid render setting value.");
+                    if (option == "--shadow-bias") options.renderSettings.shadowBias = number;
+                    else options.renderSettings.maxDistance = number;
+                }
                 else if (option == "--benchmark") {
                     if (++i >= argc) throw std::runtime_error("--benchmark requires an output .json path.");
                     options.benchmarkPath = argument(i);
@@ -242,16 +258,20 @@ int main(int argc, char** argv)
                     if (option == "--cube") useCube = true;
                     else if (option == "--mock") useMock = true;
                     else if (option == "--fixture") {
-                        if (++i >= argc) throw std::runtime_error("--fixture requires triangle, plane, or grid.");
+                        if (++i >= argc) throw std::runtime_error("--fixture requires triangle, plane, grid, or shadow.");
                         fixture = parseFixtureName(argument(i));
                     }
                     else if (!option.empty() && option.u8string().front() != '-') inputPath = option;
                     else throw std::runtime_error("Unknown option: " + option.u8string());
                 }
             }
+            validateRenderSettings(options.renderSettings);
             validateBenchmarkOptions(options.benchmarkOptions);
             if (benchmarkCountsSpecified && options.benchmarkPath.empty()) throw std::runtime_error("Benchmark counts require --benchmark.");
             if (!options.benchmarkPath.empty() && options.smokeTest) throw std::runtime_error("Choose either benchmark or smoke test.");
+            if (options.renderSmoke && (options.smokeTest || !options.benchmarkPath.empty())) throw std::runtime_error("Render integration checks run separately from smoke/benchmark options.");
+            if (options.smokeTest && (options.renderSettings.display != RenderDisplay::Shaded || options.renderSettings.frustumPreview || options.renderSettings.maxDistance > 0))
+                throw std::runtime_error("Use --render-smoke for display and visibility integration checks.");
             if (options.smokeTest && options.selectionPreset != 0) throw std::runtime_error("Smoke tests manage their own selection.");
         }
     } catch (const std::exception& error) {

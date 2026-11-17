@@ -67,6 +67,7 @@ LoadedScene makeFixtureSceneWithStats(TessellationFixture fixture)
     LoadedScene result;
     result.scene = makeTessellationFixture(fixture);
     switch (fixture) {
+    case TessellationFixture::ShadowStage: result.source.kind = SceneSourceKind::ShadowStage; break;
     case TessellationFixture::Triangle: result.source.kind = SceneSourceKind::Triangle; break;
     case TessellationFixture::Plane: result.source.kind = SceneSourceKind::Plane; break;
     case TessellationFixture::ClusterGrid: result.source.kind = SceneSourceKind::ClusterGrid; break;
@@ -82,6 +83,7 @@ const char* sceneSourceName(SceneSourceKind kind)
     case SceneSourceKind::Acr: return "ACR";
     case SceneSourceKind::Mock: return "Mock (4 clusters)";
     case SceneSourceKind::Cube: return "Cube";
+    case SceneSourceKind::ShadowStage: return "Shadow stage (receiver + patch)";
     case SceneSourceKind::Triangle: return "Test triangle";
     case SceneSourceKind::Plane: return "UV plane";
     case SceneSourceKind::ClusterGrid: return "Cluster grid (2 x 2)";
