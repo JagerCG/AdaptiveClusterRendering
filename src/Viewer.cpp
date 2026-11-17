@@ -35,6 +35,7 @@
 #include <utility>
 
 int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window);
+int runVisibilityChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
 int runLodDepthChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
 int runHierarchyChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene,
                        const OrbitCamera& camera, const std::filesystem::path& output);
@@ -123,6 +124,10 @@ ViewerModel makeModel(LoadedScene loaded)
 {
     validateScene(loaded.scene);
     auto camera = frameMesh(loaded.scene.mesh);
+    if (loaded.source.kind == SceneSourceKind::Occlusion) {
+        camera = OrbitCamera({0, 0, 0}, 2);
+        camera.setPose({0, 0, 3});
+    }
     auto name = loaded.source.path.empty() ? std::string(sceneSourceName(loaded.source.kind)) :
                                            loaded.source.path.filename().u8string();
     return {std::move(loaded), camera, std::move(name), std::nullopt};
@@ -204,7 +209,23 @@ void showModelInfo(GLFWwindow* window, const ViewerModel& model, const SceneUplo
     std::cout << std::endl;
 }
 
-enum class ModelAction { None, Open, Save, ReloadSaved, Mock, Triangle, Plane, ClusterGrid, ShadowStage, HeightPreset, OpenHeight, SaveView, OpenView, HidePanel };
+enum class ModelAction {
+    None,
+    Open,
+    Save,
+    ReloadSaved,
+    Mock,
+    Triangle,
+    Plane,
+    ClusterGrid,
+    ShadowStage,
+    Occlusion,
+    HeightPreset,
+    OpenHeight,
+    SaveView,
+    OpenView,
+    HidePanel
+};
 
 ClusterSelection previewSelection(const SceneGpuData& source, int preset)
 {
@@ -326,6 +347,9 @@ void drawBenchmarkPanel(BenchmarkSession& benchmark, BenchmarkOptions& options,
         metric("CPU frame (wall time)", &BenchmarkSample::cpuFrameMs);
         metric("CPU LOD + wait", &BenchmarkSample::cpuLodMs);
         metric("GPU LOD selection", &BenchmarkSample::gpuLodMs);
+        metric("GPU visibility", &BenchmarkSample::gpuCullMs);
+        metric("GPU Hi-Z build", &BenchmarkSample::gpuPyramidMs);
+        metric("CPU visibility + wait", &BenchmarkSample::cpuCullMs);
         ImGui::TextWrapped("GPU render total covers shadows, the main pass and any visible UI. CPU frame time includes queue and presentation waits.");
         if (!exported.empty()) ImGui::TextWrapped("JSON: %s", exported.u8string().c_str());
     }
@@ -339,7 +363,7 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     const auto& device = renderer.deviceProperties();
     const auto& settings = renderer.renderSettings();
     const auto& source = renderer.sceneGpuData();
-    const auto& selection = renderer.clusterSelection();
+    const auto& selection = renderer.mainSelection();
     const auto& output = renderer.generatedGeometry();
     const auto& upload = renderer.uploadStats();
     const auto extent = renderer.renderExtent();
@@ -383,6 +407,30 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     context.counts["display_mode"] = static_cast<uint32_t>(settings.display);
     if (!source.lodCommands) context.counts["geometry_level"] = source.activeLevel;
     context.flags["gpu_lod"] = source.lodCommands != VK_NULL_HANDLE;
+    const auto& vis = renderer.visibilityStats();
+    context.counts["cull_mode"] = static_cast<uint32_t>(settings.culling);
+    constexpr const char* modeNames[] = {"off", "frustum", "hierarchy", "hiz", "hiz-flat"};
+    context.labels["culling"] = modeNames[static_cast<uint32_t>(settings.culling)];
+    context.counts["candidate_clusters"] = renderer.clusterSelection().ranges.size();
+    context.counts["candidate_triangles"] = renderer.clusterSelection().triangleCount();
+    context.counts["frustum_rejected"] = vis.frustum;
+    context.counts["hierarchy_frustum_rejected"] = vis.hierarchy;
+    context.counts["occlusion_rejected"] = vis.occluded;
+    context.counts["rejected_bounds_drawn"] = renderer.lastRecordedDraw().rejectedBoundsInstances;
+    context.flags["show_rejected_bounds"] = settings.showRejectedBounds;
+    context.counts["hierarchy_nodes_tested"] = vis.testedNodes;
+    context.counts["hierarchy_nodes_skipped"] = vis.skippedNodes;
+    context.counts["hiz_levels"] = vis.mipCount;
+    context.counts["hiz_source_frame"] = vis.depthFrame;
+    context.flags["hiz_used"] = vis.depthFrame != 0;
+    context.flags["hiz_preview"] = settings.showHiZ;
+    context.counts["requested_hiz_mip"] = settings.hiZMip;
+    if (settings.culling != CullMode::Off) {
+        context.flags["readback_excluded"] = false;
+        context.labels["visibility_scope"] =
+            "GPU bounds tests and stable compaction. Hi-Z reduction is timed separately. CPU visibility includes the "
+            "ID/count mirror and queue waits.";
+    }
     context.flags["level_colors"] = settings.levelColors;
     context.values["lod_error_pixels"] = settings.lodPixels;
     const auto& hist = renderer.lodStats().clustersPerLevel;
@@ -411,6 +459,13 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     context.flags["cpu_frustum_preview"] = settings.frustumPreview;
     context.labels["selection_scope"] = source.lodCommands ? "GPU screen-error cut. Global cluster IDs; GPU-produced draw commands and triangle work." :
         "Manual level and input list. Optional CPU visibility filters main draws only.";
+    if (settings.culling != CullMode::Off) {
+        context.labels["selection_scope"] = "GPU-visible list after the candidate cut, in original candidate order. "
+                                            "IDs are relative to first_cluster_id.";
+        context.labels["generation_scope"] =
+            "Main-view generation uses GPU-visible triangle addresses and indirect dispatch. Additional shadow "
+            "geometry is cached using the pre-camera list.";
+    }
     for (const auto& range : selection.ranges) context.selectedClusterIds.push_back(range.sourceClusterId);
     const auto view = model.camera.viewProjection(float(extent.width) / float(extent.height));
     for (int column = 0; column < 4; ++column) for (int row = 0; row < 4; ++row) context.viewProjection.push_back(view[column][row]);
@@ -418,14 +473,13 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
 }
 
 ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds, int& boundsCluster,
-                      int& selectionPreset, const ResolvedClusterSelection& selection,
-                      bool& computeGeometry, bool& regenerate, const GeneratedGeometry& generated,
-                      int& segmentPreset, bool& wireframe, bool wireframeSupported,
-                      DisplacementSettings& displacement, int& heightPreset, const HeightField& height, uint64_t heightBytes,
-                      const SceneUploadStats& upload, std::string& status,
-                      BenchmarkSession& benchmark, BenchmarkOptions& benchmarkOptions,
+                      int& selectionPreset, const ResolvedClusterSelection& selection, bool& computeGeometry,
+                      bool& regenerate, const GeneratedGeometry& generated, int& segmentPreset, bool& wireframe,
+                      bool wireframeSupported, DisplacementSettings& displacement, int& heightPreset,
+                      const HeightField& height, uint64_t heightBytes, const SceneUploadStats& upload,
+                      std::string& status, BenchmarkSession& benchmark, BenchmarkOptions& benchmarkOptions,
                       const std::filesystem::path& exported, bool& startBenchmark, RenderSettings& renderSettings,
-                      const SourceDrawStats& lastDraw, const LodSelectionStats& lod)
+                      const SourceDrawStats& lastDraw, const LodSelectionStats& lod, const VisibilityStats& vis)
 {
     const auto& scene = model.loaded.scene;
     ModelAction action = ModelAction::None;
@@ -438,8 +492,13 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
         ImGui::Text("Vertices: %zu", scene.mesh.vertices.size());
         const auto active = sceneLevel(scene,model.geometryLevel);
         const bool mixed = renderSettings.adaptiveLod && !scene.hierarchy.levels.empty();
-        ImGui::Text("Triangles: %llu", static_cast<unsigned long long>(mixed ? selection.triangleCount() : active.indexCount / 3));
-        ImGui::Text("Clusters: %u", mixed ? static_cast<uint32_t>(selection.ranges.size()) : active.clusterCount);
+        const bool selectedCounts = mixed || renderSettings.culling != CullMode::Off;
+        ImGui::Text(
+            "%s triangles: %llu", selectedCounts ? "Selected source" : "Source",
+            static_cast<unsigned long long>(selectedCounts ? selection.triangleCount() : active.indexCount / 3));
+        ImGui::Text("Clusters: %u",
+                    selectedCounts ? static_cast<uint32_t>(selection.ranges.size()) : active.clusterCount);
+        ImGui::Text("Drawn triangles: %llu", static_cast<unsigned long long>(lastDraw.triangles));
         ImGui::Text("Triangles / cluster: <= %u", scene.maxTrianglesPerCluster);
         drawBenchmarkPanel(benchmark, benchmarkOptions, exported, startBenchmark, status);
         ImGui::Separator();
@@ -493,6 +552,33 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
                 ImGui::Text("Max error bound: %.4g units", error);
             }
         }
+        if (ImGui::CollapsingHeader("GPU visibility", ImGuiTreeNodeFlags_DefaultOpen)) {
+            int mode = static_cast<int>(renderSettings.culling);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##cull", &mode, "Off\0Frustum\0Hierarchy + frustum\0Hierarchy + frustum + Hi-Z\0Frustum + Hi-Z\0"))
+                renderSettings.culling = static_cast<CullMode>(mode);
+            if (renderSettings.culling != CullMode::Off) {
+                ImGui::Text("Visible clusters: %u / %u", vis.visible, vis.candidates);
+                ImGui::Text("Rejected: %u frustum, %u hierarchy", vis.frustum, vis.hierarchy);
+                ImGui::Text("Occluded: %u", vis.occluded);
+                ImGui::Checkbox("Show rejected bounds (orange)", &renderSettings.showRejectedBounds);
+                if (vis.gpuCullMs) ImGui::Text("GPU culling: %.4f ms", *vis.gpuCullMs);
+                if (usesHiZ(renderSettings.culling)) {
+                    if (vis.depthFrame)
+                        ImGui::Text("Hi-Z: %u levels, frame %llu", vis.mipCount,
+                                    static_cast<unsigned long long>(vis.depthFrame));
+                    else
+                        ImGui::TextWrapped("Hi-Z waits for matching solid camera depth.");
+                    if (vis.gpuPyramidMs) ImGui::Text("GPU Hi-Z build: %.4f ms", *vis.gpuPyramidMs);
+                    ImGui::Checkbox("Show Hi-Z mip", &renderSettings.showHiZ);
+                    if (renderSettings.showHiZ && vis.mipCount) {
+                        int mip = std::min<int>(renderSettings.hiZMip, vis.mipCount - 1);
+                        if (ImGui::SliderInt("Mip", &mip, 0, static_cast<int>(vis.mipCount - 1)))
+                            renderSettings.hiZMip = mip;
+                    }
+                }
+            }
+        }
         if (ImGui::CollapsingHeader("Rendering and shadows")) {
             int display = static_cast<int>(renderSettings.display);
             ImGui::SetNextItemWidth(-1);
@@ -538,6 +624,7 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
             ImGui::SetNextItemWidth(-1);
             if (ImGui::BeginCombo("##fixture", "Load test scene...")) {
                 if (ImGui::Selectable("Shadow stage (receiver + patch)")) action = ModelAction::ShadowStage;
+                if (ImGui::Selectable("Occlusion stage")) action = ModelAction::Occlusion;
                 if (ImGui::Selectable("Single triangle")) action = ModelAction::Triangle;
                 if (ImGui::Selectable("Continuous UV plane")) action = ModelAction::Plane;
                 if (ImGui::Selectable("Fixed cluster grid (2 x 2)")) action = ModelAction::ClusterGrid;
@@ -548,7 +635,8 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
             ImGui::SetNextItemWidth(-1);
             ImGui::Combo("##selection", &selectionPreset, "All clusters\0First + last cluster\0Empty list\0Last + first cluster\0");
             ImGui::EndDisabled();
-            if (mixed) ImGui::Text("GPU-selected: %zu clusters", selection.ranges.size());
+            if (renderSettings.culling != CullMode::Off) ImGui::Text("After culling: %zu clusters", selection.ranges.size());
+            else if (mixed) ImGui::Text("GPU-selected: %zu clusters", selection.ranges.size());
             else ImGui::Text("Selected: %zu / %u clusters", selection.ranges.size(), active.clusterCount);
             ImGui::Text("Selected triangles: %llu", static_cast<unsigned long long>(selection.triangleCount()));
             if (!selection.allClusters && !selection.ranges.empty()) {
@@ -674,8 +762,11 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     }
     ViewerInput input;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_VISIBLE, (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || cliBenchmark || !options.saveConfigPath.empty() ||
-                   !options.hierarchyRoundtripPath.empty()) ? GLFW_FALSE : GLFW_TRUE);
+    glfwWindowHint(GLFW_VISIBLE,
+                   (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || options.visibilitySmoke ||
+                    cliBenchmark || !options.saveConfigPath.empty() || !options.hierarchyRoundtripPath.empty())
+                       ? GLFW_FALSE
+                       : GLFW_TRUE);
     std::unique_ptr<GLFWwindow, decltype(&glfwDestroyWindow)> window(
         glfwCreateWindow(options.initialView ? options.initialView->width : 960, options.initialView ? options.initialView->height : 640,
                          "Adaptive Cluster Rendering", nullptr, nullptr), glfwDestroyWindow);
@@ -706,6 +797,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     if (!options.hierarchyRoundtripPath.empty())
         return runHierarchyChecks(renderer,window.get(),model.loaded.scene,model.camera,options.hierarchyRoundtripPath);
     if (options.renderSmoke) return runRenderIntegrationChecks(renderer, window.get());
+    if (options.visibilitySmoke) return runVisibilityChecks(renderer, window.get(), model.loaded.scene, model.camera);
     if (options.lodDepthSmoke) return runLodDepthChecks(renderer,window.get(),model.loaded.scene,model.camera);
     if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(model.loaded.scene);
     showModelInfo(window.get(), model, renderer.uploadStats());
@@ -917,11 +1009,16 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
         else updateCamera(input, model.camera);
         bool regenerate = options.smokeTest && options.computeGeometry && frame == 1;
         const bool alreadyRequested = benchmarkRequested;
-        const auto action = cliBenchmark || options.hidePanel ? ModelAction::None : drawPanel(model, clusterColors, showBounds, boundsCluster, selectionPreset,
-                                      renderer.clusterSelection(), computeGeometry, regenerate, renderer.generatedGeometry(),
-                                      segmentPreset, wireframe, renderer.supportsWireframe(),
-                                      displacement, heightPreset, renderer.heightField(), renderer.heightAllocationBytes(),
-                                      renderer.uploadStats(), status, benchmark, options.benchmarkOptions, exportedBenchmark, benchmarkRequested, renderSettings, renderer.lastRecordedDraw(), renderer.lodStats());
+        const auto action =
+            cliBenchmark || options.hidePanel
+                ? ModelAction::None
+                : drawPanel(model, clusterColors, showBounds, boundsCluster, selectionPreset,
+                            renderer.mainSelection(), computeGeometry, regenerate, renderer.generatedGeometry(),
+                            segmentPreset, wireframe, renderer.supportsWireframe(), displacement, heightPreset,
+                            renderer.heightField(), renderer.heightAllocationBytes(), renderer.uploadStats(), status,
+                            benchmark, options.benchmarkOptions, exportedBenchmark, benchmarkRequested,
+                            renderSettings, renderer.lastRecordedDraw(), renderer.lodStats(),
+                            renderer.visibilityStats());
         if (benchmarkRequested && !alreadyRequested) benchmarkStarted = std::chrono::steady_clock::now();
         renderer.setRenderSettings(renderSettings);
         renderer.setEdgeSegments(1u << segmentPreset);
@@ -938,6 +1035,17 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
         if (!gpuLod && selectionPreset != appliedPreset) {
             renderer.setClusterSelection(previewSelection(renderer.sceneGpuData(), selectionPreset));
             appliedPreset = selectionPreset;
+        }
+        try {
+            renderer.selectVisibility(model.camera, computeGeometry, wireframe);
+        }
+        catch (const std::exception& failure) {
+            if (cliBenchmark || options.smokeTest) throw;
+            benchmark.cancel();
+            benchmarkRequested = false;
+            renderSettings.culling = CullMode::Off;
+            renderer.setRenderSettings(renderSettings);
+            status = std::string("Culling disabled for this scene. ") + failure.what();
         }
         if (computeGeometry) {
             try {
@@ -989,6 +1097,8 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                 if (options.smokeTest || cliBenchmark) throw;
                 benchmark.cancel(); benchmarkRequested = false;
                 computeGeometry = false;
+                if (gpuLod) renderer.selectLod(model.camera, 0);
+                renderer.selectVisibility(model.camera, false, wireframe);
                 status = std::string("GPU generation failed; drawing source. ") + failure.what();
                 std::cerr << status << '\n';
             }
@@ -1005,6 +1115,11 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
             if (benchmark.active()) {
                 BenchmarkSample sample;
                 sample.cpuFrameMs = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-frameStart).count();
+                if (renderSettings.culling != CullMode::Off) {
+                    sample.cpuCullMs = renderer.visibilityStats().cpuMs;
+                    sample.gpuCullMs = renderer.visibilityStats().gpuCullMs;
+                    sample.gpuPyramidMs = renderer.visibilityStats().gpuPyramidMs;
+                }
                 if (gpuLod) {
                     sample.cpuLodMs = renderer.lodStats().cpuMs;
                     sample.gpuLodMs = renderer.lodStats().gpuMs;
@@ -1051,11 +1166,17 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                     if (cliBenchmark) break;
                 }
             }
-            if (benchmarkRequested) {
+            const bool awaitDepth = usesHiZ(renderSettings.culling) && !wireframe &&
+                                    !renderSettings.frustumPreview && renderSettings.maxDistance == 0 &&
+                                    renderSettings.display != RenderDisplay::ShadowMap &&
+                                    !renderer.visibilityStats().depthFrame;
+            if (benchmarkRequested && !awaitDepth) {
                 exportedBenchmark.clear(); status.clear();
-                benchmark.begin(captureBenchmark(model, renderer, computeGeometry, wireframe, clusterColors, showBounds,
-                    boundsCluster, displacement, heightPath, !cliBenchmark && !options.hidePanel), options.benchmarkOptions, computeGeometry,
-                    renderer.supportsTimestamps(), renderer.clusterSelection().indexCount > 0);
+                benchmark.begin(captureBenchmark(model, renderer, computeGeometry, wireframe, clusterColors,
+                                                 showBounds, boundsCluster, displacement, heightPath,
+                                                 !cliBenchmark && !options.hidePanel),
+                                options.benchmarkOptions, computeGeometry, renderer.supportsTimestamps(),
+                                renderer.mainSelection().indexCount > 0);
                 benchmarkRequested = false;
                 benchmarkStarted = std::chrono::steady_clock::now();
             }
@@ -1143,10 +1264,14 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                     replaceModel(makeMockSceneWithStats());
                     status.clear();
                 }
-                else if (action == ModelAction::Triangle || action == ModelAction::Plane || action == ModelAction::ClusterGrid || action == ModelAction::ShadowStage) {
-                    const auto fixture = action == ModelAction::Triangle ? TessellationFixture::Triangle :
-                        action == ModelAction::Plane ? TessellationFixture::Plane :
-                        action == ModelAction::ShadowStage ? TessellationFixture::ShadowStage : TessellationFixture::ClusterGrid;
+                else if (action == ModelAction::Triangle || action == ModelAction::Plane ||
+                         action == ModelAction::ClusterGrid || action == ModelAction::ShadowStage ||
+                         action == ModelAction::Occlusion) {
+                    const auto fixture = action == ModelAction::Triangle      ? TessellationFixture::Triangle
+                                         : action == ModelAction::Plane       ? TessellationFixture::Plane
+                                         : action == ModelAction::ShadowStage ? TessellationFixture::ShadowStage
+                                         : action == ModelAction::Occlusion   ? TessellationFixture::Occlusion
+                                                                              : TessellationFixture::ClusterGrid;
                     replaceModel(makeFixtureSceneWithStats(fixture));
                     status.clear();
                 }

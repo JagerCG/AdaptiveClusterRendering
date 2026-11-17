@@ -21,6 +21,7 @@ struct SourceDrawStats {
     uint64_t triangles = 0;
     uint32_t meshDrawCalls = 0;
     uint32_t boundsInstances = 0;
+    uint32_t rejectedBoundsInstances = 0;
     float boundsPadding = 0;
     uint64_t shadowTriangles = 0;
     uint32_t shadowDrawCalls = 0, visibleClusters = 0;
@@ -32,6 +33,14 @@ struct LodSelectionStats {
     std::vector<uint32_t> clustersPerLevel;
     double cpuMs = 0;
     std::optional<double> gpuMs;
+};
+
+struct VisibilityStats {
+    uint32_t candidates = 0, visible = 0, frustum = 0, hierarchy = 0, occluded = 0;
+    uint32_t testedNodes = 0, skippedNodes = 0, mipCount = 0;
+    uint64_t depthFrame = 0;
+    double cpuMs = 0;
+    std::optional<double> gpuCullMs, gpuPyramidMs;
 };
 
 // Most recently submitted main pass. Submit consumers on the same graphics/compute
@@ -61,6 +70,11 @@ public:
     void verifyUpload(const SceneData& scene);
     void setHierarchyLevel(uint32_t level);
     void selectLod(const OrbitCamera& camera, float padding = 0, bool force = false);
+    void selectVisibility(const OrbitCamera& camera, bool generated, bool wireframe);
+    const VisibilityStats& visibilityStats() const { return visStats_; }
+    const ResolvedClusterSelection& mainSelection() const { return visibilityActive_ ? visibleSelection_ : selection_; }
+    const SceneGpuData& mainScene() const { return visibilityActive_ ? visibleScene_ : sceneGpu_; }
+    std::vector<float> readHiZ(); // all valid mips in order for acceptance
     const LodSelectionStats& lodStats() const { return lodStats_; }
     const CameraDepthView& cameraDepth() const { return cameraDepth_; }
     std::vector<float> readCameraDepth();
@@ -74,7 +88,7 @@ public:
     const HeightField& heightField() const { return compute_->heightField(); }
     uint64_t heightRevision() const { return compute_->heightRevision(); }
     uint64_t heightAllocationBytes() const { return compute_->heightAllocationBytes(); }
-    float plannedDisplacementBound() const { return displacementBound(heightField(), displacement_); }
+    float plannedDisplacementBound() const { return compute_->maxDisplacement(displacement_); }
     bool supportsWireframe() const { return wireframeSupported_; }
     const GeneratedGeometry& generatedGeometry() const { return compute_->output(); }
     const SceneGpuData& sceneGpuData() const { return sceneGpu_; }
@@ -118,6 +132,11 @@ private:
     void createDevice();
     void createFrameResources();
     void createLodResources();
+    void createVisibilityResources();
+    void destroyVisibilityResources();
+    void growVisibilityBuffer(Buffer& buffer, VkDeviceSize& capacity, VkDeviceSize bytes,
+                              VkBufferUsageFlags usage, VkMemoryPropertyFlags memory);
+    bool generateFor(ComputeGeometry& generator, const SceneGpuData& source, const ResolvedClusterSelection& input, bool force);
     void sizeLodBuffers(VkDeviceSize resultBytes, VkDeviceSize workBytes);
     std::vector<float> readDepth(VkImage image, VkExtent2D extent, VkImageLayout layout);
     VkDeviceMemory allocateMemory(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags properties);
@@ -159,8 +178,10 @@ private:
     bool wireframeSupported_ = false;
     uint32_t indirectDrawLimit_ = 1;
     VkPipeline boundsPipeline_ = VK_NULL_HANDLE;
+    VkPipeline rejectedBoundsPipeline_ = VK_NULL_HANDLE;
     VkPipeline shadowPipeline_ = VK_NULL_HANDLE, shadowDebugPipeline_ = VK_NULL_HANDLE;
     VkPipeline cameraDebugPipeline_ = VK_NULL_HANDLE;
+    VkPipeline hiZDebugPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout cameraDepthLayout_ = VK_NULL_HANDLE;
     VkDescriptorSet cameraDepthSet_ = VK_NULL_HANDLE;
     CameraDepthView cameraDepth_;
@@ -215,6 +236,29 @@ private:
     VkPipeline lodPipeline_ = VK_NULL_HANDLE;
     VkQueryPool lodQueries_ = VK_NULL_HANDLE;
     ResolvedClusterSelection selection_;
+    SceneGpuData visibleScene_;
+    ResolvedClusterSelection visibleSelection_;
+    bool visibilityActive_ = false, separateShadowGeometry_ = false;
+    uint64_t candidateRevision_ = 0;
+    struct DepthInputs {
+        uint64_t candidates = 0, height = 0;
+        uint32_t segments = 0;
+        DisplacementSettings displacement{};
+        bool generated = false;
+    } depthInputs_;
+    VisibilityStats visStats_;
+    struct Mip { uint32_t width, height, offset; };
+    std::vector<Mip> hiZMips_;
+    Buffer hiZ_, visInput_, visResult_, visWork_;
+    VkDeviceSize hiZCapacity_ = 0, visInputCapacity_ = 0, visResultCapacity_ = 0, visWorkCapacity_ = 0;
+    VkDescriptorSetLayout visSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool visPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet visSet_ = VK_NULL_HANDLE;
+    VkPipelineLayout visLayout_ = VK_NULL_HANDLE;
+    VkPipeline hiZBuild_ = VK_NULL_HANDLE, visCull_ = VK_NULL_HANDLE;
+    VkQueryPool visQueries_ = VK_NULL_HANDLE;
+    std::unique_ptr<ComputeGeometry> shadowCompute_;
+    uint64_t shadowHeightRevision_ = 0;
     SourceDrawStats lastDraw_;
     std::unique_ptr<ComputeGeometry> compute_;
     uint32_t edgeSegments_ = 1;

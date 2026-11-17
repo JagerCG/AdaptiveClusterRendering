@@ -50,6 +50,10 @@ public:
     // compute command buffer synchronously; publication occurs only after upload.
     void uploadHeight(const HeightField& field, VkCommandBuffer command, VkQueue queue);
     const HeightField& heightField() const { return heightField_; }
+    float maxDisplacement(const DisplacementSettings& settings) const
+    {
+        return settings.enabled ? settings.amplitude * heightUnitBound_ : 0.f;
+    }
     uint64_t heightRevision() const { return heightRevision_; }
     uint64_t heightAllocationBytes() const { return height_.allocationBytes; }
 
@@ -71,6 +75,7 @@ private:
     void destroyHeight(HeightImage& height);
     HeightImage height_;
     HeightField heightField_;
+    float heightUnitBound_ = 0;
     uint64_t heightRevision_ = 0;
 
     VkPhysicalDevice gpu_ = VK_NULL_HANDLE;

@@ -12,6 +12,7 @@ struct LoadedScene;
 struct ViewerOptions {
     RenderSettings renderSettings;
     bool renderSmoke = false;
+    bool visibilitySmoke = false;
     bool lodDepthSmoke = false, hidePanel = false;
     std::filesystem::path saveConfigPath;
     std::optional<ViewConfig> initialView;

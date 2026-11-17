@@ -3,6 +3,8 @@
 #include <glm/mat4x4.hpp>
 
 enum class RenderDisplay : uint32_t { Shaded, Depth, ShadowMap };
+enum class CullMode : uint32_t { Off, Frustum, Hierarchy, HiZ, FlatHiZ };
+constexpr bool usesHiZ(CullMode mode) { return mode == CullMode::HiZ || mode == CullMode::FlatHiZ; }
 struct RenderSettings {
     RenderDisplay display = RenderDisplay::Shaded;
     bool shadows = false;
@@ -13,6 +15,9 @@ struct RenderSettings {
     bool groupColors = false;
     bool adaptiveLod = false, levelColors = false;
     float lodPixels = 96.0f;
+    CullMode culling = CullMode::Off;
+    bool showHiZ = false, showRejectedBounds = false;
+    uint32_t hiZMip = 0;
 };
 void validateRenderSettings(const RenderSettings& settings);
 glm::vec4 lodLevelColor(uint32_t level);

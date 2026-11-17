@@ -13,6 +13,9 @@ constexpr VkImageSubresourceRange depthRange{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0,
 void VulkanRenderer::setRenderSettings(const RenderSettings& settings)
 {
     validateRenderSettings(settings);
+    if (settings.culling != renderSettings_.culling) {
+        visibilityActive_ = false; hiZMips_.clear(); visStats_ = {};
+    }
     renderSettings_ = settings; // display/camera/light changes never invalidate generated geometry
 }
 

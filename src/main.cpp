@@ -22,8 +22,9 @@ TessellationFixture parseFixtureName(const std::filesystem::path& name)
     if (name == "triangle") return TessellationFixture::Triangle;
     if (name == "plane") return TessellationFixture::Plane;
     if (name == "shadow") return TessellationFixture::ShadowStage;
+    if (name == "occlusion") return TessellationFixture::Occlusion;
     if (name == "grid") return TessellationFixture::ClusterGrid;
-    throw std::runtime_error("Unknown fixture; choose triangle, plane, grid, or shadow.");
+    throw std::runtime_error("Unknown fixture; choose triangle, plane, grid, shadow or occlusion.");
 }
 
 void printGlfwError(int code, const char* description)
@@ -142,6 +143,8 @@ int main(int argc, char** argv)
                      "       [--view-config file.acrview] [--save-view file.acrview] [--lod-depth-smoke]\n"
                      "       [--shadows] [--shadow-bias 0..0.08] [--depth-view | --shadow-map]\n"
                      "       [--frustum-preview] [--max-distance model_units] [--render-smoke]\n"
+                     "       [--cull off|frustum|hierarchy|hiz|hiz-flat] [--hiz-mip 0..31] [--rejected-bounds] [--fixture "
+                     "occlusion] [--visibility-smoke]\n"
                      "       [--displacement amplitude (0..1000)] [--heightmap file.pgm]\n"
                      "       [--selection all|first-last|empty|last-first]\n"
                      "       [--benchmark output.json [--benchmark-warmup 10] [--benchmark-samples 50]]\n"
@@ -216,6 +219,36 @@ int main(int argc, char** argv)
                 }
                 else if (option == "--hide-ui") options.hidePanel = true;
                 else if (option == "--lod-depth-smoke") options.lodDepthSmoke = true;
+                else if (option == "--visibility-smoke")
+                    options.visibilitySmoke = true;
+                else if (option == "--rejected-bounds")
+                    options.renderSettings.showRejectedBounds = true;
+                else if (option == "--cull") {
+                    if (++i >= argc) throw std::runtime_error("Missing culling mode.");
+                    const auto mode = argument(i);
+                    if (mode == "off")
+                        options.renderSettings.culling = CullMode::Off;
+                    else if (mode == "frustum")
+                        options.renderSettings.culling = CullMode::Frustum;
+                    else if (mode == "hierarchy")
+                        options.renderSettings.culling = CullMode::Hierarchy;
+                    else if (mode == "hiz")
+                        options.renderSettings.culling = CullMode::HiZ;
+                    else if (mode == "hiz-flat")
+                        options.renderSettings.culling = CullMode::FlatHiZ;
+                    else
+                        throw std::runtime_error("Choose off, frustum, hierarchy, hiz or hiz-flat.");
+                }
+                else if (option == "--hiz-mip") {
+                    if (++i >= argc) throw std::runtime_error("Missing Hi-Z mip index.");
+                    const auto token = argument(i).u8string();
+                    if (token.empty() || token.find_first_not_of("0123456789") != std::string::npos ||
+                        std::stoul(token) > 31)
+                        throw std::runtime_error("Choose a Hi-Z mip in 0..31.");
+                    options.renderSettings.hiZMip = static_cast<uint32_t>(std::stoul(token));
+                    options.renderSettings.showHiZ = true;
+                    if (!usesHiZ(options.renderSettings.culling)) options.renderSettings.culling = CullMode::HiZ;
+                }
                 else if (option == "--view-config")
                     ++i; // Loaded before applying CLI overrides.
                 else if (option == "--save-view") {
@@ -313,7 +346,7 @@ int main(int argc, char** argv)
                     if (option == "--cube") useCube = true;
                     else if (option == "--mock") useMock = true;
                     else if (option == "--fixture") {
-                        if (++i >= argc) throw std::runtime_error("--fixture requires triangle, plane, grid, or shadow.");
+                        if (++i >= argc) throw std::runtime_error("--fixture requires triangle, plane, grid, shadow or occlusion.");
                         fixture = parseFixtureName(argument(i));
                     }
                     else if (!option.empty() && option.u8string().front() != '-') inputPath = option;
@@ -321,6 +354,12 @@ int main(int argc, char** argv)
                 }
             }
             validateRenderSettings(options.renderSettings);
+            if (options.visibilitySmoke && (options.smokeTest || options.renderSmoke || options.lodDepthSmoke ||
+                                            !options.hierarchyRoundtripPath.empty() ||
+                                            !options.benchmarkPath.empty() || !options.saveConfigPath.empty()))
+                throw std::runtime_error("Run visibility acceptance separately from other test or export modes.");
+            if (options.smokeTest && options.renderSettings.culling != CullMode::Off)
+                throw std::runtime_error("Use --visibility-smoke for GPU culling checks.");
             if (options.smokeTest && options.renderSettings.adaptiveLod)
                 throw std::runtime_error("Use --lod-depth-smoke for GPU selection checks.");
             if (!options.saveConfigPath.empty() && (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || !options.hierarchyRoundtripPath.empty()))

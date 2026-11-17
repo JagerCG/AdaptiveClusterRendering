@@ -16,7 +16,7 @@ glm::vec4 lodLevelColor(uint32_t level)
 void validateRenderSettings(const RenderSettings& s)
 {
     const auto finite = [](float f) { return std::isfinite(f); };
-    if (!finite(s.lodPixels) || s.lodPixels < 0 || s.lodPixels > 65536 ||
+    if (s.culling > CullMode::FlatHiZ || s.hiZMip > 31 || !finite(s.lodPixels) || s.lodPixels < 0 || s.lodPixels > 65536 ||
         s.display > RenderDisplay::ShadowMap || !finite(s.shadowBias) || s.shadowBias < 0 || s.shadowBias > .08f ||
         !finite(s.maxDistance) || s.maxDistance < 0 || !finite(s.lightDirection.x) ||
         !finite(s.lightDirection.y) || !finite(s.lightDirection.z) || glm::length(s.lightDirection) < 1e-4f ||

@@ -8,6 +8,8 @@ A C++ and Vulkan renderer for experimenting with cluster-based geometry. Milesto
 
 Start with the [01/02 mesh hierarchy demo](#m2-mesh-hierarchy-and-acr-v2) to inspect the resident geometry. The [03/06 demo](#m2-gpu-lod-and-camera-depth) shows the GPU choosing detail per region, drawing that selection and publishing the main camera depth. The [shadow demo](docs/milestone-2-render-integration.md) covers the light view.
 
+The [04/05/07 demo](#m2-gpu-visibility-drawing-and-subdivision) shows how GPU visibility changes the geometry submitted for source drawing or subdivision. It includes a stage with a known hidden surface.
+
 The [M2 Part 2 foundation and integration contract](docs/milestone-2-part2-contract.md)
 defines the working interfaces for storage and compute-based tessellation/displacement,
 including resource ownership and the handoff to rendering. It records the synchronized
@@ -120,6 +122,40 @@ ctest --test-dir build -C Debug -R "gpu-(lod-camera-depth|view-replay)$" --outpu
 The selector projects each node's accumulated geometric error using the nearest depth of its conservative bounds and the vertical focal length in pixels. A node that crosses the near plane refines until it reaches a leaf. The compute shader emits global cluster IDs, indexed draw commands and a triangle work list consumed directly by subdivision. The CPU waits for a compact ID/count mirror for debug colors, bounds and exact output sizing. Ordinary interaction reuses an unchanged selection. The benchmark forces a fresh GPU selection for each measured frame.
 
 **Camera depth for module 04.** After a submitted shaded or camera-depth frame, `VulkanRenderer::cameraDepth()` exposes the D32 image view and sampler, the viewport extent, the producing view-projection matrix, frame serial and scene revision. Vulkan device depth runs from 0 at the near plane to 1 at the far plane, with empty pixels cleared to 1. Sample in `VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL` on the same graphics/compute queue before the next frame overwrites it. Check `view` and `solid` before treating it as an occluder. A resize or scene replacement invalidates the handle, the light-only display publishes no camera image, and wireframe has partial coverage. A compute-sampling test reads the attachment before and after resizing. Building a Hi-Z pyramid and culling clusters from it belong to module 04.
+
+## M2 GPU visibility, drawing and subdivision
+
+Start the first command and open **GPU visibility**. The foreground wall covers the middle patch. Another patch sticks out on the right, and a fourth is outside the starting view. Change the culling mode and compare the counts below. Click **Reset camera** to switch to an oblique view and reveal the middle patch.
+
+```powershell
+.\build\Release\AdaptiveClusterRendering.exe --fixture occlusion --cull hiz --cluster-colors --subdivision 2 --shadows
+.\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors --cull hiz --subdivision 2 --displacement 0.08
+ctest --test-dir build -C Debug -R "gpu-visibility-(pipeline|report)" --output-on-failure
+```
+
+The table uses the occlusion stage at its initial 960 × 640 view, with two segments per edge and shadows enabled.
+
+| Culling mode | Surviving clusters | Source triangles for the camera | Generated triangles drawn | Shadow triangles |
+| --- | ---: | ---: | ---: | ---: |
+| Off | 16 | 32 | 128 | 128 |
+| Frustum | 12 | 24 | 96 | 128 |
+| Hierarchy + frustum | 12 | 24 | 96 | 128 |
+| Hierarchy + frustum + Hi-Z | 8 | 16 | 64 | 128 |
+| Frustum + Hi-Z (per cluster) | 8 | 16 | 64 | 128 |
+
+Use `--cull hiz-flat` to test each cluster against the depth pyramid without visiting hierarchy nodes. The `hiz` mode can reject a whole branch from one parent test.
+
+**Inspect the result.** Enable **Cluster bounds** to see surviving bounds. **Show rejected bounds (orange)** draws rejected boxes through the foreground in shaded mode. **Show Hi-Z mip** displays the selected depth level. Mip 0 contains the previous matching camera depth. Each coarser pixel stores the farthest covered depth across its source pixels, including background. Odd-sized rows and columns contribute through the final 1 × 1 level. A camera move, resize, changed source selection or changed displaced surface withdraws the previous depth until a matching solid frame has been drawn. During that frame, frustum and hierarchy culling continue.
+
+**Follow the geometry.** Module 04 takes the ordered list from a manual level, an explicit selection or GPU LOD. It tests parent bounds from roots to leaves, then tests surviving cluster bounds. The bounds expand by the maximum travel permitted by the height map and amplitude. The GPU compacts surviving IDs, indexed draw commands and triangle work in candidate order. Module 05 can draw those commands directly. With module 07 enabled, subdivision consumes the same triangle work and an indirect dispatch, and 05 draws the resulting mesh. The light pass retains the pre-camera candidate list and its displaced surface, including off-camera casters. The CPU reads back counts and IDs for exact output sizing, diagnostics and debug colors.
+
+**Repeat a measurement.** Save the view or use a fixed command line as below. The report records candidate and visible counts, rejection reasons, Hi-Z depth provenance, drawn geometry, CPU wait time and separate GPU times for the pyramid, culling, generation and rendering. The full-camera-pass depth comparison and numerical readbacks run outside measured intervals.
+
+```powershell
+.\build\Release\AdaptiveClusterRendering.exe --fixture occlusion --cull hiz --subdivision 2 --displacement 0.08 --shadows --benchmark build/visibility-hiz.json --benchmark-warmup 5 --benchmark-samples 20
+```
+
+On an RTX 4070 Laptop GPU, a Release run at 960 × 640 with these settings took a median 0.016 ms for the hierarchy and cluster tests and 0.032 ms to build Hi-Z. The median frame time, including forced regeneration and CPU waits, was 2.35 ms with culling off and 3.67 ms with hierarchical Hi-Z. On this 16-cluster fixture the extra overhead outweighed the geometry savings. In the default Suzanne view, the 96-pixel LOD threshold selected 78 clusters across four geometry levels. All 78 survived culling, and subdivision turned 1,822 source triangles into 7,288 drawn triangles.
 
 ## M2 Part 2: storage diagnostics demo
 
@@ -466,7 +502,7 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/VulkanRendererLod.cpp`, `shaders/select_lod.comp` | Select and compact a camera-dependent regional hierarchy cut, indirect draws and subdivision work. |
 | `src/ViewConfig.*`, `shaders/camera_depth.frag` | Save and replay viewer configurations, and display the stored main camera depth. |
 
-The viewer starts with the original geometry. Both manual levels and automatic per-region GPU selection feed drawing, subdivision, displacement, shadows and cluster bounds. Module 04 can consume the camera depth and its producing camera transform for visibility tests.
+The viewer starts with the original geometry. Both manual levels and automatic per-region GPU selection feed visibility, drawing and subdivision. Module 04 uses the matching camera depth and conservative displacement bounds. The shadow pass retains its own caster list.
 
 ## Credits
 

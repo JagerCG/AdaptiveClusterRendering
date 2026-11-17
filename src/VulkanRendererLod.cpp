@@ -225,7 +225,9 @@ void VulkanRenderer::selectLod(const OrbitCamera& camera, float padding, bool fo
     sceneGpu_.lodTriangleWork = lodWork_.handle;
     sceneGpu_.lodRecordOffset = 4 * record;
     sceneGpu_.lodWorkAllocation = lodWork_.allocationBytes;
-    if (!sameClusterSelection(selection_, resolved)) compute_->invalidate();
+    if (!sameClusterSelection(selection_, resolved)) {
+        compute_->invalidate(); visibilityActive_ = false; ++candidateRevision_;
+    }
     selection_ = std::move(resolved);
     lastLod_ = push;
     stats.cpuMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();

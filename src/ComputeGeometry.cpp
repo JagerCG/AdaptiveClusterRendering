@@ -159,7 +159,7 @@ void ComputeGeometry::destroyHeight(HeightImage& height)
 
 void ComputeGeometry::uploadHeight(const HeightField& field, VkCommandBuffer command, VkQueue queue)
 {
-    validateHeightField(field); // Reject malformed input without changing the cache/resources.
+    const float unitBound = displacementBound(field, {true, 1.f}); // Validate and scan once per uploaded height image.
     if (heightRevision_ == std::numeric_limits<uint64_t>::max()) throw std::runtime_error("Height revision overflow.");
     auto nextField = field;
     VkPhysicalDeviceProperties properties{};
@@ -268,6 +268,7 @@ void ComputeGeometry::uploadHeight(const HeightField& field, VkCommandBuffer com
     destroyHeight(height_);
     height_ = next;
     heightField_ = std::move(nextField);
+    heightUnitBound_ = unitBound;
     ++heightRevision_;
     invalidate();
 }
@@ -314,7 +315,7 @@ void ComputeGeometry::prepare(const SceneGpuData& source, const ResolvedClusterS
     next.sourceRevision = source.sceneRevision;
     next.heightRevision = heightRevision_;
     next.displacement = displacement;
-    next.maxDisplacement = displacementBound(heightField_, displacement);
+    next.maxDisplacement = maxDisplacement(displacement);
     next.vertexCount = plan.vertexCount;
     next.indexCount = plan.indexCount;
     next.edgeSegments = plan.edgeSegments;

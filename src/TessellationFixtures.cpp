@@ -34,6 +34,37 @@ SceneData makePatchGrid(uint32_t cells)
 SceneData makeTessellationFixture(TessellationFixture fixture)
 {
     switch (fixture) {
+    case TessellationFixture::Occlusion: {
+        // Four patches: foreground wall, fully hidden patch, partly exposed patch, off-screen patch.
+        const auto tile = makePatchGrid(2);
+        SceneData scene;
+        scene.maxTrianglesPerCluster = tile.maxTrianglesPerCluster;
+        const auto patch = [&](glm::vec3 center, float scale) {
+            const uint32_t vertexBase = static_cast<uint32_t>(scene.mesh.vertices.size());
+            const uint32_t indexBase = static_cast<uint32_t>(scene.dataset.indices.size());
+            for (auto v : tile.mesh.vertices) {
+                v.position = v.position * scale + center;
+                scene.mesh.positionIds.push_back(static_cast<uint32_t>(scene.mesh.vertices.size()));
+                scene.mesh.vertices.push_back(v);
+            }
+            for (auto i : tile.dataset.indices)
+                scene.dataset.indices.push_back(vertexBase + i);
+            for (auto c : tile.dataset.clusters) {
+                c.firstIndex += indexBase;
+                c.boundsMin = c.boundsMin * scale + center;
+                c.boundsMax = c.boundsMax * scale + center;
+                scene.dataset.clusters.push_back(c);
+            }
+        };
+        patch({-.25f, 0, .45f}, 1.05f);
+        patch({-.25f, 0, -.75f}, .38f);
+        patch({1.12f, 0, -.5f}, .55f);
+        patch({8, 0, 0}, .35f);
+        scene.mesh.indices = scene.dataset.indices;
+        buildMeshHierarchy(scene, 0);
+        validateScene(scene);
+        return scene;
+    }
     case TessellationFixture::Triangle: {
         SceneData scene;
         scene.maxTrianglesPerCluster = 1;

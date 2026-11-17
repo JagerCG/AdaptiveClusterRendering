@@ -79,6 +79,7 @@ void BenchmarkSession::add(const BenchmarkSample& sample)
     require(active_, "No active benchmark accepts this sample.");
     checkTime(sample.gpuMainMs); checkTime(sample.gpuShadowMs);
     checkTime(sample.cpuFrameMs); checkTime(sample.cpuLodMs); checkTime(sample.gpuLodMs);
+    checkTime(sample.cpuCullMs); checkTime(sample.gpuCullMs); checkTime(sample.gpuPyramidMs);
     checkTime(sample.cpuGenerateMs); checkTime(sample.gpuGenerateMs); checkTime(sample.gpuRenderMs);
     require(sample.cpuGenerateMs.has_value() == generated_, "Benchmark CPU generation timing has the wrong scope.");
     require(sample.gpuGenerateMs.has_value() == (generated_ && timestamps_ && nonempty_), "Benchmark GPU generation availability changed.");
@@ -138,6 +139,9 @@ std::string benchmarkJson(const BenchmarkReport& report)
     summary("cpu_frame", &BenchmarkSample::cpuFrameMs, true);
     summary("cpu_lod_and_wait", &BenchmarkSample::cpuLodMs, true);
     summary("gpu_lod", &BenchmarkSample::gpuLodMs, true);
+    summary("cpu_visibility_and_wait", &BenchmarkSample::cpuCullMs, true);
+    summary("gpu_cull", &BenchmarkSample::gpuCullMs, true);
+    summary("gpu_hiz", &BenchmarkSample::gpuPyramidMs, true);
     out << "\n  },\n  \"samples\": [";
     for (size_t i = 0; i < report.samples.size(); ++i) {
         const auto& sample = report.samples[i];
@@ -150,7 +154,10 @@ std::string benchmarkJson(const BenchmarkReport& report)
         out << ",\"gpu_shadow_ms\":"; optionalTime(out, sample.gpuShadowMs);
         out << ",\"cpu_frame_ms\":"; optionalTime(out, sample.cpuFrameMs);
         out << ",\"cpu_lod_and_wait_ms\":"; optionalTime(out, sample.cpuLodMs);
-        out << ",\"gpu_lod_ms\":"; optionalTime(out, sample.gpuLodMs); out << '}';
+        out << ",\"gpu_lod_ms\":"; optionalTime(out, sample.gpuLodMs);
+        out << ",\"cpu_visibility_and_wait_ms\":"; optionalTime(out,sample.cpuCullMs);
+        out << ",\"gpu_cull_ms\":"; optionalTime(out,sample.gpuCullMs);
+        out << ",\"gpu_hiz_ms\":"; optionalTime(out,sample.gpuPyramidMs); out << '}';
     }
     out << "\n  ]\n}\n";
     return out.str();
