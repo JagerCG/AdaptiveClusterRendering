@@ -5,12 +5,16 @@
 #include "HeightField.h"
 #include "Benchmark.h"
 #include "RenderPlanning.h"
+#include "ViewConfig.h"
 
 struct LoadedScene;
 
 struct ViewerOptions {
     RenderSettings renderSettings;
     bool renderSmoke = false;
+    bool lodDepthSmoke = false, hidePanel = false;
+    std::filesystem::path saveConfigPath;
+    std::optional<ViewConfig> initialView;
     uint32_t geometryLevel = 0;
     bool clusterColors = false;
     bool showBounds = false;

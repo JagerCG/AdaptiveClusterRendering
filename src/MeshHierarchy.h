@@ -6,6 +6,7 @@
 
 struct SceneData;
 constexpr uint32_t kNoParent = UINT32_MAX;
+constexpr uint32_t kAdaptiveGeometryLevel = UINT32_MAX; // runtime cut across resident levels
 
 // Indices and cluster IDs are absolute in [fine data | coarse data].
 // Levels and nodes are also the std430 storage records consumed by the GPU.

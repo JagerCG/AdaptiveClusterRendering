@@ -6,10 +6,18 @@
 #include <limits>
 #include <stdexcept>
 
+glm::vec4 lodLevelColor(uint32_t level)
+{
+    constexpr glm::vec4 colors[] = {{.10f,.68f,.91f,1}, {.13f,.78f,.46f,1}, {.94f,.78f,.14f,1},
+        {.98f,.40f,.12f,1}, {.90f,.23f,.54f,1}, {.60f,.30f,.88f,1}};
+    return colors[level % std::size(colors)];
+}
+
 void validateRenderSettings(const RenderSettings& s)
 {
     const auto finite = [](float f) { return std::isfinite(f); };
-    if (s.display > RenderDisplay::ShadowMap || !finite(s.shadowBias) || s.shadowBias < 0 || s.shadowBias > .08f ||
+    if (!finite(s.lodPixels) || s.lodPixels < 0 || s.lodPixels > 65536 ||
+        s.display > RenderDisplay::ShadowMap || !finite(s.shadowBias) || s.shadowBias < 0 || s.shadowBias > .08f ||
         !finite(s.maxDistance) || s.maxDistance < 0 || !finite(s.lightDirection.x) ||
         !finite(s.lightDirection.y) || !finite(s.lightDirection.z) || glm::length(s.lightDirection) < 1e-4f ||
         !finite(glm::length(s.lightDirection))) throw std::runtime_error("Invalid rendering settings.");

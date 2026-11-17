@@ -42,7 +42,7 @@ target_link_libraries(imgui PRIVATE glfw Vulkan::Vulkan)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>")
 set(SHADER_SOURCES)
 set(COMPILED_SHADERS)
-foreach(SHADER IN ITEMS mesh.vert mesh.frag shadow.vert shadow.frag shadow_debug.vert shadow_debug.frag bounds.vert bounds.frag generate_geometry.comp)
+foreach(SHADER IN ITEMS mesh.vert mesh.frag shadow.vert shadow.frag shadow_debug.vert shadow_debug.frag camera_depth.frag bounds.vert bounds.frag generate_geometry.comp select_lod.comp probe_camera_depth.comp)
     set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}")
     set(SHADER_OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER}.inc")
     add_custom_command(
@@ -103,9 +103,14 @@ add_executable(AdaptiveClusterRendering
     src/OrbitCamera.h
     src/Viewer.cpp
     src/Viewer.h
+    src/ViewConfig.cpp
+    src/ViewConfig.h
     src/VulkanRenderer.cpp
     src/VulkanRendererShadow.cpp
+    src/VulkanRendererLod.cpp
     tests/RenderIntegrationChecks.cpp
+    tests/LodDepthChecks.cpp
+    tests/CameraDepthProbe.cpp
     src/VulkanRenderer.h
     src/SceneGpuData.h
     src/ComputeGeometry.cpp
@@ -191,6 +196,12 @@ if(BUILD_TESTING)
         set_tests_properties(gpu-render-integration PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS "gpu"
             FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu")
+        add_test(NAME gpu-lod-camera-depth COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --lod-depth-smoke)
+        add_test(NAME gpu-view-replay COMMAND "${CMAKE_COMMAND}" "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>"
+                 "-DASSET=${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ViewReplay.cmake")
+        set_tests_properties(gpu-lod-camera-depth gpu-view-replay PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS "gpu"
+            FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         add_test(NAME gpu-hierarchy-roundtrip COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
                  --hierarchy-roundtrip "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/hierarchy.acr")
         set_tests_properties(gpu-hierarchy-roundtrip PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS "gpu"

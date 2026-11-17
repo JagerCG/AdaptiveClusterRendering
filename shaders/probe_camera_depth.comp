@@ -1,0 +1,11 @@
+#version 450
+// Acceptance consumer of the same sampled depth view exposed to a future Hi-Z pass.
+layout(local_size_x=25) in;
+layout(set=0,binding=0) uniform sampler2D cameraDepth;
+layout(std430,set=0,binding=1) writeonly buffer Probe { float depth[25]; } result;
+void main() {
+    uint id=gl_LocalInvocationID.x;
+    ivec2 cell=ivec2(id%5u,id/5u);
+    ivec2 pixel=((2*cell+1)*textureSize(cameraDepth,0))/10;
+    result.depth[id]=texelFetch(cameraDepth,pixel,0).r;
+}

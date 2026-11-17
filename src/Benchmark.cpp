@@ -78,6 +78,7 @@ void BenchmarkSession::add(const BenchmarkSample& sample)
 {
     require(active_, "No active benchmark accepts this sample.");
     checkTime(sample.gpuMainMs); checkTime(sample.gpuShadowMs);
+    checkTime(sample.cpuFrameMs); checkTime(sample.cpuLodMs); checkTime(sample.gpuLodMs);
     checkTime(sample.cpuGenerateMs); checkTime(sample.gpuGenerateMs); checkTime(sample.gpuRenderMs);
     require(sample.cpuGenerateMs.has_value() == generated_, "Benchmark CPU generation timing has the wrong scope.");
     require(sample.gpuGenerateMs.has_value() == (generated_ && timestamps_ && nonempty_), "Benchmark GPU generation availability changed.");
@@ -134,6 +135,9 @@ std::string benchmarkJson(const BenchmarkReport& report)
     summary("gpu_render", &BenchmarkSample::gpuRenderMs, true);
     summary("gpu_main", &BenchmarkSample::gpuMainMs, true);
     summary("gpu_shadow", &BenchmarkSample::gpuShadowMs, true);
+    summary("cpu_frame", &BenchmarkSample::cpuFrameMs, true);
+    summary("cpu_lod_and_wait", &BenchmarkSample::cpuLodMs, true);
+    summary("gpu_lod", &BenchmarkSample::gpuLodMs, true);
     out << "\n  },\n  \"samples\": [";
     for (size_t i = 0; i < report.samples.size(); ++i) {
         const auto& sample = report.samples[i];
@@ -143,7 +147,10 @@ std::string benchmarkJson(const BenchmarkReport& report)
         out << ",\"gpu_generate_ms\":"; optionalTime(out, sample.gpuGenerateMs);
         out << ",\"gpu_render_ms\":"; optionalTime(out, sample.gpuRenderMs);
         out << ",\"gpu_main_ms\":"; optionalTime(out, sample.gpuMainMs);
-        out << ",\"gpu_shadow_ms\":"; optionalTime(out, sample.gpuShadowMs); out << '}';
+        out << ",\"gpu_shadow_ms\":"; optionalTime(out, sample.gpuShadowMs);
+        out << ",\"cpu_frame_ms\":"; optionalTime(out, sample.cpuFrameMs);
+        out << ",\"cpu_lod_and_wait_ms\":"; optionalTime(out, sample.cpuLodMs);
+        out << ",\"gpu_lod_ms\":"; optionalTime(out, sample.gpuLodMs); out << '}';
     }
     out << "\n  ]\n}\n";
     return out.str();

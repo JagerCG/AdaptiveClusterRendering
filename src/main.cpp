@@ -138,6 +138,8 @@ int main(int argc, char** argv)
                      "       [--cluster-colors] [--bounds] [--compute-copy] [--verify-gpu] [--smoke-test]\n"
                      "       [--subdivision 1|2|4|8] [--wireframe]\n"
                      "       [--geometry-level N] [--group-colors]\n"
+                     "       [--gpu-lod] [--lod-pixels P] [--level-colors] [--hide-ui]\n"
+                     "       [--view-config file.acrview] [--save-view file.acrview] [--lod-depth-smoke]\n"
                      "       [--shadows] [--shadow-bias 0..0.08] [--depth-view | --shadow-map]\n"
                      "       [--frustum-preview] [--max-distance model_units] [--render-smoke]\n"
                      "       [--displacement amplitude (0..1000)] [--heightmap file.pgm]\n"
@@ -181,10 +183,45 @@ int main(int argc, char** argv)
             return 0;
         }
         if (!checkEnvironment) {
+            // Restore a saved baseline first. Explicit CLI settings override it.
+            for (int i = 1; i < argc; ++i)
+                if (argument(i) == "--view-config") {
+                    if (++i >= argc || options.initialView) throw std::runtime_error("Choose one .acrview file.");
+                    options.initialView = loadViewConfig(argument(i));
+                    const auto& v = *options.initialView;
+                    options.renderSettings = v.render;
+                    options.geometryLevel = v.level;
+                    options.hidePanel = v.hidePanel;
+                    options.clusterColors = v.clusterColors;
+                    options.showBounds = v.bounds;
+                    options.computeGeometry = v.generated;
+                    options.wireframe = v.wire;
+                    options.displacement = v.displacement;
+                    options.heightMapPath = v.heightPath;
+                    options.edgeSegments = v.segments;
+                    options.selectionPreset = v.selection;
+                    options.benchmarkOptions = v.sampling;
+                }
             for (int i = 1; i < argc; ++i) {
                 const auto option = argument(i);
-                if (option == "--cluster-colors") options.clusterColors = true;
-                else if (option == "--group-colors") options.renderSettings.groupColors = true;
+                if (option == "--cluster-colors") {
+                    options.clusterColors = true; options.renderSettings.groupColors = options.renderSettings.levelColors = false;
+                }
+                else if (option == "--group-colors") {
+                    options.renderSettings.groupColors = true; options.clusterColors = options.renderSettings.levelColors = false;
+                }
+                else if (option == "--gpu-lod") options.renderSettings.adaptiveLod = true;
+                else if (option == "--level-colors") {
+                    options.renderSettings.levelColors = true; options.clusterColors = options.renderSettings.groupColors = false;
+                }
+                else if (option == "--hide-ui") options.hidePanel = true;
+                else if (option == "--lod-depth-smoke") options.lodDepthSmoke = true;
+                else if (option == "--view-config")
+                    ++i; // Loaded before applying CLI overrides.
+                else if (option == "--save-view") {
+                    if (++i >= argc) throw std::runtime_error("Missing .acrview path.");
+                    options.saveConfigPath = argument(i);
+                }
                 else if (option == "--geometry-level") {
                     if (++i >= argc) throw std::runtime_error("Missing geometry level.");
                     const auto value = argument(i).u8string();
@@ -193,6 +230,7 @@ int main(int argc, char** argv)
                     const auto parsed = std::stoull(value);
                     if (parsed > INT32_MAX) throw std::runtime_error("Geometry level is out of range.");
                     options.geometryLevel = static_cast<uint32_t>(parsed);
+                    options.renderSettings.adaptiveLod = false;
                 }
                 else if (option == "--bounds") options.showBounds = true;
                 else if (option == "--verify-gpu") options.verifyGpu = true;
@@ -203,12 +241,13 @@ int main(int argc, char** argv)
                 else if (option == "--shadow-map") options.renderSettings.display = RenderDisplay::ShadowMap;
                 else if (option == "--frustum-preview") options.renderSettings.frustumPreview = true;
                 else if (option == "--render-smoke") options.renderSmoke = true;
-                else if (option == "--shadow-bias" || option == "--max-distance") {
+                else if (option == "--shadow-bias" || option == "--max-distance" || option == "--lod-pixels") {
                     if (++i >= argc) throw std::runtime_error("Missing render setting value.");
                     const auto value = argument(i).u8string(); size_t consumed = 0;
                     const float number = std::stof(value, &consumed);
                     if (consumed != value.size()) throw std::runtime_error("Invalid render setting value.");
                     if (option == "--shadow-bias") options.renderSettings.shadowBias = number;
+                    else if (option == "--lod-pixels") { options.renderSettings.lodPixels = number; options.renderSettings.adaptiveLod = true; }
                     else options.renderSettings.maxDistance = number;
                 }
                 else if (option == "--benchmark") {
@@ -282,6 +321,12 @@ int main(int argc, char** argv)
                 }
             }
             validateRenderSettings(options.renderSettings);
+            if (options.smokeTest && options.renderSettings.adaptiveLod)
+                throw std::runtime_error("Use --lod-depth-smoke for GPU selection checks.");
+            if (!options.saveConfigPath.empty() && (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || !options.hierarchyRoundtripPath.empty()))
+                throw std::runtime_error("Save a view separately from the acceptance checks.");
+            if (options.lodDepthSmoke && (options.renderSmoke || options.smokeTest || !options.hierarchyRoundtripPath.empty() || !options.benchmarkPath.empty()))
+                throw std::runtime_error("Run LOD/depth acceptance separately from other checks.");
             if (!options.hierarchyRoundtripPath.empty() && (options.renderSmoke || options.smokeTest || !options.benchmarkPath.empty()))
                 throw std::runtime_error("Run the hierarchy roundtrip separately from other test modes.");
             validateBenchmarkOptions(options.benchmarkOptions);
@@ -325,6 +370,8 @@ int main(int argc, char** argv)
                 exitCode = runViewer(makeCubeSceneWithStats(), options);
             } else if (useMock) {
                 exitCode = runViewer(makeMockSceneWithStats(), options);
+            } else if (inputPath.empty() && options.initialView) {
+                exitCode = runViewer(loadViewScene(*options.initialView),options);
             } else {
                 const auto path = !inputPath.empty() ? inputPath :
                     std::filesystem::absolute(argv[0]).parent_path() / "assets" / "suzanne.obj";

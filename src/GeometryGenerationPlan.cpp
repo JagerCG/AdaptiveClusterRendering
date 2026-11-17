@@ -7,7 +7,7 @@
 bool validEdgeSegments(uint32_t n) { return n == 1 || n == 2 || n == 4 || n == 8; }
 
 GeometryGenerationPlan makeGeometryGenerationPlan(uint32_t sourceIndexCount, uint32_t sourceClusterCount,
-    const ResolvedClusterSelection& selection, uint32_t edgeSegments, GeometryGenerationLimits limits)
+    const ResolvedClusterSelection& selection, uint32_t edgeSegments, GeometryGenerationLimits limits, bool expandCpuWork)
 {
     if (!validEdgeSegments(edgeSegments)) throw std::runtime_error("Edge segments must be 1, 2, 4 or 8.");
     if (selection.sceneRevision == 0) throw std::runtime_error("Compute input has no source revision.");
@@ -44,13 +44,14 @@ GeometryGenerationPlan makeGeometryGenerationPlan(uint32_t sourceIndexCount, uin
     }
     plan.workgroupsX = static_cast<uint32_t>(groups);
     // All size checks precede allocation/expansion of the potentially large list.
-    plan.triangleFirstIndices.reserve(static_cast<size_t>(count / 3));
+    if (expandCpuWork) plan.triangleFirstIndices.reserve(static_cast<size_t>(count / 3));
     plan.ranges.reserve(selection.ranges.size());
     uint32_t outputFirst = 0;
     for (const auto& range : selection.ranges) {
         const auto outputRangeCount = static_cast<uint32_t>(range.indexCount * multiplier);
         plan.ranges.push_back({range.sourceClusterId, outputFirst, outputRangeCount});
-        for (uint32_t i = 0; i < range.indexCount; i += 3) plan.triangleFirstIndices.push_back(range.firstIndex + i);
+        if (expandCpuWork)
+            for (uint32_t i = 0; i < range.indexCount; i += 3) plan.triangleFirstIndices.push_back(range.firstIndex + i);
         outputFirst += outputRangeCount;
     }
     return plan;

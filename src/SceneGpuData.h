@@ -45,4 +45,9 @@ struct SceneGpuData {
     uint32_t indexStride = sizeof(uint32_t);
     uint32_t clusterStride = sizeof(GpuClusterDesc);
     VkDescriptorSet clusterSet = VK_NULL_HANDLE; // set 0, binding 0, readonly storage buffer
+    // Borrowed from the GPU selector for mixed cuts. Word 4 starts four
+    // VkDispatchIndirectCommands (n=1,2,4,8); work contains absolute index addresses.
+    static constexpr uint32_t lodRecordStride = sizeof(uint32_t) + sizeof(VkDrawIndexedIndirectCommand);
+    VkBuffer lodCommands = VK_NULL_HANDLE, lodTriangleWork = VK_NULL_HANDLE;
+    VkDeviceSize lodRecordOffset = 0, lodWorkAllocation = 0;
 };

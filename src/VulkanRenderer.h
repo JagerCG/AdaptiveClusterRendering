@@ -28,6 +28,26 @@ struct SourceDrawStats {
     bool shadowPass = false;
 };
 
+struct LodSelectionStats {
+    std::vector<uint32_t> clustersPerLevel;
+    double cpuMs = 0;
+    std::optional<double> gpuMs;
+};
+
+// Most recently submitted main pass. Submit consumers on the same graphics/compute
+// queue before the next draw, or wait for its fence before a host readback.
+struct CameraDepthView {
+    static constexpr VkFormat format = VK_FORMAT_D32_SFLOAT;
+    VkImageView view = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkExtent2D extent{};
+    glm::mat4 viewProjection{1};
+    uint64_t frame = 0;
+    SceneRevision sceneRevision = 0;
+    bool solid = false;
+};
+
 class VulkanRenderer {
 public:
     VulkanRenderer() = default;
@@ -40,6 +60,11 @@ public:
     void uploadScene(const SceneData& scene);
     void verifyUpload(const SceneData& scene);
     void setHierarchyLevel(uint32_t level);
+    void selectLod(const OrbitCamera& camera, float padding = 0, bool force = false);
+    const LodSelectionStats& lodStats() const { return lodStats_; }
+    const CameraDepthView& cameraDepth() const { return cameraDepth_; }
+    std::vector<float> readCameraDepth();
+    void checkCameraDepthSampling(); // acceptance probe through the public sampled-image handoff
     bool ensureGeneratedGeometry(bool force = false); // false: reuse cached output
     void verifyGeneratedGeometry(const SceneData& scene);
     void setEdgeSegments(uint32_t segments);
@@ -92,6 +117,9 @@ private:
     void createInstance();
     void createDevice();
     void createFrameResources();
+    void createLodResources();
+    void sizeLodBuffers(VkDeviceSize resultBytes, VkDeviceSize workBytes);
+    std::vector<float> readDepth(VkImage image, VkExtent2D extent, VkImageLayout layout);
     VkDeviceMemory allocateMemory(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags properties);
     void createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     void destroyBuffer(const Buffer& buffer);
@@ -129,8 +157,14 @@ private:
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkPipeline wireframePipeline_ = VK_NULL_HANDLE;
     bool wireframeSupported_ = false;
+    uint32_t indirectDrawLimit_ = 1;
     VkPipeline boundsPipeline_ = VK_NULL_HANDLE;
     VkPipeline shadowPipeline_ = VK_NULL_HANDLE, shadowDebugPipeline_ = VK_NULL_HANDLE;
+    VkPipeline cameraDebugPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout cameraDepthLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSet cameraDepthSet_ = VK_NULL_HANDLE;
+    CameraDepthView cameraDepth_;
+    uint64_t frameSerial_ = 0;
     VkRenderPass shadowRenderPass_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout shadowLayout_ = VK_NULL_HANDLE;
     VkDescriptorSet shadowSet_ = VK_NULL_HANDLE;
@@ -163,6 +197,23 @@ private:
     std::vector<Cluster> residentClusters_;
     std::vector<LodLevel> residentLevels_;
     std::vector<uint32_t> clusterGroups_; // absolute cluster ID -> parent group for coloring
+    std::vector<uint32_t> clusterLevels_;
+    struct LodPush {
+        glm::vec4 cameraZ{};
+        float focalPixels = 0, budget = 0, nearPlane = 0, padding = 0;
+        uint32_t nodeWord = 0, nodes = 0, blocks = 0, gridX = 0;
+        uint32_t clusterCapacity = 0, triangleCapacity = 0, phase = 0;
+    };
+    LodPush lastLod_{};
+    LodSelectionStats lodStats_;
+    Buffer lodResult_, lodWork_;
+    VkDeviceSize lodResultSize_ = 0, lodWorkSize_ = 0;
+    VkDescriptorSetLayout lodSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSet lodSet_ = VK_NULL_HANDLE;
+    VkDescriptorPool lodPool_ = VK_NULL_HANDLE;
+    VkPipelineLayout lodLayout_ = VK_NULL_HANDLE;
+    VkPipeline lodPipeline_ = VK_NULL_HANDLE;
+    VkQueryPool lodQueries_ = VK_NULL_HANDLE;
     ResolvedClusterSelection selection_;
     SourceDrawStats lastDraw_;
     std::unique_ptr<ComputeGeometry> compute_;

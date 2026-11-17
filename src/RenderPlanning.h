@@ -11,8 +11,11 @@ struct RenderSettings {
     bool frustumPreview = false; // CPU draw-only preview, NOT GPU LOD selection
     float maxDistance = 0; // model units; zero disables the CPU distance filter
     bool groupColors = false;
+    bool adaptiveLod = false, levelColors = false;
+    float lodPixels = 96.0f;
 };
 void validateRenderSettings(const RenderSettings& settings);
+glm::vec4 lodLevelColor(uint32_t level);
 bool clusterVisible(const Cluster& cluster, float padding, const glm::mat4& viewProjection,
                     glm::vec3 eye, const RenderSettings& settings);
 // Camera-independent fit over source bounds plus conservative displacement.

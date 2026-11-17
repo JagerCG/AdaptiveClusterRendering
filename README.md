@@ -6,9 +6,7 @@ A C++ and Vulkan renderer for experimenting with cluster-based geometry. Milesto
 
 ## Development handoff
 
-OBJ import now builds a resident mesh hierarchy. See **M2 mesh hierarchy and ACR v2**
-below for the 01/02 demo. The [rendering integration and shadow demo](docs/milestone-2-render-integration.md)
-covers the geometry, depth and shadow paths.
+Start with the [01/02 mesh hierarchy demo](#m2-mesh-hierarchy-and-acr-v2) to inspect the resident geometry. The [03/06 demo](#m2-gpu-lod-and-camera-depth) shows the GPU choosing detail per region, drawing that selection and publishing the main camera depth. The [shadow demo](docs/milestone-2-render-integration.md) covers the light view.
 
 The [M2 Part 2 foundation and integration contract](docs/milestone-2-part2-contract.md)
 defines the working interfaces for storage and compute-based tessellation/displacement,
@@ -103,6 +101,26 @@ Preprocessing grows connected groups across shared position edges and simplifies
 
 ACR v2 stores the original v1 payload and adds coarse index/cluster arrays, level records, hierarchy nodes and child IDs. A versioned 72-byte header gives all counts. ACR v1 still loads as one level, and the fixed mock retains its original format. All levels are uploaded once. `MeshHierarchy.h` defines the 32-byte level and 48-byte node records. `SceneGpuData::hierarchy` gives their word offsets in the storage buffer, the total geometry counts and the shared index-buffer offset. Each node covers contiguous global cluster IDs. Its children index the next finer level. The last level holds the roots. The viewer switches its active index range on the same buffers.
 
+## M2 GPU LOD and camera depth
+
+1. Start the viewer with the first command below. In **Mesh hierarchy**, **Automatic GPU LOD** lets the GPU choose a level independently for each region. **Level colors** shows the chosen levels on the mesh. The matching legend counts clusters at each level.
+2. At the initial 960 × 640 camera position, set **Allowed screen error** to 0 to draw all 3,936 Suzanne triangles. At 96 pixels the same view draws 1,822 triangles across four levels. Scroll over the model to zoom, then watch the colors and counts change. Turn off **Automatic GPU LOD** to compare against a fixed level. The counts refer to the source geometry before subdivision.
+3. Under **Rendering and shadows**, switch **Shaded** to **Depth (near is bright)**. Rotate the model to see its main camera depth change. **Shadow map (light view)** displays the separate light-space image. Use **Save view...** and **Open view...** to replay the asset, camera and render settings. F1 hides and restores the panel.
+4. The remaining commands save that starting view, measure consecutive frames from it and run the focused GPU checks. Reports include the camera matrix, source IDs, per-level counts, drawn triangles and CPU frame time. When timestamp queries are supported, GPU time is reported separately for selection, generation (when enabled), the main pass and shadows (when enabled).
+
+On the RTX 4070 Laptop GPU at 960 × 640, the 96-pixel acceptance run selects 3,158 source triangles at its near camera pose, 1,822 at the initial pose and 314 at its far pose. At the initial pose, subdivision with two segments per edge draws 7,288 triangles. The test checks every generated triangle against the selected source patches.
+
+```powershell
+.\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors
+.\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors --save-view build/suzanne-gpu-lod.acrview
+.\build\Release\AdaptiveClusterRendering.exe --view-config build/suzanne-gpu-lod.acrview --benchmark build/suzanne-gpu-lod.json --benchmark-warmup 5 --benchmark-samples 20
+ctest --test-dir build -C Debug -R "gpu-(lod-camera-depth|view-replay)$" --output-on-failure
+```
+
+The selector projects each node's accumulated geometric error using the nearest depth of its conservative bounds and the vertical focal length in pixels. A node that crosses the near plane refines until it reaches a leaf. The compute shader emits global cluster IDs, indexed draw commands and a triangle work list consumed directly by subdivision. The CPU waits for a compact ID/count mirror for debug colors, bounds and exact output sizing. Ordinary interaction reuses an unchanged selection. The benchmark forces a fresh GPU selection for each measured frame.
+
+**Camera depth for module 04.** After a submitted shaded or camera-depth frame, `VulkanRenderer::cameraDepth()` exposes the D32 image view and sampler, the viewport extent, the producing view-projection matrix, frame serial and scene revision. Vulkan device depth runs from 0 at the near plane to 1 at the far plane, with empty pixels cleared to 1. Sample in `VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL` on the same graphics/compute queue before the next frame overwrites it. Check `view` and `solid` before treating it as an occluder. A resize or scene replacement invalidates the handle, the light-only display publishes no camera image, and wireframe has partial coverage. A compute-sampling test reads the attachment before and after resizing. Building a Hi-Z pyramid and culling clusters from it belong to module 04.
+
 ## M2 Part 2: storage diagnostics demo
 
 1. Start with Suzanne. The **Storage** section identifies the OBJ source and its
@@ -143,7 +161,7 @@ CPU upload includes waiting/driver work and is not a GPU measurement. GPU querie
 check queue support, use the device timestamp period and handle counter wrap;
 see the [Khronos timestamp guide](https://docs.vulkan.org/samples/latest/samples/api/timestamp_queries/README.html).
 Debug readback and the save/reload equality comparison are excluded from upload
-timings. Release benchmarking, warmup and repeated measurements remain future work.
+timings. Use the [repeated measurement workflow](#m2-part-2-repeated-measurement) for Release samples with warmup.
 
 ## M2 Part 2: test inputs and selection preview
 
@@ -413,13 +431,14 @@ rejection, cancellation and safe report validation. Four `gpu-benchmark-*` cases
 parse the actual JSON for all/partial/empty/source runs, verify sample counts,
 selection order and generation revisions, and perform readbacks outside the batch.
 
-On 2026-11-14, Debug build and **48/48 tests** passed on the RTX 4070 Laptop GPU
-with synchronization validation and no Vulkan warnings/errors. The seven
-benchmark-focused tests also passed in Release:
+The GPU LOD and camera depth case checks a four-cluster grid, then compares Suzanne cuts with an independent CPU traversal. It checks depth against projected plane samples, exercises a compute shader that samples the depth image, and covers displaced geometry, empty coverage and resizing. The replay case saves a configuration, restarts the viewer and checks identical cluster IDs, camera and triangle counts.
+
+Run the full suite with Vulkan synchronization validation in Debug. Run it again with the Release binary for the configuration used in demos.
 
 ```powershell
 $env:VK_LAYER_VALIDATE_SYNC = '1'
 ctest --test-dir build -C Debug --output-on-failure
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-failure`. The cached-scene preprocessing test is also CPU-only. No FPS or GPU speedup is asserted by these checks.
@@ -436,7 +455,7 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/SceneDiagnostics.*` | Runtime source/file summaries, CPU preparation timing, payload byte counts and exact save/reload verification. Leaves ACR v1 unchanged. |
 | `src/TessellationFixtures.*` | Authored triangle, continuous-UV plane and four-cluster grid for module 07 correctness checks. |
 | `src/ClusterSelection.*` | Revision-bound All/Explicit selection, ordered source ranges and rejection of duplicate, invalid or stale IDs. |
-| `src/GeometryGenerationPlan.*` | Checked subdivision sizing and CPU expansion of selected ranges into source triangle addresses. |
+| `src/GeometryGenerationPlan.*` | Checked subdivision sizing and triangle address expansion for manual inputs. Adaptive inputs borrow their GPU work list. |
 | `src/HeightField.*` | Linear height presets, PGM loading, displacement settings/bounds and CPU reference sampling. |
 | `src/ComputeGeometry.*`, `shaders/generate_geometry.comp` | GPU subdivision/displacement, height-image and generated-buffer ownership, cache identity, barriers and generation timings. |
 | `src/GeometryValidation.*` | Independent CPU reference checks for GPU readback; never generates the displayed geometry. |
@@ -444,8 +463,10 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/ClusterGpu.h`, `src/SceneGpuData.h` | Explicit 48-byte std430 cluster records and the non-owning GPU scene view. |
 | `src/VulkanRenderer.cpp`, `shaders/` | Upload geometry and cluster descriptors; depth-tested mesh and SSBO-driven bounds. In cluster color mode, draw each index range with its own color. |
 | `src/Viewer.cpp`, `src/OrbitCamera.cpp` | Manage model loading, camera controls, and the Model panel. |
+| `src/VulkanRendererLod.cpp`, `shaders/select_lod.comp` | Select and compact a camera-dependent regional hierarchy cut, indirect draws and subdivision work. |
+| `src/ViewConfig.*`, `shaders/camera_depth.frag` | Save and replay viewer configurations, and display the stored main camera depth. |
 
-The viewer starts with the original geometry. Each manually selected level supports source drawing, subdivision, displacement, shadows and cluster bounds. Module 03 can now traverse the resident hierarchy to choose regional detail automatically. Module 04 can use its conservative bounds for GPU visibility tests.
+The viewer starts with the original geometry. Both manual levels and automatic per-region GPU selection feed drawing, subdivision, displacement, shadows and cluster bounds. Module 04 can consume the camera depth and its producing camera transform for visibility tests.
 
 ## Credits
 

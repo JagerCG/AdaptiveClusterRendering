@@ -31,5 +31,6 @@ struct GeometryGenerationPlan {
 
 bool validEdgeSegments(uint32_t n);
 GeometryGenerationPlan makeGeometryGenerationPlan(uint32_t sourceIndexCount, uint32_t sourceClusterCount,
-    const ResolvedClusterSelection& selection, uint32_t edgeSegments = 1, GeometryGenerationLimits limits = {});
+    const ResolvedClusterSelection& selection, uint32_t edgeSegments = 1, GeometryGenerationLimits limits = {},
+    bool expandCpuWork = true);
 bool sameClusterSelection(const ResolvedClusterSelection& a, const ResolvedClusterSelection& b);

@@ -65,6 +65,9 @@ constexpr uint32_t kShadowDebugVertexShader[] = {
 constexpr uint32_t kShadowDebugFragmentShader[] = {
 #include "shadow_debug.frag.inc"
 };
+constexpr uint32_t kCameraDepthFragmentShader[] = {
+#include "camera_depth.frag.inc"
+};
 constexpr uint32_t kBoundsVertexShader[] = {
 #include "bounds.vert.inc"
 };
@@ -117,6 +120,13 @@ VulkanRenderer::~VulkanRenderer()
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
         compute_.reset(); // owns device resources; destroy before vkDestroyDevice
+        destroyBuffer(lodResult_);
+        destroyBuffer(lodWork_);
+        vkDestroyQueryPool(device_, lodQueries_, nullptr);
+        vkDestroyPipeline(device_, lodPipeline_, nullptr);
+        vkDestroyPipelineLayout(device_, lodLayout_, nullptr);
+        vkDestroyDescriptorPool(device_, lodPool_, nullptr);
+        vkDestroyDescriptorSetLayout(device_, lodSetLayout_, nullptr);
         shutdownUi();
         destroySwapchain();
         destroyShadowResources();
@@ -125,10 +135,12 @@ VulkanRenderer::~VulkanRenderer()
         vkDestroyPipeline(device_, boundsPipeline_, nullptr);
         vkDestroyPipeline(device_, shadowPipeline_, nullptr);
         vkDestroyPipeline(device_, shadowDebugPipeline_, nullptr);
+        vkDestroyPipeline(device_, cameraDebugPipeline_, nullptr);
         vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
         vkDestroyDescriptorPool(device_, scenePool_, nullptr);
         vkDestroyDescriptorSetLayout(device_, sceneLayout_, nullptr);
         vkDestroyDescriptorSetLayout(device_, shadowLayout_, nullptr);
+        vkDestroyDescriptorSetLayout(device_, cameraDepthLayout_, nullptr);
         vkDestroyRenderPass(device_, shadowRenderPass_, nullptr);
         destroyBuffer(lightingBuffer_);
         vkDestroyRenderPass(device_, renderPass_, nullptr);
@@ -161,6 +173,7 @@ void VulkanRenderer::initialize(GLFWwindow* window)
     createDevice();
     selectDepthFormat();
     createFrameResources();
+    createLodResources();
     createShadowResources();
     compute_ = std::make_unique<ComputeGeometry>();
     compute_->initialize(gpu_, device_, graphicsFamily_);
@@ -355,6 +368,8 @@ void VulkanRenderer::createDevice()
     vkGetPhysicalDeviceFeatures(gpu_, &available);
     enabled.fillModeNonSolid = available.fillModeNonSolid;
     wireframeSupported_ = available.fillModeNonSolid == VK_TRUE;
+    enabled.multiDrawIndirect = available.multiDrawIndirect;
+    indirectDrawLimit_ = available.multiDrawIndirect ? selectedProperties.limits.maxDrawIndirectCount : 1;
     info.pEnabledFeatures = &enabled;
     check(vkCreateDevice(gpu_, &info, nullptr, &device_), "vkCreateDevice");
     vkGetDeviceQueue(device_, graphicsFamily_, 0, &graphicsQueue_);
@@ -411,25 +426,30 @@ void VulkanRenderer::createFrameResources()
     shadowLayout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     shadowLayout.bindingCount = 2; shadowLayout.pBindings = shadowBindings;
     check(vkCreateDescriptorSetLayout(device_, &shadowLayout, nullptr, &shadowLayout_), "vkCreateDescriptorSetLayout(shadow)");
+    const VkDescriptorSetLayoutBinding cameraBinding{0, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo cameraLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    cameraLayout.bindingCount = 1; cameraLayout.pBindings = &cameraBinding;
+    check(vkCreateDescriptorSetLayout(device_, &cameraLayout, nullptr, &cameraDepthLayout_), "Create camera depth layout");
     const VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1}};
     VkDescriptorPoolCreateInfo scenePool{};
     scenePool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    scenePool.maxSets = 2; scenePool.poolSizeCount = 3; scenePool.pPoolSizes = poolSizes;
+    scenePool.maxSets = 3; scenePool.poolSizeCount = 4; scenePool.pPoolSizes = poolSizes;
     check(vkCreateDescriptorPool(device_, &scenePool, nullptr, &scenePool_), "vkCreateDescriptorPool");
-    const VkDescriptorSetLayout setLayouts[] = {sceneLayout_, shadowLayout_};
-    VkDescriptorSet sets[2]{};
+    const VkDescriptorSetLayout setLayouts[] = {sceneLayout_, shadowLayout_, cameraDepthLayout_};
+    VkDescriptorSet sets[3]{};
     VkDescriptorSetAllocateInfo descriptor{};
     descriptor.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    descriptor.descriptorPool = scenePool_; descriptor.descriptorSetCount = 2; descriptor.pSetLayouts = setLayouts;
+    descriptor.descriptorPool = scenePool_; descriptor.descriptorSetCount = 3; descriptor.pSetLayouts = setLayouts;
     check(vkAllocateDescriptorSets(device_, &descriptor, sets), "vkAllocateDescriptorSets");
-    sceneGpu_.clusterSet = sets[0]; shadowSet_ = sets[1];
+    sceneGpu_.clusterSet = sets[0]; shadowSet_ = sets[1]; cameraDepthSet_ = sets[2];
     createBuffer(lightingBuffer_, sizeof(LightingUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount = 2;
+    layoutInfo.setLayoutCount = 3;
     layoutInfo.pSetLayouts = setLayouts;
     const VkPushConstantRange ranges[] = {
         {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(DrawPush)}
@@ -543,6 +563,9 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
                        scene.hierarchy.coarse.clusters.end());
     auto levels = scene.hierarchy.levels;
     if (levels.empty()) levels.push_back(sceneLevel(scene, 0));
+    std::vector<uint32_t> clusterLevels(allClusters.size());
+    for (uint32_t i = 0; i < levels.size(); ++i)
+        std::fill_n(clusterLevels.begin() + levels[i].firstCluster, levels[i].clusterCount, i);
     std::vector<uint32_t> groups(allClusters.size());
     for (uint32_t i = 0; i < groups.size(); ++i)
         groups[i] = i;
@@ -652,6 +675,11 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     sceneGpu_.clusterCount = levels[0].clusterCount;
     sceneGpu_.hierarchy = packed.layout;
     sceneGpu_.activeLevel = sceneGpu_.firstCluster = 0;
+    sceneGpu_.lodCommands = sceneGpu_.lodTriangleWork = VK_NULL_HANDLE;
+    sceneGpu_.lodRecordOffset = sceneGpu_.lodWorkAllocation = 0;
+    cameraDepth_ = {};
+    lodStats_ = {};
+    clusterLevels_ = std::move(clusterLevels);
     residentClusters_ = std::move(allClusters);
     residentLevels_ = std::move(levels);
     clusterGroups_ = std::move(groups);
@@ -688,6 +716,9 @@ void VulkanRenderer::setHierarchyLevel(uint32_t level)
     auto selection =
         resolveClusterSelection(active, l.indexCount, revision, {revision, ClusterSelectionMode::All, {}});
     sceneGpu_.activeLevel = level;
+    sceneGpu_.lodCommands = sceneGpu_.lodTriangleWork = VK_NULL_HANDLE;
+    sceneGpu_.lodRecordOffset = sceneGpu_.lodWorkAllocation = 0;
+    lodStats_ = {};
     sceneGpu_.firstCluster = l.firstCluster;
     sceneGpu_.indexOffset = sceneGpu_.hierarchy.allIndexOffset + VkDeviceSize(l.firstIndex) * sizeof(uint32_t);
     sceneGpu_.indexCount = l.indexCount;
@@ -700,6 +731,7 @@ void VulkanRenderer::setHierarchyLevel(uint32_t level)
 
 void VulkanRenderer::setClusterSelection(const ClusterSelection& selection)
 {
+    if (sceneGpu_.activeLevel == kAdaptiveGeometryLevel) throw std::runtime_error("Manual lists require a manual geometry level.");
     // Resolve first so a rejected request preserves the active selection.
     auto next = resolveClusterSelection(drawClusters_, sceneGpu_.indexCount, sceneGpu_.sceneRevision, selection);
     if (!sameClusterSelection(selection_, next)) compute_->invalidate();
@@ -856,7 +888,8 @@ void VulkanRenderer::verifyUpload(const SceneData& scene)
     const size_t indexBytes = packed.indices.size() * sizeof(uint32_t);
     const size_t meshBytes = vertexBytes + indexBytes;
     const size_t clusterBytes = packed.records.size()*sizeof(uint32_t);
-    const auto active = sceneLevel(scene,sceneGpu_.activeLevel);
+    auto active = sceneLevel(scene, sceneGpu_.lodCommands ? 0 : sceneGpu_.activeLevel);
+    if (sceneGpu_.lodCommands) { active.indexCount = packed.layout.totalIndices; active.clusterCount = packed.layout.totalClusters; }
     if (sceneGpu_.vertexCount != scene.mesh.vertices.size() || sceneGpu_.indexCount != active.indexCount ||
         sceneGpu_.clusterCount != active.clusterCount || sceneGpu_.firstCluster != active.firstCluster ||
         sceneGpu_.indexOffset != vertexBytes + VkDeviceSize(active.firstIndex)*4)
@@ -911,16 +944,13 @@ void VulkanRenderer::verifyUpload(const SceneData& scene)
 
 void VulkanRenderer::selectDepthFormat()
 {
-    const VkFormat formats[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM};
-    for (VkFormat format : formats) {
-        VkFormatProperties properties{};
-        vkGetPhysicalDeviceFormatProperties(gpu_, format, &properties);
-        if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
-            depthFormat_ = format;
-            return;
-        }
-    }
-    throw std::runtime_error("The device has no supported depth format.");
+    depthFormat_ = VK_FORMAT_D32_SFLOAT; // same required capabilities as the directional shadow pass
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(gpu_, depthFormat_, &properties);
+    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    if ((properties.optimalTilingFeatures & needed) != needed)
+        throw std::runtime_error("Sampleable D32 camera depth with readback is unavailable.");
 }
 
 void VulkanRenderer::createDepthResources()
@@ -934,7 +964,8 @@ void VulkanRenderer::createDepthResources()
     image.arrayLayers = 1;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
     image.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     check(vkCreateImage(device_, &image, nullptr, &depthImage_), "vkCreateImage");
@@ -953,6 +984,11 @@ void VulkanRenderer::createDepthResources()
     view.subresourceRange.levelCount = 1;
     view.subresourceRange.layerCount = 1;
     check(vkCreateImageView(device_, &view, nullptr, &depthView_), "vkCreateImageView");
+    const VkDescriptorImageInfo descriptor{VK_NULL_HANDLE, depthView_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = cameraDepthSet_; write.dstBinding = 0; write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; write.pImageInfo = &descriptor;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
 void VulkanRenderer::recreateSwapchain(int width, int height)
@@ -1035,6 +1071,8 @@ void VulkanRenderer::recreateSwapchain(int width, int height)
         boundsPipeline_ = VK_NULL_HANDLE;
         vkDestroyPipeline(device_, shadowDebugPipeline_, nullptr);
         shadowDebugPipeline_ = VK_NULL_HANDLE;
+        vkDestroyPipeline(device_, cameraDebugPipeline_, nullptr);
+        cameraDebugPipeline_ = VK_NULL_HANDLE;
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         renderPass_ = VK_NULL_HANDLE;
         colorFormat_ = format.format;
@@ -1096,40 +1134,59 @@ void VulkanRenderer::createRenderPass()
     depth.format = depthFormat_;
     depth.samples = VK_SAMPLE_COUNT_1_BIT;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
     const VkAttachmentReference colorAttachment{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     const VkAttachmentReference depthAttachment{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-    VkSubpassDescription subpass{};
+    VkSubpassDescription subpasses[2]{};
+    auto& subpass = subpasses[0];
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorAttachment;
     subpass.pDepthStencilAttachment = &depthAttachment;
+    const VkAttachmentReference depthInput{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    auto& overlay = subpasses[1];
+    overlay.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    overlay.colorAttachmentCount = overlay.inputAttachmentCount = 1;
+    overlay.pColorAttachments = &colorAttachment; overlay.pInputAttachments = &depthInput;
 
     // Wait for the acquired image before the render pass changes its layout.
-    VkSubpassDependency dependency{};
+    VkSubpassDependency dependencies[3]{};
+    auto& dependency = dependencies[0];
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
     const auto depthStages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | depthStages;
-    dependency.dstStageMask = dependency.srcStageMask;
-    dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | depthStages;
+    dependency.srcStageMask = dependency.dstStageMask | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                               VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[1] = {0, 1, depthStages | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        depthStages | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        VK_DEPENDENCY_BY_REGION_BIT};
+    dependencies[2] = {1, VK_SUBPASS_EXTERNAL, depthStages | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, 0};
 
     VkRenderPassCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     info.attachmentCount = 2;
     info.pAttachments = attachments;
-    info.subpassCount = 1;
-    info.pSubpasses = &subpass;
-    info.dependencyCount = 1;
-    info.pDependencies = &dependency;
+    info.subpassCount = 2;
+    info.pSubpasses = subpasses;
+    info.dependencyCount = 3;
+    info.pDependencies = dependencies;
     check(vkCreateRenderPass(device_, &info, nullptr, &renderPass_), "vkCreateRenderPass");
 }
 
@@ -1281,10 +1338,13 @@ void VulkanRenderer::createPipeline()
     rasterization.depthBiasEnable = VK_FALSE;
     blend.attachmentCount = 1; info.renderPass = renderPass_;
     passPipeline(kShadowDebugVertexShader, sizeof(kShadowDebugVertexShader), kShadowDebugFragmentShader, sizeof(kShadowDebugFragmentShader), shadowDebugPipeline_);
+    info.subpass = 1;
+    passPipeline(kShadowDebugVertexShader, sizeof(kShadowDebugVertexShader), kCameraDepthFragmentShader, sizeof(kCameraDepthFragmentShader), cameraDebugPipeline_);
 }
 
 void VulkanRenderer::destroySwapchain()
 {
+    cameraDepth_ = {};
     for (const auto& image : swapchainImages_) {
         vkDestroyFramebuffer(device_, image.framebuffer, nullptr);
         vkDestroyImageView(device_, image.view, nullptr);
@@ -1323,6 +1383,7 @@ void VulkanRenderer::initializeUi(uint32_t minImageCount, uint32_t imageCount)
     info.MinImageCount = minImageCount;
     info.ImageCount = imageCount;
     info.PipelineInfoMain.RenderPass = renderPass_;
+    info.PipelineInfoMain.Subpass = 1;
     info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     info.CheckVkResultFn = [](VkResult result) { check(result, "ImGui Vulkan backend"); };
     if (!ImGui_ImplVulkan_Init(&info)) {
@@ -1393,19 +1454,47 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         vkCmdBindIndexBuffer(commandBuffer_, geometry.indexBuffer, geometry.indexOffset, VK_INDEX_TYPE_UINT32);
         auto& calls = shadow ? stats.shadowDrawCalls : stats.meshDrawCalls;
         auto& triangles = shadow ? stats.shadowTriangles : stats.triangles;
-        const auto draw = [&](uint32_t first, uint32_t count, uint32_t id) {
+        const bool sharedState =
+            shadow || (!clusterColors && !renderSettings_.groupColors && !renderSettings_.levelColors && !filtered);
+        const bool gpuCommands = sceneGpu_.lodCommands && !computeGeometry;
+        const auto indirect = [&](size_t slot, uint32_t count) {
+            const auto offset = sceneGpu_.lodRecordOffset + slot * SceneGpuData::lodRecordStride + sizeof(uint32_t);
+            vkCmdDrawIndexedIndirect(commandBuffer_, sceneGpu_.lodCommands, offset, count,
+                                     SceneGpuData::lodRecordStride);
+        };
+        if (gpuCommands && sharedState) {
+            // The selector writes adjacent commands. Color/debug filtering below needs per-cluster state.
+            for (size_t first = 0; first < ranges.size();) {
+                const auto count = static_cast<uint32_t>(std::min<size_t>(ranges.size() - first, indirectDrawLimit_));
+                indirect(first, count);
+                first += count;
+                ++calls;
+            }
+            triangles += selection_.triangleCount();
+            return;
+        }
+        const auto draw = [&](uint32_t first, uint32_t count, uint32_t id, size_t slot) {
             if (!shadow) {
                 const auto global = sceneGpu_.firstCluster + id;
-                push.baseColor = renderSettings_.groupColors ? clusterColor(clusterGroups_[global]) :
+                push.baseColor = renderSettings_.levelColors ? lodLevelColor(clusterLevels_[global]) :
+                                 renderSettings_.groupColors ? clusterColor(clusterGroups_[global]) :
                                  clusterColors ? clusterColor(global) : kShadedColor;
                 vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                    64, sizeof(glm::vec4), &push.baseColor);
             }
-            vkCmdDrawIndexed(commandBuffer_, count, 1, first, 0, 0); ++calls; triangles += count / 3;
+            if (gpuCommands)
+                indirect(slot, 1);
+            else
+                vkCmdDrawIndexed(commandBuffer_, count, 1, first, 0, 0);
+            ++calls;
+            triangles += count / 3;
         };
-        if (contiguous && (shadow || (!clusterColors && !renderSettings_.groupColors && !filtered))) draw(0, geometry.indexCount, 0);
-        else for (const auto& range : ranges)
-            if (shadow || visible[range.sourceClusterId]) draw(range.firstIndex, range.indexCount, range.sourceClusterId);
+        if (contiguous && sharedState)
+            draw(0, geometry.indexCount, 0, 0);
+        else for (size_t slot = 0; slot < ranges.size(); ++slot) {
+            const auto& range = ranges[slot];
+            if (shadow || visible[range.sourceClusterId]) draw(range.firstIndex, range.indexCount, range.sourceClusterId, slot);
+        }
     };
     const auto drawActiveMesh = [&](bool shadow) {
         if (computeGeometry) drawMesh(compute_->output(), compute_->output().ranges, true, shadow);
@@ -1456,6 +1545,13 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
             }
         }
     }
+    vkCmdNextSubpass(commandBuffer_, VK_SUBPASS_CONTENTS_INLINE);
+    if (stats.display == RenderDisplay::Depth) {
+        setViewport(extent_.width, extent_.height);
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &cameraDepthSet_, 0, nullptr);
+        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, cameraDebugPipeline_);
+        vkCmdDraw(commandBuffer_, 3, 1, 0, 0);
+    }
     if (ui) ImGui_ImplVulkan_RenderDrawData(ui, commandBuffer_);
     vkCmdEndRenderPass(commandBuffer_);
     if (measure && renderQueries_) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, renderQueries_, 2);
@@ -1500,6 +1596,12 @@ bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bo
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &renderFinished;
     check(vkQueueSubmit(graphicsQueue_, 1, &submit, frameFence_), "vkQueueSubmit");
+    ++frameSerial_;
+    cameraDepth_ = {};
+    if (renderSettings_.display != RenderDisplay::ShadowMap) {
+        cameraDepth_ = {depthView_, shadowSampler_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, extent_,
+            camera.viewProjection(float(extent_.width) / extent_.height), frameSerial_, sceneGpu_.sceneRevision, !wireframe};
+    }
     renderMeasurementPending_ = measure && renderQueries_;
 
     VkPresentInfoKHR present{};

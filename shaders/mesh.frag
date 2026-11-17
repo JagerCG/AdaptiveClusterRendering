@@ -31,6 +31,5 @@ void main()
         }
     }
     vec3 shaded = params.baseColor.rgb * (.2 + .8 * diffuse * visibility);
-    if (params.displayMode == 1u) shaded = vec3(1 - gl_FragCoord.z);
     color = vec4(shaded, 1);
 }
