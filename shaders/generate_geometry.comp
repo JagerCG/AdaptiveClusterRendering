@@ -1,0 +1,130 @@
+#version 450
+
+layout(local_size_x = 64) in;
+// Raw words preserve the CPU's packed 32-byte vertex layout (pos 0, normal 12,
+// UV 24), without assuming std430 vec3 alignment matches a C++ struct.
+layout(std430, set = 0, binding = 0) readonly buffer SourceVertices { uint vertexWords[]; } sourceVertices;
+layout(std430, set = 0, binding = 1) readonly buffer SourceIndices { uint indexWords[]; } sourceIndices;
+layout(std430, set = 0, binding = 2) readonly buffer TriangleWork { uint firstIndices[]; } work;
+layout(std430, set = 0, binding = 3) writeonly buffer OutputVertices { uint vertexWords[]; } outputVertices;
+layout(std430, set = 0, binding = 4) writeonly buffer OutputIndices { uint indices[]; } outputIndices;
+layout(set = 0, binding = 5) uniform sampler2D heightMap;
+
+layout(push_constant) uniform GenerationParameters {
+    uint vertexWordOffset;
+    uint indexWordOffset;
+    uint sourceTriangleCount;
+    uint edgeSegments;
+    float amplitude;
+    float maxDisplacement;
+} params;
+
+uint sourceWord(uint index, uint word)
+{
+    return sourceVertices.vertexWords[params.vertexWordOffset + index * 8 + word];
+}
+
+struct Vertex { vec3 position; vec3 normal; vec2 uv; };
+
+Vertex interpolateVertex(uvec3 source, uvec2 lattice)
+{
+    uint n = params.edgeSegments;
+    uvec3 weights = uvec3(n - lattice.x - lattice.y, lattice.x, lattice.y);
+    float values[8];
+    for (uint word = 0; word < 8; ++word) {
+        uint value;
+        // Source corners, including all of n=1, are copied bit for bit.
+        if (weights.x == n) value = sourceWord(source.x, word);
+        else if (weights.y == n) value = sourceWord(source.y, word);
+        else if (weights.z == n) value = sourceWord(source.z, word);
+        else if (any(equal(weights, uvec3(0)))) {
+            uvec2 edge = weights.x == 0 ? source.yz : (weights.y == 0 ? source.xz : source.xy);
+            uvec2 w = weights.x == 0 ? weights.yz : (weights.y == 0 ? weights.xz : weights.xy);
+            // Opposite traversal of a shared indexed edge uses the same operand
+            // order. 'precise' prevents FMA/reassociation differences at seams.
+            if (edge.x > edge.y) { edge = edge.yx; w = w.yx; }
+            precise float result = uintBitsToFloat(sourceWord(edge.x, word)) * (float(w.x) / float(n)) +
+                                   uintBitsToFloat(sourceWord(edge.y, word)) * (float(w.y) / float(n));
+            value = floatBitsToUint(result);
+        } else {
+            precise float result = uintBitsToFloat(sourceWord(source.x, word)) * (float(weights.x) / float(n)) +
+                                   uintBitsToFloat(sourceWord(source.y, word)) * (float(weights.y) / float(n)) +
+                                   uintBitsToFloat(sourceWord(source.z, word)) * (float(weights.z) / float(n));
+            value = floatBitsToUint(result);
+        }
+        values[word] = uintBitsToFloat(value);
+    }
+    return Vertex(vec3(values[0], values[1], values[2]), vec3(values[3], values[4], values[5]), vec2(values[6], values[7]));
+}
+
+vec3 unitOrZero(vec3 value)
+{
+    float scale = max(max(abs(value.x), abs(value.y)), abs(value.z));
+    if (scale <= 1e-20) return vec3(0);
+    return normalize(value / scale);
+}
+
+float heightAt(vec2 uv)
+{
+    // Manual bilinear interpolation: the endpoints map to texel centers.
+    // texelFetch avoids relying on optional R32_SFLOAT linear-filter support.
+    ivec2 last = textureSize(heightMap, 0) - 1;
+    precise vec2 p = clamp(uv, vec2(0), vec2(1)) * vec2(last);
+    ivec2 lo = ivec2(floor(p)), hi = min(lo + 1, last);
+    vec2 t = p - vec2(lo);
+    precise float a = texelFetch(heightMap, lo, 0).r * (1-t.x) + texelFetch(heightMap, ivec2(hi.x,lo.y), 0).r * t.x;
+    precise float b = texelFetch(heightMap, ivec2(lo.x,hi.y), 0).r * (1-t.x) + texelFetch(heightMap, hi, 0).r * t.x;
+    precise float result = a * (1-t.y) + b * t.y;
+    return clamp(result, 0, 1);
+}
+
+void emitVertex(uint outputIndex, Vertex vertex)
+{
+    float values[8] = float[](vertex.position.x, vertex.position.y, vertex.position.z,
+                            vertex.normal.x, vertex.normal.y, vertex.normal.z, vertex.uv.x, vertex.uv.y);
+    for (uint word = 0; word < 8; ++word) outputVertices.vertexWords[outputIndex * 8 + word] = floatBitsToUint(values[word]);
+    outputIndices.indices[outputIndex] = outputIndex;
+}
+
+void main()
+{
+    uint n = params.edgeSegments;
+    uint outputTriangle = gl_GlobalInvocationID.x;
+    if (outputTriangle >= params.sourceTriangleCount * n * n) return;
+    uint sourceFirst = work.firstIndices[outputTriangle / (n * n)];
+    uvec3 source;
+    for (uint k = 0; k < 3; ++k) source[k] = sourceIndices.indexWords[params.indexWordOffset + sourceFirst + k];
+    // Row j contains 2*(n-j)-1 triangles. Decode the local triangle without a
+    // CPU-authored subdivision list; both orientations keep the source winding.
+    uint local = outputTriangle % (n * n), row = 0;
+    while (local >= 2 * (n - row) - 1) { local -= 2 * (n - row) - 1; ++row; }
+    uint column = local / 2;
+    uint first = outputTriangle * 3;
+    Vertex vertices[3];
+    if ((local & 1) == 0) {
+        vertices[0] = interpolateVertex(source, uvec2(column, row));
+        vertices[1] = interpolateVertex(source, uvec2(column + 1, row));
+        vertices[2] = interpolateVertex(source, uvec2(column, row + 1));
+    } else {
+        vertices[0] = interpolateVertex(source, uvec2(column + 1, row));
+        vertices[1] = interpolateVertex(source, uvec2(column + 1, row + 1));
+        vertices[2] = interpolateVertex(source, uvec2(column, row + 1));
+    }
+    // This exact bypass preserves Step 5 positions AND shading for off/zero/neutral.
+    if (params.maxDisplacement > 0) {
+        for (uint k = 0; k < 3; ++k) {
+            precise vec3 p = vertices[k].position + unitOrZero(vertices[k].normal) *
+                            (params.amplitude * (2 * heightAt(vertices[k].uv) - 1));
+            vertices[k].position = p;
+        }
+        // Independent output vertices allow a geometric (flat) normal per face.
+        // Shared positions/UVs remain identical; shading normals need not match.
+        vec3 face = unitOrZero(cross(unitOrZero(vertices[1].position - vertices[0].position),
+                                    unitOrZero(vertices[2].position - vertices[0].position)));
+        for (uint k = 0; k < 3; ++k) {
+            vec3 normal = dot(face, face) > 0 ? face : unitOrZero(vertices[k].normal);
+            vertices[k].normal = dot(normal, normal) > 0 ? normal : vec3(0,0,1);
+        }
+    }
+    for (uint k = 0; k < 3; ++k) emitVertex(first + k, vertices[k]);
+}

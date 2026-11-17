@@ -4,6 +4,7 @@
 #include "MeshSource.h"
 #include "OrbitCamera.h"
 #include "SceneData.h"
+#include "GeometryValidation.h"
 
 #include <GLFW/glfw3.h>
 #include <glm/common.hpp>
@@ -11,6 +12,8 @@
 #include <imgui_impl_vulkan.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -90,9 +93,11 @@ VulkanRenderer::~VulkanRenderer()
 {
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
+        compute_.reset(); // owns device resources; destroy before vkDestroyDevice
         shutdownUi();
         destroySwapchain();
         vkDestroyPipeline(device_, pipeline_, nullptr);
+        vkDestroyPipeline(device_, wireframePipeline_, nullptr);
         vkDestroyPipeline(device_, boundsPipeline_, nullptr);
         vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
         vkDestroyDescriptorPool(device_, scenePool_, nullptr);
@@ -101,6 +106,8 @@ VulkanRenderer::~VulkanRenderer()
         vkDestroyFence(device_, frameFence_, nullptr);
         vkDestroySemaphore(device_, imageAvailable_, nullptr);
         vkDestroyCommandPool(device_, commandPool_, nullptr);
+        vkDestroyQueryPool(device_, uploadQueries_, nullptr);
+        vkDestroyQueryPool(device_, renderQueries_, nullptr);
         destroyBuffer(meshBuffer_);
         destroyBuffer(clusterBuffer_);
         vkDestroyDevice(device_, nullptr);
@@ -125,6 +132,9 @@ void VulkanRenderer::initialize(GLFWwindow* window)
     createDevice();
     selectDepthFormat();
     createFrameResources();
+    compute_ = std::make_unique<ComputeGeometry>();
+    compute_->initialize(gpu_, device_, graphicsFamily_);
+    setHeightField(makeHeightField(HeightPreset::Waves));
 }
 
 bool VulkanRenderer::prepareFrame(GLFWwindow* window)
@@ -194,6 +204,7 @@ void VulkanRenderer::createInstance()
         info.pNext = &debugInfo;
     }
     check(vkCreateInstance(&info, nullptr, &instance_), "vkCreateInstance");
+    validationEnabled_ = enableValidation;
 
     if (enableValidation) {
         auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
@@ -220,6 +231,13 @@ void VulkanRenderer::createDevice()
         if (properties.apiVersion < kVulkanVersion) {
             continue;
         }
+        if (properties.limits.maxComputeWorkGroupInvocations < kGeometryGroupSize ||
+            properties.limits.maxComputeWorkGroupSize[0] < kGeometryGroupSize ||
+            properties.limits.maxPerStageDescriptorStorageBuffers < 5 ||
+            properties.limits.maxDescriptorSetStorageBuffers < 5 || properties.limits.maxPushConstantsSize < 84 ||
+            properties.limits.maxPerStageDescriptorSamplers < 1 || properties.limits.maxPerStageDescriptorSampledImages < 1) {
+            continue;
+        }
 
         uint32_t extensionCount = 0;
         check(vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, nullptr),
@@ -244,7 +262,8 @@ void VulkanRenderer::createDevice()
             VkBool32 canPresent = VK_FALSE;
             check(vkGetPhysicalDeviceSurfaceSupportKHR(candidate, i, surface_, &canPresent),
                   "vkGetPhysicalDeviceSurfaceSupportKHR");
-            const bool canDraw = (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+            const auto required = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+            const bool canDraw = (families[i].queueFlags & required) == required;
             if (canDraw && canPresent) {
                 graphics = i;
                 present = i;
@@ -278,10 +297,12 @@ void VulkanRenderer::createDevice()
             graphicsFamily_ = graphics;
             presentFamily_ = present;
             selectedProperties = properties;
+            timestampValidBits_ = families[graphics].timestampValidBits;
+            timestampPeriod_ = properties.limits.timestampPeriod;
         }
     }
     if (gpu_ == VK_NULL_HANDLE) {
-        throw std::runtime_error("No Vulkan 1.2 device can draw to this window.");
+        throw std::runtime_error("No Vulkan 1.2 device supports this window and the geometry compute pipeline.");
     }
 
     const float priority = 1.0f;
@@ -300,14 +321,28 @@ void VulkanRenderer::createDevice()
     info.pQueueCreateInfos = queues;
     info.enabledExtensionCount = 1;
     info.ppEnabledExtensionNames = &swapchainExtension;
+    VkPhysicalDeviceFeatures available{}, enabled{};
+    vkGetPhysicalDeviceFeatures(gpu_, &available);
+    enabled.fillModeNonSolid = available.fillModeNonSolid;
+    wireframeSupported_ = available.fillModeNonSolid == VK_TRUE;
+    info.pEnabledFeatures = &enabled;
     check(vkCreateDevice(gpu_, &info, nullptr, &device_), "vkCreateDevice");
     vkGetDeviceQueue(device_, graphicsFamily_, 0, &graphicsQueue_);
     vkGetDeviceQueue(device_, presentFamily_, 0, &presentQueue_);
     std::cout << "Rendering on " << selectedProperties.deviceName << std::endl;
+    deviceProperties_ = selectedProperties;
 }
 
 void VulkanRenderer::createFrameResources()
 {
+    if (timestampValidBits_ > 0 && timestampPeriod_ > 0.0f) {
+        VkQueryPoolCreateInfo queries{};
+        queries.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        queries.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queries.queryCount = 2;
+        check(vkCreateQueryPool(device_, &queries, nullptr, &uploadQueries_), "vkCreateQueryPool");
+        check(vkCreateQueryPool(device_, &queries, nullptr, &renderQueries_), "vkCreateQueryPool(render)");
+    }
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -356,10 +391,9 @@ void VulkanRenderer::createFrameResources()
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &sceneLayout_;
     const VkPushConstantRange ranges[] = {
-        {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4)},
-        {VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(glm::mat4), sizeof(glm::vec4)}
+        {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 84}
     };
-    layoutInfo.pushConstantRangeCount = 2;
+    layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = ranges;
     check(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &pipelineLayout_), "vkCreatePipelineLayout");
 }
@@ -399,6 +433,7 @@ void VulkanRenderer::createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsa
     VkMemoryRequirements requirements{};
     vkGetBufferMemoryRequirements(device_, buffer.handle, &requirements);
     buffer.memory = allocateMemory(requirements, properties);
+    buffer.allocationBytes = requirements.size;
     check(vkBindBufferMemory(device_, buffer.handle, buffer.memory, 0), "vkBindBufferMemory");
 }
 
@@ -410,7 +445,17 @@ void VulkanRenderer::destroyBuffer(const Buffer& buffer)
 
 void VulkanRenderer::uploadScene(const SceneData& scene)
 {
+    const auto cpuStart = std::chrono::steady_clock::now();
+    SceneUploadStats nextStats;
     validateScene(scene);
+    if (sceneGpu_.sceneRevision == std::numeric_limits<SceneRevision>::max()) {
+        throw std::runtime_error("Source scene revision exhausted.");
+    }
+    const SceneRevision nextRevision = sceneGpu_.sceneRevision + 1;
+    auto nextSelection = resolveClusterSelection(scene.dataset.clusters,
+        static_cast<uint32_t>(scene.dataset.indices.size()), nextRevision,
+        {nextRevision, ClusterSelectionMode::All, {}});
+    nextStats.payload = scenePayloadBytes(scene);
     const auto& mesh = scene.mesh;
     const auto& indices = scene.dataset.indices;
     const auto clusters = packClusters(scene.dataset);
@@ -450,10 +495,17 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(commandBuffer_, &begin), "vkBeginCommandBuffer");
+        if (uploadQueries_ != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(commandBuffer_, uploadQueries_, 0, 2);
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, uploadQueries_, 0);
+        }
         const VkBufferCopy copy{0, 0, meshBytes};
         vkCmdCopyBuffer(commandBuffer_, staging.handle, replacement.handle, 1, &copy);
         const VkBufferCopy clusterCopy{meshBytes, 0, clusterBytes};
         vkCmdCopyBuffer(commandBuffer_, staging.handle, replacementClusters.handle, 1, &clusterCopy);
+        if (uploadQueries_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, uploadQueries_, 1);
+        }
 
         VkBufferMemoryBarrier barriers[2]{};
         for (auto& barrier : barriers) {
@@ -464,11 +516,11 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
             barrier.size = VK_WHOLE_SIZE;
         }
         barriers[0].buffer = replacement.handle;
-        barriers[0].dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
         barriers[1].buffer = replacementClusters.handle;
         barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 2, barriers, 0, nullptr);
         check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
 
@@ -478,6 +530,17 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
         submit.pCommandBuffers = &commandBuffer_;
         check(vkQueueSubmit(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
         check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle");
+        if (uploadQueries_ != VK_NULL_HANDLE) {
+            uint64_t timestamps[2]{};
+            check(vkGetQueryPoolResults(device_, uploadQueries_, 0, 2, sizeof(timestamps), timestamps,
+                                       sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+                  "vkGetQueryPoolResults");
+            // Unsigned subtraction also handles a single wrap at the queue's valid width.
+            const uint64_t mask = timestampValidBits_ == 64 ? ~uint64_t{0} :
+                                  (uint64_t{1} << timestampValidBits_) - 1;
+            nextStats.gpuTransferMs = double((timestamps[1] - timestamps[0]) & mask) *
+                                      double(timestampPeriod_) / 1'000'000.0;
+        }
     } catch (...) {
         destroyBuffer(staging);
         destroyBuffer(replacement);
@@ -505,10 +568,167 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     write.pBufferInfo = &clusterInfo;
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    nextStats.residentAllocationBytes = meshBuffer_.allocationBytes + clusterBuffer_.allocationBytes;
+    nextStats.cpuUploadMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - cpuStart).count();
+    uploadStats_ = nextStats;
+    sceneGpu_.sceneRevision = nextRevision;
+    selection_ = std::move(nextSelection);
+    compute_->invalidate();
+}
+
+void VulkanRenderer::setClusterSelection(const ClusterSelection& selection)
+{
+    // Resolve first so a rejected request preserves the active selection.
+    auto next = resolveClusterSelection(drawClusters_, sceneGpu_.indexCount, sceneGpu_.sceneRevision, selection);
+    if (!sameClusterSelection(selection_, next)) compute_->invalidate();
+    selection_ = std::move(next);
+}
+
+bool VulkanRenderer::ensureGeneratedGeometry(bool force)
+{
+    if (!force && compute_->matches(sceneGpu_, selection_, edgeSegments_, displacement_)) return false;
+    check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
+    compute_->prepare(sceneGpu_, selection_, edgeSegments_, displacement_);
+    check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(commandBuffer_, &begin), "vkBeginCommandBuffer");
+    compute_->record(commandBuffer_);
+    check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &commandBuffer_;
+    check(vkQueueSubmit(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit (compute)");
+    check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle (compute)");
+    compute_->finish();
+    return true;
+}
+
+void VulkanRenderer::setEdgeSegments(uint32_t segments)
+{
+    if (!validEdgeSegments(segments)) throw std::runtime_error("Edge segments must be 1, 2, 4 or 8.");
+    if (segments != edgeSegments_) compute_->invalidate();
+    edgeSegments_ = segments;
+}
+
+void VulkanRenderer::setDisplacement(const DisplacementSettings& settings)
+{
+    validateDisplacement(settings);
+    if (!sameDisplacement(displacement_, settings)) compute_->invalidate();
+    displacement_ = settings;
+}
+
+void VulkanRenderer::setHeightField(const HeightField& field)
+{
+    validateHeightField(field);
+    check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences (height)");
+    compute_->uploadHeight(field, commandBuffer_, graphicsQueue_);
+}
+
+void VulkanRenderer::verifyGeneratedGeometry(const SceneData& scene)
+{
+    const auto& output = compute_->output();
+    const uint64_t multiplier = uint64_t(edgeSegments_) * edgeSegments_;
+    if (!compute_->matches(sceneGpu_, selection_, edgeSegments_, displacement_) || output.sourceRevision != sceneGpu_.sceneRevision ||
+        output.edgeSegments != edgeSegments_ || output.sourceTriangleCount != selection_.triangleCount() ||
+        output.vertexCount != selection_.indexCount * multiplier || output.indexCount != selection_.indexCount * multiplier ||
+        output.vertexBytes != uint64_t(output.vertexCount) * sizeof(Vertex) ||
+        output.indexBytes != uint64_t(output.indexCount) * sizeof(uint32_t) ||
+        output.vertexStride != sizeof(Vertex) || output.indexStride != sizeof(uint32_t) ||
+        output.allocatedOutputBytes < output.vertexBytes + output.indexBytes ||
+        output.allocatedOutputBytes > kDefaultGeometryOutputBudget ||
+        output.worklistBytes != selection_.triangleCount() * sizeof(uint32_t) ||
+        output.allocatedWorklistBytes < output.worklistBytes ||
+        !std::isfinite(output.cpuGenerateMs) || output.cpuGenerateMs < 0 ||
+        output.maxDisplacement != displacementBound(compute_->heightField(), displacement_) ||
+        (output.gpuGenerateMs && (!std::isfinite(*output.gpuGenerateMs) || *output.gpuGenerateMs < 0)) ||
+        output.gpuGenerateMs.has_value() != (timestampValidBits_ > 0 && timestampPeriod_ > 0 && output.indexCount > 0) ||
+        output.ranges.size() != selection_.ranges.size()) {
+        throw std::runtime_error("Generated output metadata / timing does not match the selected source.");
+    }
+    uint32_t expectedFirst = 0;
+    for (size_t i = 0; i < selection_.ranges.size(); ++i) {
+        const auto& input = selection_.ranges[i];
+        const auto& range = output.ranges[i];
+        if (range.sourceClusterId != input.sourceClusterId || range.firstIndex != expectedFirst ||
+            range.indexCount != input.indexCount * multiplier) throw std::runtime_error("Generated draw range lost its source ID / order.");
+        expectedFirst += range.indexCount;
+    }
+    if (!output.indexCount) {
+        if (output.vertexBuffer || output.indexBuffer || output.allocatedOutputBytes || output.workgroups ||
+            output.allocatedWorklistBytes) throw std::runtime_error("Empty compute output still owns drawable buffers.");
+        std::cout << "GPU geometry readback passed: empty selection, zero output / dispatch (n=" << edgeSegments_ << ")." << std::endl;
+        return;
+    }
+    if (!output.vertexBuffer || !output.indexBuffer || output.vertexBuffer == sceneGpu_.vertexBuffer ||
+        output.indexBuffer == sceneGpu_.indexBuffer || output.vertexBuffer == output.indexBuffer) {
+        throw std::runtime_error("Compute output is not independent of the source buffers.");
+    }
+    check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
+    Buffer readback;
+    const VkDeviceSize total = output.vertexBytes + output.indexBytes;
+    try {
+        createBuffer(readback, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(commandBuffer_, &begin), "vkBeginCommandBuffer");
+        // ComputeGeometry already made output writes visible to transfer reads.
+        const VkBufferCopy vertexCopy{output.vertexOffset, 0, output.vertexBytes};
+        const VkBufferCopy indexCopy{output.indexOffset, output.vertexBytes, output.indexBytes};
+        vkCmdCopyBuffer(commandBuffer_, output.vertexBuffer, readback.handle, 1, &vertexCopy);
+        vkCmdCopyBuffer(commandBuffer_, output.indexBuffer, readback.handle, 1, &indexCopy);
+        VkMemoryBarrier after{};
+        after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &after, 0, nullptr, 0, nullptr);
+        check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commandBuffer_;
+        check(vkQueueSubmit(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit (compute readback)");
+        check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle (compute readback)");
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, readback.memory, 0, total, 0, &mapped), "vkMapMemory (compute readback)");
+        const auto* bytes = static_cast<const char*>(mapped);
+        const auto* indices = reinterpret_cast<const uint32_t*>(bytes + output.vertexBytes);
+        std::vector<Vertex> vertices(output.vertexCount);
+        std::vector<uint32_t> outputIndices(output.indexCount);
+        std::memcpy(vertices.data(), bytes, static_cast<size_t>(output.vertexBytes));
+        std::memcpy(outputIndices.data(), indices, static_cast<size_t>(output.indexBytes));
+        vkUnmapMemory(device_, readback.memory);
+        const auto stats = validateGeneratedGeometry(scene, selection_, edgeSegments_, vertices, outputIndices,
+                                                     &compute_->heightField(), displacement_);
+        std::cout << "GPU geometry readback passed: n=" << edgeSegments_ << ", " << output.vertexCount << " vertices, "
+                  << stats.triangles << " triangles, " << stats.sharedEdgeChecks << " exact shared-edge checks, max attribute error "
+                  << stats.maxAttributeError << ", max normal error " << stats.maxNormalError
+                  << ", displacement bound " << output.maxDisplacement << "; reference / bounds / indices verified." << std::endl;
+    } catch (...) {
+        destroyBuffer(readback);
+        throw;
+    }
+    destroyBuffer(readback);
 }
 
 void VulkanRenderer::verifyUpload(const SceneData& scene)
 {
+    const auto expected = scenePayloadBytes(scene);
+    if (uploadStats_.payload.vertices != expected.vertices || uploadStats_.payload.indices != expected.indices ||
+        uploadStats_.payload.clusters != expected.clusters || uploadStats_.residentAllocationBytes < expected.total() ||
+        !std::isfinite(uploadStats_.cpuUploadMs) || uploadStats_.cpuUploadMs < 0.0 ||
+        (uploadStats_.gpuTransferMs &&
+         (!std::isfinite(*uploadStats_.gpuTransferMs) || *uploadStats_.gpuTransferMs < 0.0)) ||
+        uploadStats_.gpuTransferMs.has_value() != (uploadQueries_ != VK_NULL_HANDLE)) {
+        throw std::runtime_error("Upload diagnostics do not match the resident scene / timestamp support.");
+    }
     const auto clusters = packClusters(scene.dataset);
     const size_t vertexBytes = scene.mesh.vertices.size() * sizeof(Vertex);
     const size_t indexBytes = scene.dataset.indices.size() * sizeof(uint32_t);
@@ -684,6 +904,8 @@ void VulkanRenderer::recreateSwapchain(int width, int height)
         shutdownUi();
         vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = VK_NULL_HANDLE;
+        vkDestroyPipeline(device_, wireframePipeline_, nullptr);
+        wireframePipeline_ = VK_NULL_HANDLE;
         vkDestroyPipeline(device_, boundsPipeline_, nullptr);
         boundsPipeline_ = VK_NULL_HANDLE;
         vkDestroyRenderPass(device_, renderPass_, nullptr);
@@ -870,10 +1092,17 @@ void VulkanRenderer::createPipeline()
     info.layout = pipelineLayout_;
     info.renderPass = renderPass_;
     const VkResult result = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_);
+    VkResult wireResult = VK_SUCCESS;
+    if (result == VK_SUCCESS && wireframeSupported_) {
+        rasterization.polygonMode = VK_POLYGON_MODE_LINE;
+        wireResult = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &wireframePipeline_);
+        rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    }
 
     vkDestroyShaderModule(device_, fragment, nullptr);
     vkDestroyShaderModule(device_, vertex, nullptr);
     check(result, "vkCreateGraphicsPipelines");
+    check(wireResult, "vkCreateGraphicsPipelines (wireframe)");
 
     vertex = createShaderModule(device_, kBoundsVertexShader, sizeof(kBoundsVertexShader));
     fragment = VK_NULL_HANDLE;
@@ -959,14 +1188,28 @@ void VulkanRenderer::shutdownUi()
 }
 
 void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
-                                bool clusterColors, bool showBounds, int boundsCluster, ImDrawData* ui)
+                                bool clusterColors, bool showBounds, int boundsCluster, bool computeGeometry, bool wireframe, ImDrawData* ui, bool measure)
 {
+    if (selection_.sceneRevision != sceneGpu_.sceneRevision) {
+        throw std::runtime_error("Cannot draw a stale cluster selection.");
+    }
+    SourceDrawStats drawStats;
+    drawStats.usesGeneratedGeometry = computeGeometry;
+    drawStats.wireframe = wireframe;
+    if (wireframe && !wireframeSupported_) throw std::runtime_error("Wireframe is not supported by this GPU.");
+    if (computeGeometry && !compute_->matches(sceneGpu_, selection_, edgeSegments_, displacement_)) {
+        throw std::runtime_error("Cannot draw stale or missing compute geometry.");
+    }
     check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(commandBuffer_, &begin), "vkBeginCommandBuffer");
 
+    if (measure && renderQueries_) {
+        vkCmdResetQueryPool(commandBuffer_, renderQueries_, 0, 2);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, renderQueries_, 0);
+    }
     VkClearValue clearValues[2]{};
     clearValues[0].color = {{0.025f, 0.034f, 0.05f, 1.0f}};
     clearValues[1].depthStencil = {1.0f, 0};
@@ -984,46 +1227,77 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
     const VkRect2D scissor{{0, 0}, extent_};
     vkCmdSetViewport(commandBuffer_, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer_, 0, 1, &scissor);
-    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframe ? wireframePipeline_ : pipeline_);
 
     const float aspectRatio = viewport.width / viewport.height;
     const glm::mat4 viewProjection = camera.viewProjection(aspectRatio);
-    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(viewProjection), &viewProjection);
 
-    vkCmdBindVertexBuffers(commandBuffer_, 0, 1, &sceneGpu_.vertexBuffer, &sceneGpu_.vertexOffset);
-    vkCmdBindIndexBuffer(commandBuffer_, sceneGpu_.indexBuffer, sceneGpu_.indexOffset, VK_INDEX_TYPE_UINT32);
-    if (clusterColors) {
-        for (uint32_t id = 0; id < drawClusters_.size(); ++id) {
-            const Cluster& cluster = drawClusters_[id];
-            const glm::vec4 color = clusterColor(id);
-            vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-                               sizeof(glm::mat4), sizeof(color), &color);
-            vkCmdDrawIndexed(commandBuffer_, cluster.indexCount, 1, cluster.firstIndex, 0, 0);
+    const auto drawMesh = [&](const auto& geometry, const auto& ranges, bool contiguous) {
+        if (ranges.empty()) return; // generated empty output has null buffer handles
+        vkCmdBindVertexBuffers(commandBuffer_, 0, 1, &geometry.vertexBuffer, &geometry.vertexOffset);
+        vkCmdBindIndexBuffer(commandBuffer_, geometry.indexBuffer, geometry.indexOffset, VK_INDEX_TYPE_UINT32);
+        if (clusterColors) {
+            for (const auto& range : ranges) {
+                const glm::vec4 color = clusterColor(range.sourceClusterId);
+                vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   sizeof(glm::mat4), sizeof(color), &color);
+                vkCmdDrawIndexed(commandBuffer_, range.indexCount, 1, range.firstIndex, 0, 0);
+                ++drawStats.meshDrawCalls;
+                drawStats.triangles += range.indexCount / 3;
+            }
+        } else {
+            vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               sizeof(glm::mat4), sizeof(kShadedColor), &kShadedColor);
+            if (contiguous) {
+                vkCmdDrawIndexed(commandBuffer_, geometry.indexCount, 1, 0, 0, 0);
+                drawStats.meshDrawCalls = 1;
+                drawStats.triangles = geometry.indexCount / 3;
+            } else {
+                for (const auto& range : ranges) {
+                    vkCmdDrawIndexed(commandBuffer_, range.indexCount, 1, range.firstIndex, 0, 0);
+                    ++drawStats.meshDrawCalls;
+                    drawStats.triangles += range.indexCount / 3;
+                }
+            }
         }
-    } else {
-        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-                           sizeof(glm::mat4), sizeof(kShadedColor), &kShadedColor);
-        vkCmdDrawIndexed(commandBuffer_, sceneGpu_.indexCount, 1, 0, 0, 0);
-    }
+    };
+    if (computeGeometry) drawMesh(compute_->output(), compute_->output().ranges, true);
+    else drawMesh(sceneGpu_, selection_.ranges, selection_.allClusters);
+    // The source SSBO stays immutable. Expand the displayed AABB conservatively.
+    drawStats.boundsPadding = computeGeometry ? compute_->output().maxDisplacement : 0;
     if (showBounds) {
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           80, sizeof(float), &drawStats.boundsPadding);
         vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundsPipeline_);
         vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
                                 0, 1, &sceneGpu_.clusterSet, 0, nullptr);
-        const bool selected = boundsCluster >= 0 && static_cast<uint32_t>(boundsCluster) < sceneGpu_.clusterCount;
-        vkCmdDraw(commandBuffer_, 24, selected ? 1u : sceneGpu_.clusterCount, 0,
-                  selected ? static_cast<uint32_t>(boundsCluster) : 0u);
+        if (selection_.allClusters && boundsCluster < 0) {
+            vkCmdDraw(commandBuffer_, 24, sceneGpu_.clusterCount, 0, 0);
+            drawStats.boundsInstances = sceneGpu_.clusterCount;
+        } else {
+            for (const auto& range : selection_.ranges) {
+                if (boundsCluster >= 0 && range.sourceClusterId != static_cast<uint32_t>(boundsCluster)) continue;
+                vkCmdDraw(commandBuffer_, 24, 1, 0, range.sourceClusterId);
+                ++drawStats.boundsInstances;
+            }
+        }
     }
 
-    ImGui_ImplVulkan_RenderDrawData(ui, commandBuffer_);
+    if (ui) ImGui_ImplVulkan_RenderDrawData(ui, commandBuffer_);
     vkCmdEndRenderPass(commandBuffer_);
+    if (measure && renderQueries_)
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, renderQueries_, 1);
     check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
+    lastDraw_ = drawStats;
 }
 
 bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bool showBounds,
-                               int boundsCluster, ImDrawData* ui)
+                               int boundsCluster, bool computeGeometry, bool wireframe, ImDrawData* ui, bool measure)
 {
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
+    if (renderMeasurementPending_) throw std::runtime_error("Consume the previous render measurement before submitting another frame.");
 
     uint32_t imageIndex = 0;
     const VkResult acquire = vkAcquireNextImageKHR(
@@ -1039,11 +1313,13 @@ bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bo
         check(acquire, "vkAcquireNextImageKHR");
     }
 
-    recordDraw(imageIndex, camera, clusterColors, showBounds, boundsCluster, ui);
+    recordDraw(imageIndex, camera, clusterColors, showBounds, boundsCluster, computeGeometry, wireframe, ui, measure);
     // Reset only when a submission will signal the fence again.
     check(vkResetFences(device_, 1, &frameFence_), "vkResetFences");
     const VkSemaphore renderFinished = swapchainImages_[imageIndex].renderFinished;
-    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // A measured interval starts only after the swapchain image is available.
+    // Ordinary frames retain the original overlap; measurement serializes at TOP.
+    const VkPipelineStageFlags waitStage = measure ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.waitSemaphoreCount = 1;
@@ -1054,6 +1330,7 @@ bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bo
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &renderFinished;
     check(vkQueueSubmit(graphicsQueue_, 1, &submit, frameFence_), "vkQueueSubmit");
+    renderMeasurementPending_ = measure && renderQueries_;
 
     VkPresentInfoKHR present{};
     present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1070,4 +1347,17 @@ bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bo
     check(result, "vkQueuePresentKHR");
     rebuildSwapchain_ = acquire == VK_SUBOPTIMAL_KHR;
     return true;
+}
+
+std::optional<double> VulkanRenderer::finishRenderMeasurement()
+{
+    if (!renderQueries_) return std::nullopt;
+    if (!renderMeasurementPending_) throw std::runtime_error("No submitted render measurement to read.");
+    check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences(render measurement)");
+    uint64_t timestamps[2]{};
+    check(vkGetQueryPoolResults(device_, renderQueries_, 0, 2, sizeof(timestamps), timestamps,
+                               sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults(render)");
+    const uint64_t mask = timestampValidBits_ == 64 ? ~uint64_t{0} : (uint64_t{1} << timestampValidBits_) - 1;
+    renderMeasurementPending_ = false;
+    return double((timestamps[1] - timestamps[0]) & mask) * double(timestampPeriod_) / 1'000'000.0;
 }

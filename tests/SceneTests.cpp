@@ -1,10 +1,12 @@
 #include "SceneData.h"
+#include "SceneDiagnostics.h"
 #include "ClusterGpu.h"
 #include "QemClusterBuilder.h"
 #include "ObjLoader.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <functional>
@@ -82,20 +84,33 @@ int main(int argc, char** argv)
             validateScene(buildScene(scene.mesh, 128));
         } else if (test == "qem-guided") {
             const auto mesh = loadObj(argv[2]);
+            constexpr uint32_t capacity = 64;
             const auto baselineStart = std::chrono::steady_clock::now();
-            const auto baseline = buildClusters(mesh);
+            const auto baseline = buildClusters(mesh, capacity);
             const auto baselineTime = std::chrono::steady_clock::now() - baselineStart;
             const auto qemStart = std::chrono::steady_clock::now();
-            const auto qem = buildQemGuidedClusters(mesh);
+            const auto qem = buildQemGuidedClusters(mesh, capacity);
             const auto qemTime = std::chrono::steady_clock::now() - qemStart;
-            const auto repeated = buildQemGuidedClusters(mesh);
+            const auto repeated = buildQemGuidedClusters(mesh, capacity);
             expect(qem.dataset.indices == repeated.dataset.indices &&
                    qem.dataset.clusters.size() == repeated.dataset.clusters.size(),
                    "QEM-guided clustering is not deterministic.");
-            expect(qem.dataset.clusters.size() == baseline.clusters.size(),
-                   "QEM-guided grouping changed the cluster count for the same capacity.");
-            validateScene(SceneData{mesh, qem.dataset, 64});
+            // Different growth orders can leave different-sized remainder groups.
+            // Capacity and complete coverage are required; equal group counts are not.
+            const size_t triangleCount = mesh.indices.size() / 3;
+            const size_t minimumClusters = (triangleCount + capacity - 1) / capacity;
+            expect(qem.dataset.clusters.size() >= minimumClusters &&
+                   qem.dataset.clusters.size() <= triangleCount,
+                   "QEM-guided grouping violated cluster count bounds.");
+            const SceneData qemScene{mesh, qem.dataset, capacity};
+            validateScene(qemScene);
+            roundtrip(qemScene, dir);
             const auto baselineError = measureQemInternalEdgeError(mesh, baseline);
+            expect(std::isfinite(qem.errorStats.meanInternalEdgeError) &&
+                   qem.errorStats.meanInternalEdgeError >= 0.0 &&
+                   std::isfinite(baselineError.meanInternalEdgeError) &&
+                   baselineError.meanInternalEdgeError >= 0.0,
+                   "Expected finite, nonnegative QEM error statistics.");
             expect(qem.errorStats.internalAdjacencyCount > 0 && baselineError.internalAdjacencyCount > 0,
                    "Expected Suzanne clusters to contain adjacent triangle pairs.");
             expect(qem.errorStats.meanInternalEdgeError ==
@@ -109,6 +124,68 @@ int main(int argc, char** argv)
                       << "QEM clusters=" << qem.dataset.clusters.size() << " build_ms=" << qemMs
                       << " mean_internal_QEM_error=" << qem.errorStats.meanInternalEdgeError << '\n'
                       << "Geometry is unchanged; geometric deviation is zero by construction.\n";
+        } else if (test == "storage-stats") {
+            const auto generated = makeMockSceneWithStats();
+            expect(generated.source.kind == SceneSourceKind::Mock && generated.source.path.empty() &&
+                   !generated.source.fileBytes && !generated.source.fileVersion,
+                   "Generated mock must not report a disk file / format version.");
+            const auto payload = scenePayloadBytes(generated.scene);
+            expect(payload.vertices == 512 && payload.indices == 192 && payload.clusters == 192 &&
+                   payload.total() == 896, "Incorrect mock GPU payload bytes.");
+            const auto path = dir / "verified.ACR";
+            const auto saved = saveSceneVerified(path, generated.scene);
+            expect(saved.fileBytes == 1216 && saved.fileBytes == std::filesystem::file_size(path),
+                   "ACR v1 file bytes must include CPU indices, position IDs and the header.");
+            auto restored = loadSceneWithStats(path);
+            expect(restored.source.kind == SceneSourceKind::Acr && restored.source.fileVersion == kSceneFileVersion &&
+                   restored.source.fileBytes == saved.fileBytes && restored.source.path.is_absolute() &&
+                   sameSceneData(restored.scene, generated.scene), "ACR summary / exact roundtrip mismatch.");
+            const auto obj = loadSceneWithStats(argv[2]);
+            expect(obj.source.kind == SceneSourceKind::Obj && !obj.source.fileVersion &&
+                   obj.source.fileBytes == std::filesystem::file_size(argv[2]), "OBJ source metadata mismatch.");
+            const auto realSaved = saveSceneVerified(dir / "suzanne.acr", obj.scene);
+            expect(realSaved.fileBytes == 172576 && scenePayloadBytes(obj.scene).total() == 117232,
+                   "Unexpected Suzanne storage / GPU payload size.");
+            const auto cube = makeCubeSceneWithStats();
+            expect(cube.source.kind == SceneSourceKind::Cube && !cube.source.fileBytes &&
+                   !cube.source.fileVersion && cube.source.path.empty(), "Cube must be a generated source.");
+            for (double ms : {generated.source.cpuPrepareMs, restored.source.cpuPrepareMs,
+                              obj.source.cpuPrepareMs, cube.source.cpuPrepareMs, saved.cpuSaveMs, saved.cpuReloadMs}) {
+                expect(std::isfinite(ms) && ms >= 0.0, "Invalid CPU timing (no speed threshold is required).");
+            }
+            // Detect changes even when counts remain identical. Signed zero is persisted bit-for-bit.
+            auto changed = mock; changed.mesh.vertices[0].normal.x = -0.0f;
+            expect(!sameSceneData(mock, changed), "Float bit changes were ignored.");
+            changed = mock; changed.mesh.vertices[0].position.x += .1f;
+            expect(!sameSceneData(mock, changed), "Vertex changes were ignored.");
+            changed = mock; changed.mesh.vertices[0].texcoord.x = .5f;
+            expect(!sameSceneData(mock, changed), "UV changes were ignored.");
+            changed = mock; std::swap(changed.mesh.indices[0], changed.mesh.indices[1]);
+            expect(!sameSceneData(mock, changed), "Original index order changes were ignored.");
+            changed = mock; std::swap(changed.dataset.indices[0], changed.dataset.indices[1]);
+            expect(!sameSceneData(mock, changed), "Rendering index order changes were ignored.");
+            changed = mock; changed.mesh.positionIds[0] = 1;
+            expect(!sameSceneData(mock, changed), "Position ID changes were ignored.");
+            changed = mock; changed.dataset.clusters[0].boundsMin.x -= .1f;
+            expect(!sameSceneData(mock, changed), "Cluster bound changes were ignored.");
+            changed = mock; changed.dataset.clusters[0].indexCount = 3;
+            expect(!sameSceneData(mock, changed), "Cluster range changes were ignored.");
+            changed = mock; changed.maxTrianglesPerCluster = 8;
+            expect(!sameSceneData(mock, changed), "Capacity changes were ignored.");
+            const auto oldSource = restored.source;
+            auto bytes = readBytes(path); bytes[0] = 'X';
+            writeBytes(dir / "invalid.acr", bytes);
+            rejected([&] { restored = loadSceneWithStats(dir / "invalid.acr"); });
+            expect(sameSceneData(restored.scene, mock) && restored.source.path == oldSource.path &&
+                   restored.source.fileBytes == oldSource.fileBytes &&
+                   restored.source.cpuPrepareMs == oldSource.cpuPrepareMs,
+                   "Failed load overwrote previously valid scene / metadata.");
+            rejected([&] { (void)saveSceneVerified(dir / "missing" / "scene.acr", mock); });
+            const auto wrongExtension = dir / "keep.obj";
+            const std::vector<char> keep{'K', 'E', 'E', 'P'};
+            writeBytes(wrongExtension, keep);
+            rejected([&] { (void)saveSceneVerified(wrongExtension, mock); });
+            expect(readBytes(wrongExtension) == keep, "Wrong-extension output was overwritten before rejection.");
         } else if (test == "invalid-scene") {
             auto damaged = mock;
             damaged.dataset.indices[0] = 99999;

@@ -3,16 +3,27 @@
 
 #include "MeshSource.h"
 #include "SceneData.h"
+#include "SceneDiagnostics.h"
 #include "Viewer.h"
+#include "GeometryGenerationPlan.h"
 
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
 namespace {
+
+TessellationFixture parseFixtureName(const std::filesystem::path& name)
+{
+    if (name == "triangle") return TessellationFixture::Triangle;
+    if (name == "plane") return TessellationFixture::Plane;
+    if (name == "grid") return TessellationFixture::ClusterGrid;
+    throw std::runtime_error("Unknown fixture; choose triangle, plane, or grid.");
+}
 
 void printGlfwError(int code, const char* description)
 {
@@ -122,7 +133,13 @@ int main(int argc, char** argv)
     const auto argument = [&](int i) { return std::filesystem::path(argv[i]); };
     const auto usage = [] {
         std::cout << "Usage: AdaptiveClusterRendering [model.obj | model.acr | --cube | --mock]\n"
-                     "       [--cluster-colors] [--bounds] [--verify-gpu] [--smoke-test]\n"
+                     "       [--fixture triangle|plane|grid (instead of another source)]\n"
+                     "       [--cluster-colors] [--bounds] [--compute-copy] [--verify-gpu] [--smoke-test]\n"
+                     "       [--subdivision 1|2|4|8] [--wireframe]\n"
+                     "       [--displacement amplitude (0..1000)] [--heightmap file.pgm]\n"
+                     "       [--selection all|first-last|empty|last-first]\n"
+                     "       [--benchmark output.json [--benchmark-warmup 10] [--benchmark-samples 50]]\n"
+                     "       --smoke-roundtrip output.acr (hidden save/mock/reload test)\n"
                      "       --preprocess input.obj output.acr\n"
                      "       --make-mock output.acr\n"
                      "       --validate model.acr\n"
@@ -130,26 +147,32 @@ int main(int argc, char** argv)
     };
     const bool checkEnvironment = argc == 2 && argument(1) == "--check-environment";
     bool useCube = false, useMock = false;
+    std::optional<TessellationFixture> fixture;
     std::filesystem::path inputPath;
     ViewerOptions options;
+    bool benchmarkCountsSpecified = false;
+    options.reportDirectory = std::filesystem::absolute(argument(0)).parent_path() / "benchmarks";
     try {
         if (argc == 2 && argument(1) == "--help") { usage(); return 0; }
         if (argc == 4 && argument(1) == "--preprocess") {
-            const auto scene = loadScene(argument(2));
-            saveScene(argument(3), scene);
-            std::cout << "Saved " << scene.dataset.clusters.size() << " clusters to " << argument(3).u8string() << '\n';
+            const auto loaded = loadSceneWithStats(argument(2));
+            printSceneSummary(std::cout, loaded);
+            const auto saved = saveSceneVerified(argument(3), loaded.scene);
+            std::cout << "Saved + verified ACR v1: " << saved.path.u8string() << " | " << saved.fileBytes
+                      << " bytes | CPU save (ms): " << saved.cpuSaveMs << " | CPU reload (ms): " << saved.cpuReloadMs << '\n';
             return 0;
         }
         if (argc == 3 && argument(1) == "--make-mock") {
-            saveScene(argument(2), makeMockScene());
-            std::cout << "Saved fixed 4-cluster mock scene.\n";
+            const auto loaded = makeMockSceneWithStats();
+            printSceneSummary(std::cout, loaded);
+            const auto saved = saveSceneVerified(argument(2), loaded.scene);
+            std::cout << "Saved + verified fixed 4-cluster mock scene: " << saved.fileBytes << " bytes.\n";
             return 0;
         }
         if (argc == 3 && argument(1) == "--validate") {
-            const auto scene = loadScene(argument(2));
-            std::cout << "Scene validation passed: " << scene.mesh.vertices.size() << " vertices, "
-                      << scene.dataset.indices.size() / 3 << " triangles, " << scene.dataset.clusters.size()
-                      << " clusters.\n";
+            const auto loaded = loadSceneWithStats(argument(2));
+            printSceneSummary(std::cout, loaded);
+            std::cout << "Scene validation passed.\n";
             return 0;
         }
         if (!checkEnvironment) {
@@ -158,15 +181,78 @@ int main(int argc, char** argv)
                 if (option == "--cluster-colors") options.clusterColors = true;
                 else if (option == "--bounds") options.showBounds = true;
                 else if (option == "--verify-gpu") options.verifyGpu = true;
+                else if (option == "--compute-copy") options.computeGeometry = true;
+                else if (option == "--wireframe") options.wireframe = true;
+                else if (option == "--benchmark") {
+                    if (++i >= argc) throw std::runtime_error("--benchmark requires an output .json path.");
+                    options.benchmarkPath = argument(i);
+                    if (options.benchmarkPath.extension() != ".json") throw std::runtime_error("Benchmark output must use .json.");
+                }
+                else if (option == "--benchmark-warmup" || option == "--benchmark-samples") {
+                    if (++i >= argc) throw std::runtime_error("Benchmark count is missing.");
+                    const auto value = argument(i).u8string();
+                    if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                        throw std::runtime_error("Benchmark counts must be positive integers.");
+                    const auto count = std::stoul(value);
+                    if (count > 10000) throw std::runtime_error("Benchmark count exceeds 10000.");
+                    if (option == "--benchmark-warmup") options.benchmarkOptions.warmup = static_cast<uint32_t>(count);
+                    else options.benchmarkOptions.samples = static_cast<uint32_t>(count);
+                    benchmarkCountsSpecified = true;
+                }
+                else if (option == "--selection") {
+                    if (++i >= argc) throw std::runtime_error("--selection requires all, first-last, empty, or last-first.");
+                    const auto value = argument(i);
+                    if (value == "all") options.selectionPreset = 0;
+                    else if (value == "first-last") options.selectionPreset = 1;
+                    else if (value == "empty") options.selectionPreset = 2;
+                    else if (value == "last-first") options.selectionPreset = 3;
+                    else throw std::runtime_error("Unknown cluster selection preset.");
+                }
+                else if (option == "--displacement") {
+                    if (++i >= argc) throw std::runtime_error("--displacement requires an amplitude in model units.");
+                    const auto value = argument(i).u8string();
+                    size_t consumed = 0;
+                    options.displacement = {true, std::stof(value, &consumed)};
+                    validateDisplacement(options.displacement);
+                    if (consumed != value.size()) throw std::runtime_error("Invalid displacement amplitude.");
+                    options.computeGeometry = true;
+                }
+                else if (option == "--heightmap") {
+                    if (++i >= argc) throw std::runtime_error("--heightmap requires a PGM file path.");
+                    options.heightMapPath = argument(i);
+                }
+                else if (option == "--subdivision") {
+                    if (++i >= argc) throw std::runtime_error("--subdivision requires 1, 2, 4 or 8.");
+                    const auto value = argument(i).u8string();
+                    if (value.size() != 1 || value[0] < '0' || value[0] > '9' ||
+                        !validEdgeSegments(static_cast<uint32_t>(value[0] - '0'))) {
+                        throw std::runtime_error("--subdivision requires 1, 2, 4 or 8.");
+                    }
+                    options.edgeSegments = static_cast<uint32_t>(value[0] - '0');
+                    options.computeGeometry = true;
+                }
                 else if (option == "--smoke-test") options.smokeTest = true;
+                else if (option == "--smoke-roundtrip") {
+                    if (++i >= argc) throw std::runtime_error("--smoke-roundtrip requires an output ACR path.");
+                    options.smokeTest = true;
+                    options.smokeRoundtripPath = argument(i);
+                }
                 else {
-                    if (useCube || useMock || !inputPath.empty()) throw std::runtime_error("Choose only one scene source.");
+                    if (useCube || useMock || fixture || !inputPath.empty()) throw std::runtime_error("Choose only one scene source.");
                     if (option == "--cube") useCube = true;
                     else if (option == "--mock") useMock = true;
+                    else if (option == "--fixture") {
+                        if (++i >= argc) throw std::runtime_error("--fixture requires triangle, plane, or grid.");
+                        fixture = parseFixtureName(argument(i));
+                    }
                     else if (!option.empty() && option.u8string().front() != '-') inputPath = option;
                     else throw std::runtime_error("Unknown option: " + option.u8string());
                 }
             }
+            validateBenchmarkOptions(options.benchmarkOptions);
+            if (benchmarkCountsSpecified && options.benchmarkPath.empty()) throw std::runtime_error("Benchmark counts require --benchmark.");
+            if (!options.benchmarkPath.empty() && options.smokeTest) throw std::runtime_error("Choose either benchmark or smoke test.");
+            if (options.smokeTest && options.selectionPreset != 0) throw std::runtime_error("Smoke tests manage their own selection.");
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -195,14 +281,16 @@ int main(int argc, char** argv)
         }
     } else {
         try {
-            if (useCube) {
-                exitCode = runViewer(buildScene(makeCube()), "Cube", options);
+            if (fixture) {
+                exitCode = runViewer(makeFixtureSceneWithStats(*fixture), options);
+            } else if (useCube) {
+                exitCode = runViewer(makeCubeSceneWithStats(), options);
             } else if (useMock) {
-                exitCode = runViewer(makeMockScene(), "Mock (4 clusters)", options);
+                exitCode = runViewer(makeMockSceneWithStats(), options);
             } else {
                 const auto path = !inputPath.empty() ? inputPath :
                     std::filesystem::absolute(argv[0]).parent_path() / "assets" / "suzanne.obj";
-                exitCode = runViewer(loadScene(path), path.filename().u8string(), options);
+                exitCode = runViewer(loadSceneWithStats(path), options);
             }
         } catch (const std::exception& error) {
             std::cerr << error.what() << '\n';

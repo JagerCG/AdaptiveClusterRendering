@@ -8,7 +8,7 @@ struct ClusterDesc {
 layout(std430, set = 0, binding = 0) readonly buffer ClusterBuffer {
     ClusterDesc clusters[];
 };
-layout(push_constant) uniform DrawParams { mat4 viewProjection; } drawParams;
+layout(push_constant) uniform DrawParams { mat4 viewProjection; layout(offset = 80) float padding; } drawParams;
 layout(location = 0) out vec3 lineColor;
 
 // 12 edges, two endpoints each; corner xyz corresponds to the three low bits.
@@ -17,7 +17,7 @@ void main()
 {
     ClusterDesc cluster = clusters[gl_InstanceIndex];
     int corner = corners[gl_VertexIndex];
-    vec3 p = mix(cluster.boundsMin.xyz, cluster.boundsMax.xyz,
+    vec3 p = mix(cluster.boundsMin.xyz - vec3(drawParams.padding), cluster.boundsMax.xyz + vec3(drawParams.padding),
                  vec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1));
     gl_Position = drawParams.viewProjection * vec4(p, 1);
     // Stable IDs are read from the same SSBO as the bounds.
