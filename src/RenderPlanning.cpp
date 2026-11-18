@@ -18,6 +18,7 @@ void validateRenderSettings(const RenderSettings& s)
     const auto finite = [](float f) { return std::isfinite(f); };
     if (s.culling > CullMode::FlatHiZ || s.hiZMip > 31 || !finite(s.lodPixels) || s.lodPixels < 0 || s.lodPixels > 65536 ||
         s.display > RenderDisplay::ShadowMap || !finite(s.shadowBias) || s.shadowBias < 0 || s.shadowBias > .08f ||
+        !finite(s.shadowCoverage) || s.shadowCoverage < .05f || s.shadowCoverage > 1 ||
         !finite(s.maxDistance) || s.maxDistance < 0 || !finite(s.lightDirection.x) ||
         !finite(s.lightDirection.y) || !finite(s.lightDirection.z) || glm::length(s.lightDirection) < 1e-4f ||
         !finite(glm::length(s.lightDirection))) throw std::runtime_error("Invalid rendering settings.");
@@ -38,10 +39,10 @@ bool clusterVisible(const Cluster& c, float padding, const glm::mat4& vp, glm::v
     }
     return std::none_of(std::begin(outside), std::end(outside), [](bool b) { return b; });
 }
-glm::mat4 shadowViewProjection(const std::vector<Cluster>& clusters, float padding, glm::vec3 direction)
+glm::mat4 shadowViewProjection(const std::vector<Cluster>& clusters, float padding, glm::vec3 direction, float coverage)
 {
     if (clusters.empty() || !std::isfinite(padding) || padding < 0) throw std::runtime_error("Invalid shadow bounds.");
-    RenderSettings s; s.lightDirection = direction; validateRenderSettings(s);
+    RenderSettings s; s.lightDirection = direction; s.shadowCoverage = coverage; validateRenderSettings(s);
     glm::vec3 lo = clusters.front().boundsMin, hi = clusters.front().boundsMax;
     for (const auto& c : clusters) { lo = glm::min(lo, c.boundsMin); hi = glm::max(hi, c.boundsMax); }
     lo -= glm::vec3(padding); hi += glm::vec3(padding);
@@ -57,6 +58,11 @@ glm::mat4 shadowViewProjection(const std::vector<Cluster>& clusters, float paddi
         lightLo = glm::min(lightLo, p); lightHi = glm::max(lightHi, p);
     }
     const float margin = std::max(.001f, radius * .05f);
+    // Center the footprint on the scene in light space. Keep the entire fitted depth interval
+    // so casters closer to the light can still project onto receivers inside the footprint.
+    const glm::vec2 inset = (1.f - coverage) * .5f * (glm::vec2(lightHi - lightLo) + 2.f * margin);
+    lightLo.x += inset.x; lightLo.y += inset.y;
+    lightHi.x -= inset.x; lightHi.y -= inset.y;
     auto projection = glm::orthoRH_ZO(lightLo.x - margin, lightHi.x + margin, lightLo.y - margin, lightHi.y + margin,
                                      std::max(.001f, -lightHi.z - margin), -lightLo.z + margin);
     projection[1][1] *= -1; // same positive-height Vulkan viewport in both passes

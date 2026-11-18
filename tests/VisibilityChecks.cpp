@@ -47,7 +47,7 @@ void checkMips(uint32_t width, uint32_t height, std::vector<float> src, const st
 
 std::vector<float> VulkanRenderer::readHiZ()
 {
-    expect(visibilityActive_ && visStats_.depthFrame && !hiZMips_.empty(), "No valid GPU depth pyramid.");
+    expect(cameraList_.active && cameraList_.stats.depthFrame && !hiZMips_.empty(), "No valid GPU depth pyramid.");
     const auto last = hiZMips_.back();
     std::vector<float> data(size_t(last.offset) + last.width * last.height);
     const auto bytes = data.size() * sizeof(float);

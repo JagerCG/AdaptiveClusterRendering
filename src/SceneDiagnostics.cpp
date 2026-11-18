@@ -95,6 +95,7 @@ LoadedScene makeFixtureSceneWithStats(TessellationFixture fixture)
     result.scene = makeTessellationFixture(fixture);
     switch (fixture) {
     case TessellationFixture::Occlusion: result.source.kind = SceneSourceKind::Occlusion; break;
+    case TessellationFixture::ShadowCasters: result.source.kind = SceneSourceKind::ShadowCasters; break;
     case TessellationFixture::ShadowStage: result.source.kind = SceneSourceKind::ShadowStage; break;
     case TessellationFixture::Triangle: result.source.kind = SceneSourceKind::Triangle; break;
     case TessellationFixture::Plane: result.source.kind = SceneSourceKind::Plane; break;
@@ -109,6 +110,7 @@ const char* sceneSourceName(SceneSourceKind kind)
     switch (kind) {
     case SceneSourceKind::Obj: return "OBJ";
     case SceneSourceKind::Occlusion: return "Occlusion stage";
+    case SceneSourceKind::ShadowCasters: return "Off-camera shadow caster";
     case SceneSourceKind::Acr: return "ACR";
     case SceneSourceKind::Mock: return "Mock (4 clusters)";
     case SceneSourceKind::Cube: return "Cube";

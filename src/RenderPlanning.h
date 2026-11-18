@@ -8,6 +8,8 @@ constexpr bool usesHiZ(CullMode mode) { return mode == CullMode::HiZ || mode == 
 struct RenderSettings {
     RenderDisplay display = RenderDisplay::Shaded;
     bool shadows = false;
+    bool shadowCulling = false;
+    float shadowCoverage = 1.0f; // fraction of the fitted light width/height, independent of the camera
     float shadowBias = 0.002f; // normalized light-depth comparison bias
     glm::vec3 lightDirection{0.6f, 0.8f, 1.0f}; // surface toward directional light
     bool frustumPreview = false; // CPU draw-only preview, NOT GPU LOD selection
@@ -24,4 +26,5 @@ glm::vec4 lodLevelColor(uint32_t level);
 bool clusterVisible(const Cluster& cluster, float padding, const glm::mat4& viewProjection,
                     glm::vec3 eye, const RenderSettings& settings);
 // Camera-independent fit over source bounds plus conservative displacement.
-glm::mat4 shadowViewProjection(const std::vector<Cluster>& clusters, float padding, glm::vec3 lightDirection);
+glm::mat4 shadowViewProjection(const std::vector<Cluster>& clusters, float padding, glm::vec3 lightDirection,
+                               float coverage = 1.0f);

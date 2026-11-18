@@ -683,8 +683,10 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     sceneGpu_.clusterCount = levels[0].clusterCount;
     sceneGpu_.hierarchy = packed.layout;
     sceneGpu_.activeLevel = sceneGpu_.firstCluster = 0;
-    visibilityActive_ = separateShadowGeometry_ = false;
-    visStats_ = {};
+    lightList_.active = separateShadowGeometry_ = false;
+    lightList_.stats = {};
+    cameraList_.active = false;
+    cameraList_.stats = {};
     hiZMips_.clear();
     ++candidateRevision_;
     sceneGpu_.lodCommands = sceneGpu_.lodTriangleWork = VK_NULL_HANDLE;
@@ -728,7 +730,7 @@ void VulkanRenderer::setHierarchyLevel(uint32_t level)
     auto selection =
         resolveClusterSelection(active, l.indexCount, revision, {revision, ClusterSelectionMode::All, {}});
     sceneGpu_.activeLevel = level;
-    visibilityActive_ = false;
+    cameraList_.active = lightList_.active = false;
     ++candidateRevision_;
     sceneGpu_.lodCommands = sceneGpu_.lodTriangleWork = VK_NULL_HANDLE;
     sceneGpu_.lodRecordOffset = sceneGpu_.lodWorkAllocation = 0;
@@ -750,7 +752,7 @@ void VulkanRenderer::setClusterSelection(const ClusterSelection& selection)
     auto next = resolveClusterSelection(drawClusters_, sceneGpu_.indexCount, sceneGpu_.sceneRevision, selection);
     if (!sameClusterSelection(selection_, next)) {
         compute_->invalidate();
-        visibilityActive_ = false;
+        cameraList_.active = lightList_.active = false;
         ++candidateRevision_;
     }
     selection_ = std::move(next);
@@ -759,9 +761,37 @@ void VulkanRenderer::setClusterSelection(const ClusterSelection& selection)
 bool VulkanRenderer::ensureGeneratedGeometry(bool force)
 {
     const bool changed = generateFor(*compute_, mainScene(), mainSelection(), force);
-    separateShadowGeometry_ = visibilityActive_ &&
-                              (renderSettings_.shadows || renderSettings_.display == RenderDisplay::ShadowMap) &&
-                              mainSelection().ranges.size() != selection_.ranges.size();
+    prepareShadowPass(true, force);
+    return changed;
+}
+
+void VulkanRenderer::prepareShadowPass(bool generated, bool forceCulling)
+{
+    const float padding = generated ? plannedDisplacementBound() : 0.f;
+    const bool refit = lightFitRevision_ != sceneGpu_.sceneRevision || lightPadding_ != padding;
+    if (refit) {
+        lightMatrix_ = shadowViewProjection(residentClusters_, padding, renderSettings_.lightDirection,
+                                            renderSettings_.shadowCoverage);
+        lightFitRevision_ = sceneGpu_.sceneRevision;
+        lightPadding_ = padding;
+        lightList_.active = false;
+    }
+    const bool shadowPass = renderSettings_.shadows || renderSettings_.display == RenderDisplay::ShadowMap;
+    if (shadowPass && renderSettings_.shadowCulling) {
+        if (forceCulling || !lightList_.active || lightCandidateRevision_ != candidateRevision_) {
+            buildVisibilityList(lightList_, lightMatrix_, {shadowMapSize, shadowMapSize}, padding, false, 0);
+            lightCandidateRevision_ = candidateRevision_;
+        }
+    } else {
+        lightList_.active = false;
+        lightList_.stats = {};
+    }
+
+    const auto& mainRanges = mainSelection().ranges;
+    const auto& lightRanges = shadowSelection().ranges;
+    separateShadowGeometry_ = generated && shadowPass && &mainRanges != &lightRanges &&
+        !std::equal(mainRanges.begin(), mainRanges.end(), lightRanges.begin(), lightRanges.end(),
+                    [](const auto& a, const auto& b) { return a.sourceClusterId == b.sourceClusterId; });
     if (separateShadowGeometry_) {
         if (!shadowCompute_) {
             auto next = std::make_unique<ComputeGeometry>();
@@ -774,9 +804,8 @@ bool VulkanRenderer::ensureGeneratedGeometry(bool force)
             shadowCompute_->uploadHeight(heightField(), commandBuffer_, graphicsQueue_);
             shadowHeightRevision_ = heightRevision();
         }
-        generateFor(*shadowCompute_, sceneGpu_, selection_, false);
+        generateFor(*shadowCompute_, shadowScene(), shadowSelection(), false);
     }
-    return changed;
 }
 
 bool VulkanRenderer::generateFor(ComputeGeometry& generator, const SceneGpuData& source,
@@ -1401,8 +1430,8 @@ void VulkanRenderer::createPipeline()
 void VulkanRenderer::destroySwapchain()
 {
     cameraDepth_ = {};
-    visibilityActive_ = false;
-    visStats_ = {};
+    cameraList_.active = false;
+    cameraList_.stats = {};
     hiZMips_.clear();
     for (const auto& image : swapchainImages_) {
         vkDestroyFramebuffer(device_, image.framebuffer, nullptr);
@@ -1475,7 +1504,10 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
     stats.boundsPadding = computeGeometry ? compute_->output().maxDisplacement : 0;
     const float aspect = float(extent_.width) / float(extent_.height);
     const auto viewProjection = camera.viewProjection(aspect);
-    lightMatrix_ = shadowViewProjection(residentClusters_, stats.boundsPadding, renderSettings_.lightDirection);
+    if (stats.shadowPass) {
+        stats.shadowCandidates = static_cast<uint32_t>(selection_.ranges.size());
+        stats.shadowCasters = static_cast<uint32_t>(shadowSelection().ranges.size());
+    }
     const LightingUniform lighting{lightMatrix_, glm::vec4(glm::normalize(renderSettings_.lightDirection), 0)};
     void* mapped = nullptr;
     check(vkMapMemory(device_, lightingBuffer_.memory, 0, sizeof(lighting), 0, &mapped), "vkMapMemory(lighting)");
@@ -1505,7 +1537,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         const VkRect2D scissor{{0, 0}, {width, height}};
         vkCmdSetViewport(commandBuffer_, 0, 1, &viewport); vkCmdSetScissor(commandBuffer_, 0, 1, &scissor);
     };
-    // The light uses the full candidate cut. Off-camera geometry can still cast shadows.
+    // The two views share the LOD cut, then each consumes its own compacted draw commands.
     const auto drawMesh = [&](const auto& geometry, const auto& ranges, bool contiguous, bool shadow) {
         if (ranges.empty()) return;
         vkCmdBindVertexBuffers(commandBuffer_, 0, 1, &geometry.vertexBuffer, &geometry.vertexOffset);
@@ -1514,7 +1546,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         auto& triangles = shadow ? stats.shadowTriangles : stats.triangles;
         const bool sharedState =
             shadow || (!clusterColors && !renderSettings_.groupColors && !renderSettings_.levelColors && !filtered);
-        const auto& source = shadow ? sceneGpu_ : mainScene();
+        const auto& source = shadow ? shadowScene() : mainScene();
         const bool gpuCommands = source.lodCommands && !computeGeometry;
         const auto indirect = [&](size_t slot, uint32_t count) {
             const auto offset = source.lodRecordOffset + slot * SceneGpuData::lodRecordStride + sizeof(uint32_t);
@@ -1529,7 +1561,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
                 first += count;
                 ++calls;
             }
-            triangles += (shadow ? selection_ : mainSelection()).triangleCount();
+            triangles += (shadow ? shadowSelection() : mainSelection()).triangleCount();
             return;
         }
         const auto draw = [&](uint32_t first, uint32_t count, uint32_t id, size_t slot) {
@@ -1561,8 +1593,8 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
             drawMesh(output, output.ranges, true, shadow);
         }
         else {
-            const auto& selected = shadow ? selection_ : mainSelection();
-            drawMesh(shadow ? sceneGpu_ : mainScene(), selected.ranges, selected.allClusters, shadow);
+            const auto& selected = shadow ? shadowSelection() : mainSelection();
+            drawMesh(shadow ? shadowScene() : mainScene(), selected.ranges, selected.allClusters, shadow);
         }
     };
     if (stats.shadowPass) {
@@ -1610,7 +1642,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
             }
         }
     }
-    if (visibilityActive_ && renderSettings_.showRejectedBounds && stats.display == RenderDisplay::Shaded) {
+    if (cameraList_.active && renderSettings_.showRejectedBounds && stats.display == RenderDisplay::Shaded) {
         // Draw rejected boxes through the wall for inspection. This pipeline never writes depth.
         vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, rejectedBoundsPipeline_);
         const uint32_t rejectedDisplay = 3;
@@ -1619,8 +1651,8 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         // Survivors preserve candidate order, including reversed manual lists.
         size_t next = 0;
         for (const auto& candidate : selection_.ranges) {
-            if (next < visibleSelection_.ranges.size() &&
-                visibleSelection_.ranges[next].sourceClusterId == candidate.sourceClusterId) {
+            if (next < cameraList_.selection.ranges.size() &&
+                cameraList_.selection.ranges[next].sourceClusterId == candidate.sourceClusterId) {
                 ++next;
                 continue;
             }
@@ -1629,13 +1661,13 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         }
     }
     vkCmdNextSubpass(commandBuffer_, VK_SUBPASS_CONTENTS_INLINE);
-    if (renderSettings_.showHiZ && stats.display != RenderDisplay::ShadowMap && visibilityActive_ &&
+    if (renderSettings_.showHiZ && stats.display != RenderDisplay::ShadowMap && cameraList_.active &&
         !hiZMips_.empty()) {
         setViewport(extent_.width, extent_.height);
         const auto mip = hiZMips_[std::min<size_t>(renderSettings_.hiZMip, hiZMips_.size() - 1)];
         const uint32_t args[] = {mip.width, mip.height, mip.offset, 0};
         vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, hiZDebugPipeline_);
-        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, visLayout_, 1, 1, &visSet_, 0,
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, visLayout_, 1, 1, &cameraList_.set, 0,
                                 nullptr);
         vkCmdPushConstants(commandBuffer_, visLayout_, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(args), args);
@@ -1660,6 +1692,9 @@ bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bo
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
     if (renderMeasurementPending_) throw std::runtime_error("Consume the previous render measurement before submitting another frame.");
 
+    // Generated measurements already forced the selector in ensureGeneratedGeometry().
+    // Both routes also support callers that changed only the light since the last frame.
+    prepareShadowPass(computeGeometry, measure && !computeGeometry);
     uint32_t imageIndex = 0;
     const VkResult acquire = vkAcquireNextImageKHR(
         device_, swapchain_, kAcquireTimeoutNs, imageAvailable_, VK_NULL_HANDLE, &imageIndex);

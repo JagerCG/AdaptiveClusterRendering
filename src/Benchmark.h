@@ -16,6 +16,7 @@ struct BenchmarkSample {
     std::optional<double> cpuGenerateMs, gpuGenerateMs, gpuRenderMs, gpuMainMs, gpuShadowMs;
     std::optional<double> cpuFrameMs, cpuLodMs, gpuLodMs;
     std::optional<double> cpuCullMs, gpuCullMs, gpuPyramidMs;
+    std::optional<double> cpuShadowCullMs, gpuShadowCullMs;
 };
 // Export metadata is grouped by type; every numeric field names its unit.
 struct BenchmarkContext {
@@ -23,8 +24,8 @@ struct BenchmarkContext {
     std::map<std::string, uint64_t> counts;
     std::map<std::string, double> values;
     std::map<std::string, bool> flags;
-    std::vector<uint32_t> selectedClusterIds;
-    std::vector<float> viewProjection;
+    std::vector<uint32_t> selectedClusterIds, shadowClusterIds;
+    std::vector<float> viewProjection, lightViewProjection;
 };
 struct BenchmarkReport {
     BenchmarkOptions options;

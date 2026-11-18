@@ -19,10 +19,14 @@ int main() {
         expect(clusterVisible(inside, 3, glm::mat4(1), {0,0,2}, s));
         for (auto direction : {glm::vec3(0,1,0), glm::vec3(0,0,1), glm::vec3(.6f,.8f,1)}) {
             const auto light = shadowViewProjection({inside}, .6f, direction);
+            const auto half = shadowViewProjection({inside}, .6f, direction, .5f);
             for (int i=0; i<8; ++i) {
                 auto lo=inside.boundsMin-glm::vec3(.6f), hi=inside.boundsMax+glm::vec3(.6f);
-                auto p=light*glm::vec4((i&1)?hi.x:lo.x,(i&2)?hi.y:lo.y,(i&4)?hi.z:lo.z,1);
+                const auto corner = glm::vec4((i&1)?hi.x:lo.x,(i&2)?hi.y:lo.y,(i&4)?hi.z:lo.z,1);
+                auto p=light*corner;
                 p/=p.w; expect(std::abs(p.x)<=1 && std::abs(p.y)<=1 && p.z>=0 && p.z<=1);
+                const auto cropped = half * corner;
+                expect(glm::length(glm::vec2(cropped) - 2.f * glm::vec2(p)) < 1e-5f && cropped.z == p.z);
             }
         }
         bool rejected=false; s.lightDirection={0,0,0};

@@ -13,6 +13,7 @@ struct ViewerOptions {
     RenderSettings renderSettings;
     bool renderSmoke = false;
     bool visibilitySmoke = false;
+    bool shadowCullSmoke = false;
     bool lodDepthSmoke = false, hidePanel = false;
     std::filesystem::path saveConfigPath;
     std::optional<ViewConfig> initialView;

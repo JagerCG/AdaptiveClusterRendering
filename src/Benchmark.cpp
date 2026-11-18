@@ -80,6 +80,7 @@ void BenchmarkSession::add(const BenchmarkSample& sample)
     checkTime(sample.gpuMainMs); checkTime(sample.gpuShadowMs);
     checkTime(sample.cpuFrameMs); checkTime(sample.cpuLodMs); checkTime(sample.gpuLodMs);
     checkTime(sample.cpuCullMs); checkTime(sample.gpuCullMs); checkTime(sample.gpuPyramidMs);
+    checkTime(sample.cpuShadowCullMs); checkTime(sample.gpuShadowCullMs);
     checkTime(sample.cpuGenerateMs); checkTime(sample.gpuGenerateMs); checkTime(sample.gpuRenderMs);
     require(sample.cpuGenerateMs.has_value() == generated_, "Benchmark CPU generation timing has the wrong scope.");
     require(sample.gpuGenerateMs.has_value() == (generated_ && timestamps_ && nonempty_), "Benchmark GPU generation availability changed.");
@@ -114,15 +115,20 @@ std::string benchmarkJson(const BenchmarkReport& report)
     map("counts", report.context.counts, [&](uint64_t v) { out << v; });
     map("values", report.context.values, [&](double v) { require(std::isfinite(v), "Nonfinite report metadata."); out << v; });
     map("flags", report.context.flags, [&](bool v) { out << (v ? "true" : "false"); });
-    out << ",\n  \"selected_cluster_ids\": [";
-    for (size_t i = 0; i < report.context.selectedClusterIds.size(); ++i) { if (i) out << ','; out << report.context.selectedClusterIds[i]; }
-    out << "],\n  \"view_projection_column_major\": [";
-    for (size_t i = 0; i < report.context.viewProjection.size(); ++i) {
-        if (i) out << ',';
-        require(std::isfinite(report.context.viewProjection[i]), "Nonfinite report camera.");
-        out << report.context.viewProjection[i];
-    }
-    out << "],\n  \"summary_ms\": {";
+    const auto array = [&](const char* name, const auto& values) {
+        out << ",\n  " << quote(name) << ": [";
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i) out << ',';
+            require(std::isfinite(values[i]), "Nonfinite benchmark array element.");
+            out << values[i];
+        }
+        out << ']';
+    };
+    array("selected_cluster_ids", report.context.selectedClusterIds);
+    array("shadow_cluster_ids", report.context.shadowClusterIds);
+    array("view_projection_column_major", report.context.viewProjection);
+    array("light_view_projection_column_major", report.context.lightViewProjection);
+    out << ",\n  \"summary_ms\": {";
     const auto summary = [&](const char* name, std::optional<double> BenchmarkSample::* metric, bool comma) {
         if (comma) out << ',';
         const auto stats = summarizeBenchmark(report, metric);
@@ -142,6 +148,8 @@ std::string benchmarkJson(const BenchmarkReport& report)
     summary("cpu_visibility_and_wait", &BenchmarkSample::cpuCullMs, true);
     summary("gpu_cull", &BenchmarkSample::gpuCullMs, true);
     summary("gpu_hiz", &BenchmarkSample::gpuPyramidMs, true);
+    summary("cpu_shadow_cull_and_wait", &BenchmarkSample::cpuShadowCullMs, true);
+    summary("gpu_shadow_cull", &BenchmarkSample::gpuShadowCullMs, true);
     out << "\n  },\n  \"samples\": [";
     for (size_t i = 0; i < report.samples.size(); ++i) {
         const auto& sample = report.samples[i];
@@ -157,7 +165,9 @@ std::string benchmarkJson(const BenchmarkReport& report)
         out << ",\"gpu_lod_ms\":"; optionalTime(out, sample.gpuLodMs);
         out << ",\"cpu_visibility_and_wait_ms\":"; optionalTime(out,sample.cpuCullMs);
         out << ",\"gpu_cull_ms\":"; optionalTime(out,sample.gpuCullMs);
-        out << ",\"gpu_hiz_ms\":"; optionalTime(out,sample.gpuPyramidMs); out << '}';
+        out << ",\"gpu_hiz_ms\":"; optionalTime(out,sample.gpuPyramidMs);
+        out << ",\"cpu_shadow_cull_and_wait_ms\":"; optionalTime(out, sample.cpuShadowCullMs);
+        out << ",\"gpu_shadow_cull_ms\":"; optionalTime(out, sample.gpuShadowCullMs); out << '}';
     }
     out << "\n  ]\n}\n";
     return out.str();

@@ -35,6 +35,7 @@
 #include <utility>
 
 int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window);
+int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
 int runVisibilityChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
 int runLodDepthChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
 int runHierarchyChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene,
@@ -124,9 +125,9 @@ ViewerModel makeModel(LoadedScene loaded)
 {
     validateScene(loaded.scene);
     auto camera = frameMesh(loaded.scene.mesh);
-    if (loaded.source.kind == SceneSourceKind::Occlusion) {
+    if (loaded.source.kind == SceneSourceKind::Occlusion || loaded.source.kind == SceneSourceKind::ShadowCasters) {
         camera = OrbitCamera({0, 0, 0}, 2);
-        camera.setPose({0, 0, 3});
+        camera.setPose({0, 0, loaded.source.kind == SceneSourceKind::ShadowCasters ? 1.5f : 3.f});
     }
     auto name = loaded.source.path.empty() ? std::string(sceneSourceName(loaded.source.kind)) :
                                            loaded.source.path.filename().u8string();
@@ -220,6 +221,7 @@ enum class ModelAction {
     ClusterGrid,
     ShadowStage,
     Occlusion,
+    ShadowCasters,
     HeightPreset,
     OpenHeight,
     SaveView,
@@ -344,6 +346,8 @@ void drawBenchmarkPanel(BenchmarkSession& benchmark, BenchmarkOptions& options,
         metric("GPU render total", &BenchmarkSample::gpuRenderMs);
         metric("GPU main pass", &BenchmarkSample::gpuMainMs);
         metric("GPU shadow pass", &BenchmarkSample::gpuShadowMs);
+        metric("GPU shadow caster culling", &BenchmarkSample::gpuShadowCullMs);
+        metric("CPU shadow cull + wait", &BenchmarkSample::cpuShadowCullMs);
         metric("CPU frame (wall time)", &BenchmarkSample::cpuFrameMs);
         metric("CPU LOD + wait", &BenchmarkSample::cpuLodMs);
         metric("GPU LOD selection", &BenchmarkSample::gpuLodMs);
@@ -447,6 +451,17 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     context.flags["group_colors"] = settings.groupColors;
     context.counts["shadow_triangles"] = renderer.lastRecordedDraw().shadowTriangles;
     context.counts["shadow_draw_calls"] = renderer.lastRecordedDraw().shadowDrawCalls;
+    const auto& draw = renderer.lastRecordedDraw();
+    context.counts["shadow_candidate_clusters"] = draw.shadowCandidates;
+    context.counts["shadow_caster_clusters"] = draw.shadowCasters;
+    context.counts["shadow_frustum_rejected"] = draw.shadowCandidates - draw.shadowCasters;
+    context.flags["shadow_culling"] = settings.shadowCulling;
+    context.values["shadow_coverage"] = settings.shadowCoverage;
+    if (draw.shadowPass) {
+        for (const auto& range : renderer.shadowSelection().ranges)
+            context.shadowClusterIds.push_back(range.sourceClusterId);
+        if (settings.shadowCulling) context.flags["readback_excluded"] = false;
+    }
     context.counts["visible_clusters"] = renderer.lastRecordedDraw().visibleClusters;
     context.counts["shadow_map_size"] = VulkanRenderer::shadowMapSize;
     context.values["shadow_bias"] = settings.shadowBias;
@@ -464,11 +479,15 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
                                             "IDs are relative to first_cluster_id.";
         context.labels["generation_scope"] =
             "Main-view generation uses GPU-visible triangle addresses and indirect dispatch. Additional shadow "
-            "geometry is cached using the pre-camera list.";
+            "geometry is cached using the light's caster list.";
     }
+    context.labels["shadow_scope"] = "The light selects from the pre-camera LOD or manual list. Caster IDs use the same first_cluster_id base as the main view. Shadow raster and caster culling have separate timers.";
     for (const auto& range : selection.ranges) context.selectedClusterIds.push_back(range.sourceClusterId);
     const auto view = model.camera.viewProjection(float(extent.width) / float(extent.height));
-    for (int column = 0; column < 4; ++column) for (int row = 0; row < 4; ++row) context.viewProjection.push_back(view[column][row]);
+    for (int column = 0; column < 4; ++column) for (int row = 0; row < 4; ++row) {
+        context.viewProjection.push_back(view[column][row]);
+        context.lightViewProjection.push_back(renderer.lastLightMatrix()[column][row]);
+    }
     return context;
 }
 
@@ -479,7 +498,8 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
                       const HeightField& height, uint64_t heightBytes, const SceneUploadStats& upload,
                       std::string& status, BenchmarkSession& benchmark, BenchmarkOptions& benchmarkOptions,
                       const std::filesystem::path& exported, bool& startBenchmark, RenderSettings& renderSettings,
-                      const SourceDrawStats& lastDraw, const LodSelectionStats& lod, const VisibilityStats& vis)
+                      const SourceDrawStats& lastDraw, const LodSelectionStats& lod, const VisibilityStats& vis,
+                      const VisibilityStats& shadowVis)
 {
     const auto& scene = model.loaded.scene;
     ModelAction action = ModelAction::None;
@@ -585,14 +605,20 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
             if (ImGui::Combo("##display", &display, "Shaded\0Depth (near is bright)\0Shadow map (light view)\0"))
                 renderSettings.display = static_cast<RenderDisplay>(display);
             ImGui::Checkbox("Shadows", &renderSettings.shadows);
+            ImGui::Checkbox("Cull casters in light view", &renderSettings.shadowCulling);
+            ImGui::TextUnformatted("Shadow coverage (1 = full scene)");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##shadowCoverage", &renderSettings.shadowCoverage, .05f, 1.f, "%.2f");
             ImGui::TextUnformatted("Shadow bias");
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##shadowBias", &renderSettings.shadowBias, 0, .02f, "%.4f");
             if (ImGui::Button("Light from left")) renderSettings.lightDirection = {-1, .7f, 1};
             ImGui::SameLine();
             if (ImGui::Button("Light from right")) renderSettings.lightDirection = {1, .7f, 1};
-            ImGui::Text("Shadow: %llu triangles", static_cast<unsigned long long>(lastDraw.shadowTriangles));
-            ImGui::TextWrapped("Both views use the same source or displaced model. Shadow map shows the full light view.");
+            ImGui::Text("Shadow casters: %u / %u", lastDraw.shadowCasters, lastDraw.shadowCandidates);
+            ImGui::Text("Shadow triangles: %llu", static_cast<unsigned long long>(lastDraw.shadowTriangles));
+            if (lastDraw.shadowPass && renderSettings.shadowCulling && shadowVis.gpuCullMs)
+                ImGui::Text("Last GPU caster test: %.4f ms", *shadowVis.gpuCullMs);
             ImGui::Checkbox("CPU frustum preview", &renderSettings.frustumPreview);
             ImGui::TextUnformatted("Max distance (model units)");
             ImGui::SetNextItemWidth(-1);
@@ -625,6 +651,7 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
             if (ImGui::BeginCombo("##fixture", "Load test scene...")) {
                 if (ImGui::Selectable("Shadow stage (receiver + patch)")) action = ModelAction::ShadowStage;
                 if (ImGui::Selectable("Occlusion stage")) action = ModelAction::Occlusion;
+                if (ImGui::Selectable("Off-camera shadow caster")) action = ModelAction::ShadowCasters;
                 if (ImGui::Selectable("Single triangle")) action = ModelAction::Triangle;
                 if (ImGui::Selectable("Continuous UV plane")) action = ModelAction::Plane;
                 if (ImGui::Selectable("Fixed cluster grid (2 x 2)")) action = ModelAction::ClusterGrid;
@@ -763,7 +790,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     ViewerInput input;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_VISIBLE,
-                   (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || options.visibilitySmoke ||
+                   (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || options.visibilitySmoke || options.shadowCullSmoke ||
                     cliBenchmark || !options.saveConfigPath.empty() || !options.hierarchyRoundtripPath.empty())
                        ? GLFW_FALSE
                        : GLFW_TRUE);
@@ -797,6 +824,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     if (!options.hierarchyRoundtripPath.empty())
         return runHierarchyChecks(renderer,window.get(),model.loaded.scene,model.camera,options.hierarchyRoundtripPath);
     if (options.renderSmoke) return runRenderIntegrationChecks(renderer, window.get());
+    if (options.shadowCullSmoke) return runShadowCasterChecks(renderer, window.get(), model.loaded.scene, model.camera);
     if (options.visibilitySmoke) return runVisibilityChecks(renderer, window.get(), model.loaded.scene, model.camera);
     if (options.lodDepthSmoke) return runLodDepthChecks(renderer,window.get(),model.loaded.scene,model.camera);
     if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(model.loaded.scene);
@@ -1018,7 +1046,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                             renderer.heightField(), renderer.heightAllocationBytes(), renderer.uploadStats(), status,
                             benchmark, options.benchmarkOptions, exportedBenchmark, benchmarkRequested,
                             renderSettings, renderer.lastRecordedDraw(), renderer.lodStats(),
-                            renderer.visibilityStats());
+                            renderer.visibilityStats(), renderer.shadowVisibilityStats());
         if (benchmarkRequested && !alreadyRequested) benchmarkStarted = std::chrono::steady_clock::now();
         renderer.setRenderSettings(renderSettings);
         renderer.setEdgeSegments(1u << segmentPreset);
@@ -1115,6 +1143,11 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
             if (benchmark.active()) {
                 BenchmarkSample sample;
                 sample.cpuFrameMs = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-frameStart).count();
+                if (renderer.lastRecordedDraw().shadowPass && renderSettings.shadowCulling) {
+                    const auto& light = renderer.shadowVisibilityStats();
+                    sample.cpuShadowCullMs = light.cpuMs;
+                    sample.gpuShadowCullMs = light.gpuCullMs;
+                }
                 if (renderSettings.culling != CullMode::Off) {
                     sample.cpuCullMs = renderer.visibilityStats().cpuMs;
                     sample.gpuCullMs = renderer.visibilityStats().gpuCullMs;
@@ -1266,10 +1299,11 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                 }
                 else if (action == ModelAction::Triangle || action == ModelAction::Plane ||
                          action == ModelAction::ClusterGrid || action == ModelAction::ShadowStage ||
-                         action == ModelAction::Occlusion) {
+                         action == ModelAction::Occlusion || action == ModelAction::ShadowCasters) {
                     const auto fixture = action == ModelAction::Triangle      ? TessellationFixture::Triangle
                                          : action == ModelAction::Plane       ? TessellationFixture::Plane
                                          : action == ModelAction::ShadowStage ? TessellationFixture::ShadowStage
+                                         : action == ModelAction::ShadowCasters ? TessellationFixture::ShadowCasters
                                          : action == ModelAction::Occlusion   ? TessellationFixture::Occlusion
                                                                               : TessellationFixture::ClusterGrid;
                     replaceModel(makeFixtureSceneWithStats(fixture));

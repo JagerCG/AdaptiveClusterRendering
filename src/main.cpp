@@ -23,8 +23,9 @@ TessellationFixture parseFixtureName(const std::filesystem::path& name)
     if (name == "plane") return TessellationFixture::Plane;
     if (name == "shadow") return TessellationFixture::ShadowStage;
     if (name == "occlusion") return TessellationFixture::Occlusion;
+    if (name == "shadow-casters") return TessellationFixture::ShadowCasters;
     if (name == "grid") return TessellationFixture::ClusterGrid;
-    throw std::runtime_error("Unknown fixture; choose triangle, plane, grid, shadow or occlusion.");
+    throw std::runtime_error("Unknown fixture; choose triangle, plane, grid, shadow, occlusion or shadow-casters.");
 }
 
 void printGlfwError(int code, const char* description)
@@ -135,16 +136,16 @@ int main(int argc, char** argv)
     const auto argument = [&](int i) { return std::filesystem::path(argv[i]); };
     const auto usage = [] {
         std::cout << "Usage: AdaptiveClusterRendering [model.obj | model.acr | --cube | --mock]\n"
-                     "       [--fixture triangle|plane|grid|shadow (instead of another source)]\n"
+                     "       [--fixture triangle|plane|grid|shadow|occlusion|shadow-casters]\n"
                      "       [--cluster-colors] [--bounds] [--compute-copy] [--verify-gpu] [--smoke-test]\n"
                      "       [--subdivision 1|2|4|8] [--wireframe]\n"
                      "       [--geometry-level N] [--group-colors]\n"
                      "       [--gpu-lod] [--lod-pixels P] [--level-colors] [--hide-ui]\n"
                      "       [--view-config file.acrview] [--save-view file.acrview] [--lod-depth-smoke]\n"
                      "       [--shadows] [--shadow-bias 0..0.08] [--depth-view | --shadow-map]\n"
+                     "       [--shadow-cull all|frustum] [--shadow-coverage 0.05..1] [--light-direction X Y Z] [--shadow-cull-smoke]\n"
                      "       [--frustum-preview] [--max-distance model_units] [--render-smoke]\n"
-                     "       [--cull off|frustum|hierarchy|hiz|hiz-flat] [--hiz-mip 0..31] [--rejected-bounds] [--fixture "
-                     "occlusion] [--visibility-smoke]\n"
+                     "       [--cull off|frustum|hierarchy|hiz|hiz-flat] [--hiz-mip 0..31] [--rejected-bounds] [--visibility-smoke]\n"
                      "       [--displacement amplitude (0..1000)] [--heightmap file.pgm]\n"
                      "       [--selection all|first-last|empty|last-first]\n"
                      "       [--benchmark output.json [--benchmark-warmup 10] [--benchmark-samples 50]]\n"
@@ -221,6 +222,8 @@ int main(int argc, char** argv)
                 else if (option == "--lod-depth-smoke") options.lodDepthSmoke = true;
                 else if (option == "--visibility-smoke")
                     options.visibilitySmoke = true;
+                else if (option == "--shadow-cull-smoke")
+                    options.shadowCullSmoke = true;
                 else if (option == "--rejected-bounds")
                     options.renderSettings.showRejectedBounds = true;
                 else if (option == "--cull") {
@@ -270,16 +273,31 @@ int main(int argc, char** argv)
                 else if (option == "--compute-copy") options.computeGeometry = true;
                 else if (option == "--wireframe") options.wireframe = true;
                 else if (option == "--shadows") options.renderSettings.shadows = true;
+                else if (option == "--shadow-cull") {
+                    if (++i >= argc || (argument(i) != "frustum" && argument(i) != "all"))
+                        throw std::runtime_error("--shadow-cull requires all or frustum.");
+                    options.renderSettings.shadowCulling = argument(i) == "frustum";
+                }
+                else if (option == "--light-direction") {
+                    for (int axis = 0; axis < 3; ++axis) {
+                        if (++i >= argc) throw std::runtime_error("--light-direction requires three components.");
+                        const auto value = argument(i).u8string();
+                        size_t consumed = 0;
+                        options.renderSettings.lightDirection[axis] = std::stof(value, &consumed);
+                        if (consumed != value.size()) throw std::runtime_error("Invalid light direction component.");
+                    }
+                }
                 else if (option == "--depth-view") options.renderSettings.display = RenderDisplay::Depth;
                 else if (option == "--shadow-map") options.renderSettings.display = RenderDisplay::ShadowMap;
                 else if (option == "--frustum-preview") options.renderSettings.frustumPreview = true;
                 else if (option == "--render-smoke") options.renderSmoke = true;
-                else if (option == "--shadow-bias" || option == "--max-distance" || option == "--lod-pixels") {
+                else if (option == "--shadow-bias" || option == "--shadow-coverage" || option == "--max-distance" || option == "--lod-pixels") {
                     if (++i >= argc) throw std::runtime_error("Missing render setting value.");
                     const auto value = argument(i).u8string(); size_t consumed = 0;
                     const float number = std::stof(value, &consumed);
                     if (consumed != value.size()) throw std::runtime_error("Invalid render setting value.");
                     if (option == "--shadow-bias") options.renderSettings.shadowBias = number;
+                    else if (option == "--shadow-coverage") options.renderSettings.shadowCoverage = number;
                     else if (option == "--lod-pixels") { options.renderSettings.lodPixels = number; options.renderSettings.adaptiveLod = true; }
                     else options.renderSettings.maxDistance = number;
                 }
@@ -346,7 +364,7 @@ int main(int argc, char** argv)
                     if (option == "--cube") useCube = true;
                     else if (option == "--mock") useMock = true;
                     else if (option == "--fixture") {
-                        if (++i >= argc) throw std::runtime_error("--fixture requires triangle, plane, grid, shadow or occlusion.");
+                        if (++i >= argc) throw std::runtime_error("--fixture requires a scene name.");
                         fixture = parseFixtureName(argument(i));
                     }
                     else if (!option.empty() && option.u8string().front() != '-') inputPath = option;
@@ -354,10 +372,11 @@ int main(int argc, char** argv)
                 }
             }
             validateRenderSettings(options.renderSettings);
-            if (options.visibilitySmoke && (options.smokeTest || options.renderSmoke || options.lodDepthSmoke ||
+            if ((options.visibilitySmoke || options.shadowCullSmoke) &&
+                ((options.visibilitySmoke && options.shadowCullSmoke) || options.smokeTest || options.renderSmoke || options.lodDepthSmoke ||
                                             !options.hierarchyRoundtripPath.empty() ||
                                             !options.benchmarkPath.empty() || !options.saveConfigPath.empty()))
-                throw std::runtime_error("Run visibility acceptance separately from other test or export modes.");
+                throw std::runtime_error("Run each visibility acceptance check separately from other test or export modes.");
             if (options.smokeTest && options.renderSettings.culling != CullMode::Off)
                 throw std::runtime_error("Use --visibility-smoke for GPU culling checks.");
             if (options.smokeTest && options.renderSettings.adaptiveLod)

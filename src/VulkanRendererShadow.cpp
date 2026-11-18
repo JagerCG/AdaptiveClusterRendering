@@ -14,8 +14,12 @@ void VulkanRenderer::setRenderSettings(const RenderSettings& settings)
 {
     validateRenderSettings(settings);
     if (settings.culling != renderSettings_.culling) {
-        visibilityActive_ = false; hiZMips_.clear(); visStats_ = {};
+        cameraList_.active = false; hiZMips_.clear(); cameraList_.stats = {};
     }
+    if (settings.lightDirection != renderSettings_.lightDirection || settings.shadowCoverage != renderSettings_.shadowCoverage)
+        lightFitRevision_ = 0;
+    if (settings.shadowCulling != renderSettings_.shadowCulling || !lightFitRevision_)
+        lightList_.active = false;
     renderSettings_ = settings; // display/camera/light changes never invalidate generated geometry
 }
 

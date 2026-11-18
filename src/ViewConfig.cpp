@@ -17,7 +17,7 @@ void validate(const ViewConfig& v)
     validateBenchmarkOptions(v.sampling);
     OrbitCamera({0, 0, 0}, 1).setPose(v.pose);
     const bool disk = v.source == SceneSourceKind::Acr || v.source == SceneSourceKind::Obj;
-    if (v.source < SceneSourceKind::Obj || v.source > SceneSourceKind::Occlusion || disk == v.sourcePath.empty() ||
+    if (v.source < SceneSourceKind::Obj || v.source > SceneSourceKind::ShadowCasters || disk == v.sourcePath.empty() ||
         v.width < 1 || v.height < 1 || v.width > 32768 || v.height > 32768 || !validEdgeSegments(v.segments) ||
         v.selection < 0 || v.selection > 3 || v.boundsId < -1 || v.heightPreset < -1 || v.heightPreset > 6 ||
         ((v.heightPreset == -1) != !v.heightPath.empty()))
@@ -67,6 +67,8 @@ LoadedScene loadViewScene(const ViewConfig& v)
         return makeFixtureSceneWithStats(TessellationFixture::ShadowStage);
     case SceneSourceKind::Occlusion:
         return makeFixtureSceneWithStats(TessellationFixture::Occlusion);
+    case SceneSourceKind::ShadowCasters:
+        return makeFixtureSceneWithStats(TessellationFixture::ShadowCasters);
     }
     throw std::runtime_error("Unknown saved scene.");
 }
@@ -82,7 +84,7 @@ ViewConfig loadViewConfig(const std::filesystem::path& path)
     int version, kind, display;
     std::string source, height;
     key(in, "ACR_VIEW");
-    if (!(in >> version) || (version != 1 && version != 2))
+    if (!(in >> version) || version < 1 || version > 3)
         throw std::runtime_error("Unsupported view configuration version.");
     key(in, "source");
     in >> kind >> std::quoted(source);
@@ -110,6 +112,10 @@ ViewConfig loadViewConfig(const std::filesystem::path& path)
         key(in, "culling");
         in >> mode >> v.render.showHiZ >> v.render.hiZMip >> v.render.showRejectedBounds;
         v.render.culling = static_cast<CullMode>(mode);
+    }
+    if (version >= 3) {
+        key(in, "shadow_cull");
+        in >> v.render.shadowCulling >> v.render.shadowCoverage;
     }
     if (!in || (in >> std::ws).peek() != std::char_traits<char>::eof())
         throw std::runtime_error("Malformed view configuration.");
@@ -151,7 +157,7 @@ void saveViewConfig(const std::filesystem::path& path, const ViewConfig& v)
         out.imbue(std::locale::classic());
         out << std::setprecision(std::numeric_limits<float>::max_digits10);
         const auto& s = v.render;
-        out << "ACR_VIEW 2\nsource " << int(v.source) << ' ' << std::quoted(relative(v.sourcePath)) << "\nwindow "
+        out << "ACR_VIEW 3\nsource " << int(v.source) << ' ' << std::quoted(relative(v.sourcePath)) << "\nwindow "
             << v.width << ' ' << v.height << ' ' << v.hidePanel << "\ncamera " << v.pose.x << ' ' << v.pose.y << ' '
             << v.pose.z << "\nlod " << v.level << ' ' << s.adaptiveLod << ' ' << s.lodPixels << ' ' << s.levelColors
             << "\ndraw " << v.clusterColors << ' ' << s.groupColors << ' ' << v.bounds << ' ' << v.boundsId << ' '
@@ -161,7 +167,7 @@ void saveViewConfig(const std::filesystem::path& path, const ViewConfig& v)
             << v.displacement.enabled << ' ' << v.displacement.amplitude << "\nheight " << v.heightPreset << ' '
             << std::quoted(relative(v.heightPath)) << "\nsample " << v.sampling.warmup << ' ' << v.sampling.samples
             << "\nculling " << static_cast<uint32_t>(s.culling) << ' ' << s.showHiZ << ' ' << s.hiZMip << ' '
-            << s.showRejectedBounds << '\n';
+            << s.showRejectedBounds << "\nshadow_cull " << s.shadowCulling << ' ' << s.shadowCoverage << '\n';
         out.close();
         std::filesystem::rename(temp, path);
     }

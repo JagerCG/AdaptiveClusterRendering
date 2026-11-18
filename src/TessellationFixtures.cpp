@@ -80,24 +80,35 @@ SceneData makeTessellationFixture(TessellationFixture fixture)
         validateScene(scene);
         return scene;
     }
-    case TessellationFixture::ShadowStage: {
+    case TessellationFixture::ShadowStage:
+    case TessellationFixture::ShadowCasters: {
         SceneData scene;
         scene.maxTrianglesPerCluster = 2;
-        const auto quad = [&](float halfSize, float z, bool receiver) {
+        const auto quad = [&](glm::vec3 center, float halfSize, bool receiver) {
             const uint32_t base = static_cast<uint32_t>(scene.mesh.vertices.size());
             const glm::vec2 corners[] = {{0,0}, {1,0}, {1,1}, {0,1}};
             for (const auto& uv : corners) {
                 scene.mesh.positionIds.push_back(static_cast<uint32_t>(scene.mesh.vertices.size()));
                 // The receiver samples neutral at UV (0,0) for Waves/Mound.
-                scene.mesh.vertices.push_back({{(2*uv.x-1)*halfSize, (2*uv.y-1)*halfSize, z}, {0,0,1}, receiver ? glm::vec2(0) : uv});
+                scene.mesh.vertices.push_back({center + glm::vec3((2.f * uv - 1.f) * halfSize, 0),
+                                               {0,0,1}, receiver ? glm::vec2(0) : uv});
             }
             const auto first = static_cast<uint32_t>(scene.mesh.indices.size());
             scene.mesh.indices.insert(scene.mesh.indices.end(), {base,base+1,base+2, base,base+2,base+3});
-            scene.dataset.clusters.push_back({first,6,{-halfSize,-halfSize,z},{halfSize,halfSize,z}});
+            const glm::vec3 halfExtent{halfSize, halfSize, 0};
+            scene.dataset.clusters.push_back({first, 6, center - halfExtent, center + halfExtent});
         };
-        quad(1.8f, -.65f, true);
-        quad(.6f, .3f, false);
+        if (fixture == TessellationFixture::ShadowStage) {
+            quad({0,0,-.65f}, 1.8f, true);
+            quad({0,0,.3f}, .6f, false);
+        } else {
+            quad({0,0,-.7f}, 1, true);            // 0: on-screen receiver
+            quad({1.08f,1.44f,1.1f}, .28f, false); // 1: above the camera, on the receiver's light ray
+            quad({-1.65f,-.5f,-.7f}, .16f, false); // 2 and 3: camera-visible side markers
+            quad({1.65f,-.5f,-.7f}, .16f, false);
+        }
         scene.dataset.indices = scene.mesh.indices;
+        if (fixture == TessellationFixture::ShadowCasters) buildMeshHierarchy(scene, 0);
         validateScene(scene);
         return scene;
     }

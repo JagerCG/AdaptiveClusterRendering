@@ -1,5 +1,7 @@
 # M2 Part 2 and rendering integration
 
+For the completed eight-module pipeline and the current shadow demo, see the [M2 acceptance record](milestone-2-acceptance.md).
+
 The [01/02 hierarchy handoff](../README.md#m2-mesh-hierarchy-and-acr-v2) implements mesh preprocessing and resident storage. The [03/06 handoff](../README.md#m2-gpu-lod-and-camera-depth) adds GPU-selected geometry, saved views and the sampled main camera depth for module 04. The notes below describe the earlier integration checkpoint.
 
 The [04/05/07 integration](../README.md#m2-gpu-visibility-drawing-and-subdivision) connects GPU frustum, hierarchy and Hi-Z visibility to camera drawing and displaced geometry. It includes exact-depth comparisons and an independent check of every Hi-Z level.
@@ -113,9 +115,9 @@ synchronization contract.
 The CPU preview uses the same bound on the generated path. This validates its
 meaning without claiming that the future GPU culling consumer has been integrated.
 
-## Remaining team dependencies
+## Dependencies at the initial integration checkpoint
 
-| Interface | Still required |
+| Interface | Work identified at that checkpoint |
 | --- | --- |
 | 01 -> 02 | Coarse/fine geometry, hierarchy IDs, errors and bounds; agree a versioned persistent format before extending ACR v1. |
 | 03/04 -> 07 | GPU-selected cluster IDs/count, work expansion and capacity/overflow rules, indirect dispatch and producer/consumer synchronization. Current generation inputs are CPU-authored. |

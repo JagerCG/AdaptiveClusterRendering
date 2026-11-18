@@ -53,18 +53,19 @@ void VulkanRenderer::createVisibilityResources()
     si.bindingCount = 5;
     si.pBindings = bindings;
     check(vkCreateDescriptorSetLayout(device_, &si, nullptr, &visSetLayout_), "Visibility descriptor layout");
-    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
-                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
+    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.poolSizeCount = 2;
     pi.pPoolSizes = sizes;
-    pi.maxSets = 1;
+    pi.maxSets = 2;
     check(vkCreateDescriptorPool(device_, &pi, nullptr, &visPool_), "Visibility descriptor pool");
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = visPool_;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &visSetLayout_;
-    check(vkAllocateDescriptorSets(device_, &ai, &visSet_), "Visibility descriptor set");
+    for (auto* list : {&cameraList_, &lightList_})
+        check(vkAllocateDescriptorSets(device_, &ai, &list->set), "Visibility descriptor set");
     const VkDescriptorSetLayout layouts[] = {sceneLayout_, visSetLayout_};
     const VkPushConstantRange range{stages, 0, sizeof(CullParams)};
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -103,8 +104,10 @@ void VulkanRenderer::destroyVisibilityResources()
 {
     destroyBuffer(hiZ_);
     destroyBuffer(visInput_);
-    destroyBuffer(visResult_);
-    destroyBuffer(visWork_);
+    for (auto* list : {&cameraList_, &lightList_}) {
+        destroyBuffer(list->result);
+        destroyBuffer(list->work);
+    }
     vkDestroyQueryPool(device_, visQueries_, nullptr);
     vkDestroyPipeline(device_, visCull_, nullptr);
     vkDestroyPipeline(device_, hiZBuild_, nullptr);
@@ -134,36 +137,46 @@ void VulkanRenderer::growVisibilityBuffer(Buffer& buffer, VkDeviceSize& capacity
 
 void VulkanRenderer::selectVisibility(const OrbitCamera& camera, bool generated, bool wireframe)
 {
-    visibilityActive_ = false;
-    visStats_ = {};
+    cameraList_.active = false;
+    cameraList_.stats = {};
     hiZMips_.clear();
     const auto mode = renderSettings_.culling;
     if (mode == CullMode::Off) return;
+    const auto vp = camera.viewProjection(float(extent_.width) / extent_.height);
+    const bool useDepth = usesHiZ(mode) && !wireframe && renderSettings_.display != RenderDisplay::ShadowMap &&
+                          !renderSettings_.frustumPreview && renderSettings_.maxDistance == 0 && cameraDepth_.view &&
+                          cameraDepth_.solid && cameraDepth_.sceneRevision == sceneGpu_.sceneRevision &&
+                          cameraDepth_.extent.width == extent_.width && cameraDepth_.extent.height == extent_.height &&
+                          cameraDepth_.viewProjection == vp && depthInputs_.candidates == candidateRevision_ &&
+                          depthInputs_.generated == generated &&
+                          (!generated || (depthInputs_.segments == edgeSegments_ && depthInputs_.height == heightRevision() &&
+                                          sameDisplacement(depthInputs_.displacement, displacement_)));
+    buildVisibilityList(cameraList_, vp, extent_, generated ? plannedDisplacementBound() : 0,
+                        mode == CullMode::Hierarchy || mode == CullMode::HiZ, useDepth ? cameraDepth_.frame : 0);
+}
+
+void VulkanRenderer::buildVisibilityList(VisibilityList& list, const glm::mat4& vp, VkExtent2D extent, float padding,
+                                         bool hierarchy, uint64_t depthFrame)
+{
+    list.active = false;
+    list.stats = {};
     const auto start = std::chrono::steady_clock::now();
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, UINT64_MAX), "Wait before culling");
     const auto& h = sceneGpu_.hierarchy;
     CullParams p{};
-    p.vp = camera.viewProjection(float(extent_.width) / extent_.height);
+    p.vp = vp;
     p.candidates = static_cast<uint32_t>(selection_.ranges.size());
     p.firstCluster = sceneGpu_.firstCluster;
     p.firstIndex = static_cast<uint32_t>((sceneGpu_.indexOffset - h.allIndexOffset) / sizeof(uint32_t));
     p.inputBase = static_cast<uint32_t>(sceneGpu_.lodRecordOffset / 4);
     p.stride = sceneGpu_.lodCommands ? 6 : 1;
     p.nodeWord = h.nodeWord;
-    p.nodes = h.nodeCount;
-    p.useHierarchy = (mode == CullMode::Hierarchy || mode == CullMode::HiZ) && p.nodes;
-    p.width = extent_.width;
-    p.height = extent_.height;
-    p.padding = generated ? plannedDisplacementBound() : 0;
-    // Previous depth is trustworthy for a static cut only when the camera and actual surface still agree.
-    p.useDepth = usesHiZ(mode) && !wireframe && renderSettings_.display != RenderDisplay::ShadowMap &&
-                 !renderSettings_.frustumPreview && renderSettings_.maxDistance == 0 && cameraDepth_.view &&
-                 cameraDepth_.solid && cameraDepth_.sceneRevision == sceneGpu_.sceneRevision &&
-                 cameraDepth_.extent.width == p.width && cameraDepth_.extent.height == p.height &&
-                 cameraDepth_.viewProjection == p.vp && depthInputs_.candidates == candidateRevision_ &&
-                 depthInputs_.generated == generated &&
-                 (!generated || (depthInputs_.segments == edgeSegments_ && depthInputs_.height == heightRevision() &&
-                                 sameDisplacement(depthInputs_.displacement, displacement_)));
+    p.nodes = hierarchy ? h.nodeCount : 0;
+    p.useHierarchy = p.nodes != 0;
+    p.width = extent.width;
+    p.height = extent.height;
+    p.padding = padding;
+    p.useDepth = depthFrame != 0;
     uint64_t pyramidWords = 0;
     if (p.useDepth) {
         for (uint32_t w = p.width, hgt = p.height;; w = (w + 1) / 2, hgt = (hgt + 1) / 2) {
@@ -179,9 +192,9 @@ void VulkanRenderer::selectVisibility(const OrbitCamera& camera, bool generated,
     const uint64_t resultBytes = (record + 6ull * p.candidates) * 4;
     growVisibilityBuffer(hiZ_, hiZCapacity_, std::max<uint64_t>(4, 4 * pyramidWords),
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    growVisibilityBuffer(visResult_, visResultCapacity_, resultBytes,
+    growVisibilityBuffer(list.result, list.resultCapacity, resultBytes,
                          VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, coherent);
-    growVisibilityBuffer(visWork_, visWorkCapacity_, std::max<uint64_t>(4, 4 * selection_.triangleCount()), 0,
+    growVisibilityBuffer(list.work, list.workCapacity, std::max<uint64_t>(4, 4 * selection_.triangleCount()), 0,
                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!sceneGpu_.lodCommands) {
         growVisibilityBuffer(visInput_, visInputCapacity_, std::max<uint64_t>(4, 4ull * p.candidates), 0, coherent);
@@ -199,14 +212,16 @@ void VulkanRenderer::selectVisibility(const OrbitCamera& camera, bool generated,
                                               {},
                                               {sceneGpu_.lodCommands ? sceneGpu_.lodCommands : visInput_.handle, 0,
                                                sceneGpu_.lodCommands ? lodResultSize_ : visInputCapacity_},
-                                              {visResult_.handle, 0, resultBytes},
-                                              {visWork_.handle, 0, visWorkCapacity_}};
-    const VkDescriptorImageInfo image{shadowSampler_, depthView_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+                                              {list.result.handle, 0, resultBytes},
+                                              {list.work.handle, 0, list.workCapacity}};
+    const VkDescriptorImageInfo image{shadowSampler_, depthFrame ? depthView_ : shadowView_,
+                                      depthFrame ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet writes[5]{};
     for (uint32_t i = 0; i < 5; ++i) {
         auto& w = writes[i];
         w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = visSet_;
+        w.dstSet = list.set;
         w.dstBinding = i;
         w.descriptorCount = 1;
         w.descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -222,10 +237,10 @@ void VulkanRenderer::selectVisibility(const OrbitCamera& camera, bool generated,
     memoryBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
                   VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    vkCmdFillBuffer(cmd, visResult_.handle, 0, 24 * 4, 0);
+    vkCmdFillBuffer(cmd, list.result.handle, 0, 24 * 4, 0);
     memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    const VkDescriptorSet sets[]{sceneGpu_.clusterSet, visSet_};
+    const VkDescriptorSet sets[]{sceneGpu_.clusterSet, list.set};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, visLayout_, 0, 2, sets, 0, nullptr);
     if (visQueries_) {
         vkCmdResetQueryPool(cmd, visQueries_, 0, 3);
@@ -286,33 +301,33 @@ void VulkanRenderer::selectVisibility(const OrbitCamera& camera, bool generated,
     ClusterSelection surviving{sceneGpu_.sceneRevision, ClusterSelectionMode::Explicit, {}};
     surviving.clusterIds.reserve(p.candidates);
     void* mapped = nullptr;
-    check(vkMapMemory(device_, visResult_.memory, 0, resultBytes, 0, &mapped), "Map visibility result");
+    check(vkMapMemory(device_, list.result.memory, 0, resultBytes, 0, &mapped), "Map visibility result");
     const auto* words = static_cast<const uint32_t*>(mapped);
-    visStats_.candidates = p.candidates;
-    visStats_.visible = words[0];
-    visStats_.frustum = words[17];
-    visStats_.hierarchy = words[18];
-    visStats_.occluded = words[19] + words[20];
-    visStats_.testedNodes = words[21];
-    visStats_.skippedNodes = words[22];
+    list.stats.candidates = p.candidates;
+    list.stats.visible = words[0];
+    list.stats.frustum = words[17];
+    list.stats.hierarchy = words[18];
+    list.stats.occluded = words[19] + words[20];
+    list.stats.testedNodes = words[21];
+    list.stats.skippedNodes = words[22];
     const uint32_t triangles = words[1];
     if (words[0] <= p.candidates)
         for (uint32_t i = 0; i < words[0]; ++i)
             surviving.clusterIds.push_back(words[record + 6ull * i]);
-    vkUnmapMemory(device_, visResult_.memory);
-    if (uint64_t(visStats_.visible) + visStats_.frustum + visStats_.hierarchy + visStats_.occluded != p.candidates)
+    vkUnmapMemory(device_, list.result.memory);
+    if (uint64_t(list.stats.visible) + list.stats.frustum + list.stats.hierarchy + list.stats.occluded != p.candidates)
         throw std::runtime_error("GPU visibility reason counts do not cover the candidate list.");
-    visibleSelection_ =
+    list.selection =
         resolveClusterSelection(drawClusters_, sceneGpu_.indexCount, sceneGpu_.sceneRevision, surviving);
-    if (visibleSelection_.triangleCount() != triangles)
+    if (list.selection.triangleCount() != triangles)
         throw std::runtime_error("GPU visible geometry count disagrees with its IDs.");
-    visibleScene_ = sceneGpu_;
-    visibleScene_.lodCommands = visResult_.handle;
-    visibleScene_.lodRecordOffset = record * 4;
-    visibleScene_.lodTriangleWork = visWork_.handle;
-    visibleScene_.lodWorkAllocation = visWork_.allocationBytes;
-    visStats_.mipCount = static_cast<uint32_t>(hiZMips_.size());
-    visStats_.depthFrame = p.useDepth ? cameraDepth_.frame : 0;
+    list.scene = sceneGpu_;
+    list.scene.lodCommands = list.result.handle;
+    list.scene.lodRecordOffset = record * 4;
+    list.scene.lodTriangleWork = list.work.handle;
+    list.scene.lodWorkAllocation = list.work.allocationBytes;
+    list.stats.mipCount = depthFrame ? static_cast<uint32_t>(hiZMips_.size()) : 0;
+    list.stats.depthFrame = depthFrame;
     if (visQueries_) {
         uint64_t t[3];
         check(vkGetQueryPoolResults(device_, visQueries_, 0, 3, sizeof(t), t, sizeof(uint64_t),
@@ -320,9 +335,9 @@ void VulkanRenderer::selectVisibility(const OrbitCamera& camera, bool generated,
               "Visibility timestamps");
         const uint64_t mask = timestampValidBits_ == 64 ? UINT64_MAX : (uint64_t{1} << timestampValidBits_) - 1;
         const auto ms = [&](int a, int b) { return double((t[b] - t[a]) & mask) * timestampPeriod_ / 1.e6; };
-        visStats_.gpuCullMs = ms(1, 2);
-        if (p.useDepth) visStats_.gpuPyramidMs = ms(0, 1);
+        list.stats.gpuCullMs = ms(1, 2);
+        if (p.useDepth) list.stats.gpuPyramidMs = ms(0, 1);
     }
-    visStats_.cpuMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    visibilityActive_ = true;
+    list.stats.cpuMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    list.active = true;
 }

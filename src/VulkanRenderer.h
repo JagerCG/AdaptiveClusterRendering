@@ -25,6 +25,7 @@ struct SourceDrawStats {
     float boundsPadding = 0;
     uint64_t shadowTriangles = 0;
     uint32_t shadowDrawCalls = 0, visibleClusters = 0;
+    uint32_t shadowCandidates = 0, shadowCasters = 0;
     RenderDisplay display = RenderDisplay::Shaded;
     bool shadowPass = false;
 };
@@ -71,9 +72,11 @@ public:
     void setHierarchyLevel(uint32_t level);
     void selectLod(const OrbitCamera& camera, float padding = 0, bool force = false);
     void selectVisibility(const OrbitCamera& camera, bool generated, bool wireframe);
-    const VisibilityStats& visibilityStats() const { return visStats_; }
-    const ResolvedClusterSelection& mainSelection() const { return visibilityActive_ ? visibleSelection_ : selection_; }
-    const SceneGpuData& mainScene() const { return visibilityActive_ ? visibleScene_ : sceneGpu_; }
+    const VisibilityStats& visibilityStats() const { return cameraList_.stats; }
+    const VisibilityStats& shadowVisibilityStats() const { return lightList_.stats; }
+    const ResolvedClusterSelection& mainSelection() const { return cameraList_.active ? cameraList_.selection : selection_; }
+    const ResolvedClusterSelection& shadowSelection() const { return lightList_.active ? lightList_.selection : selection_; }
+    const SceneGpuData& mainScene() const { return cameraList_.active ? cameraList_.scene : sceneGpu_; }
     std::vector<float> readHiZ(); // all valid mips in order for acceptance
     const LodSelectionStats& lodStats() const { return lodStats_; }
     const CameraDepthView& cameraDepth() const { return cameraDepth_; }
@@ -121,6 +124,20 @@ private:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkDeviceSize allocationBytes = 0;
     };
+
+    struct VisibilityList {
+        bool active = false;
+        VisibilityStats stats;
+        ResolvedClusterSelection selection;
+        SceneGpuData scene;
+        Buffer result, work;
+        VkDeviceSize resultCapacity = 0, workCapacity = 0;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+    const SceneGpuData& shadowScene() const { return lightList_.active ? lightList_.scene : sceneGpu_; }
+    void buildVisibilityList(VisibilityList& list, const glm::mat4& vp, VkExtent2D extent, float padding,
+                             bool hierarchy, uint64_t depthFrame);
+    void prepareShadowPass(bool generated, bool forceCulling);
 
     struct SwapchainImage {
         VkImageView view = VK_NULL_HANDLE;
@@ -236,9 +253,10 @@ private:
     VkPipeline lodPipeline_ = VK_NULL_HANDLE;
     VkQueryPool lodQueries_ = VK_NULL_HANDLE;
     ResolvedClusterSelection selection_;
-    SceneGpuData visibleScene_;
-    ResolvedClusterSelection visibleSelection_;
-    bool visibilityActive_ = false, separateShadowGeometry_ = false;
+    VisibilityList cameraList_, lightList_;
+    bool separateShadowGeometry_ = false;
+    uint64_t lightCandidateRevision_ = 0, lightFitRevision_ = 0;
+    float lightPadding_ = 0;
     uint64_t candidateRevision_ = 0;
     struct DepthInputs {
         uint64_t candidates = 0, height = 0;
@@ -246,14 +264,12 @@ private:
         DisplacementSettings displacement{};
         bool generated = false;
     } depthInputs_;
-    VisibilityStats visStats_;
     struct Mip { uint32_t width, height, offset; };
     std::vector<Mip> hiZMips_;
-    Buffer hiZ_, visInput_, visResult_, visWork_;
-    VkDeviceSize hiZCapacity_ = 0, visInputCapacity_ = 0, visResultCapacity_ = 0, visWorkCapacity_ = 0;
+    Buffer hiZ_, visInput_;
+    VkDeviceSize hiZCapacity_ = 0, visInputCapacity_ = 0;
     VkDescriptorSetLayout visSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool visPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet visSet_ = VK_NULL_HANDLE;
     VkPipelineLayout visLayout_ = VK_NULL_HANDLE;
     VkPipeline hiZBuild_ = VK_NULL_HANDLE, visCull_ = VK_NULL_HANDLE;
     VkQueryPool visQueries_ = VK_NULL_HANDLE;

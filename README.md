@@ -6,7 +6,9 @@ A C++ and Vulkan renderer for experimenting with cluster-based geometry. Milesto
 
 ## Development handoff
 
-Start with the [01/02 mesh hierarchy demo](#m2-mesh-hierarchy-and-acr-v2) to inspect the resident geometry. The [03/06 demo](#m2-gpu-lod-and-camera-depth) shows the GPU choosing detail per region, drawing that selection and publishing the main camera depth. The [shadow demo](docs/milestone-2-render-integration.md) covers the light view.
+The [M2 acceptance and demo guide](docs/milestone-2-acceptance.md) covers modules 01–08, including a one-minute off-camera shadow demo, a saved Suzanne view and measured results. From the repository root, launch `build/Release/AdaptiveClusterRendering.exe --view-config assets/views/m2-shadow-casters.acrview` after building Release.
+
+The [01/02 mesh hierarchy demo](#m2-mesh-hierarchy-and-acr-v2) shows the resident geometry. The [03/06 demo](#m2-gpu-lod-and-camera-depth) shows the GPU choosing detail per region, drawing that selection and publishing the main camera depth.
 
 The [04/05/07 demo](#m2-gpu-visibility-drawing-and-subdivision) shows how GPU visibility changes the geometry submitted for source drawing or subdivision. It includes a stage with a known hidden surface.
 
@@ -20,7 +22,7 @@ with wireframe comparison, Step 6 GPU height-map displacement, and Step 7 fixed-
 measurement, report export and a complete standalone demo.
 
 Start with the [M2 Part 2 demo guide](docs/milestone-2-part2-demo.md) for the short
-walkthrough, measurement commands and remaining team integration. Recorded Release
+walkthrough and the original standalone measurement commands. Recorded Part 2 Release
 results are in the [performance snapshot](docs/milestone-2-part2-performance.md).
 
 ## Presentations
@@ -147,7 +149,7 @@ Use `--cull hiz-flat` to test each cluster against the depth pyramid without vis
 
 **Inspect the result.** Enable **Cluster bounds** to see surviving bounds. **Show rejected bounds (orange)** draws rejected boxes through the foreground in shaded mode. **Show Hi-Z mip** displays the selected depth level. Mip 0 contains the previous matching camera depth. Each coarser pixel stores the farthest covered depth across its source pixels, including background. Odd-sized rows and columns contribute through the final 1 × 1 level. A camera move, resize, changed source selection or changed displaced surface withdraws the previous depth until a matching solid frame has been drawn. During that frame, frustum and hierarchy culling continue.
 
-**Follow the geometry.** Module 04 takes the ordered list from a manual level, an explicit selection or GPU LOD. It tests parent bounds from roots to leaves, then tests surviving cluster bounds. The bounds expand by the maximum travel permitted by the height map and amplitude. The GPU compacts surviving IDs, indexed draw commands and triangle work in candidate order. Module 05 can draw those commands directly. With module 07 enabled, subdivision consumes the same triangle work and an indirect dispatch, and 05 draws the resulting mesh. The light pass retains the pre-camera candidate list and its displaced surface, including off-camera casters. The CPU reads back counts and IDs for exact output sizing, diagnostics and debug colors.
+**Follow the geometry.** Module 04 takes the ordered list from a manual level, an explicit selection or GPU LOD. It tests parent bounds from roots to leaves, then tests surviving cluster bounds. The bounds expand by the maximum travel permitted by the height map and amplitude. The GPU compacts surviving IDs, indexed draw commands and triangle work in candidate order. Module 05 can draw those commands directly. With module 07 enabled, subdivision consumes the same triangle work and an indirect dispatch, and 05 draws the resulting mesh. Module 08 starts from the same pre-camera candidates. Its default submits all of them. **Cull casters in light view** tests their padded bounds against the light frustum and submits the survivors, including off-camera casters that can shadow the scene. The CPU reads back counts and IDs for exact output sizing, diagnostics and debug colors.
 
 **Repeat a measurement.** Save the view or use a fixed command line as below. The report records candidate and visible counts, rejection reasons, Hi-Z depth provenance, drawn geometry, CPU wait time and separate GPU times for the pyramid, culling, generation and rendering. The full-camera-pass depth comparison and numerical readbacks run outside measured intervals.
 
@@ -500,9 +502,11 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/VulkanRenderer.cpp`, `shaders/` | Upload geometry and cluster descriptors; depth-tested mesh and SSBO-driven bounds. In cluster color mode, draw each index range with its own color. |
 | `src/Viewer.cpp`, `src/OrbitCamera.cpp` | Manage model loading, camera controls, and the Model panel. |
 | `src/VulkanRendererLod.cpp`, `shaders/select_lod.comp` | Select and compact a camera-dependent regional hierarchy cut, indirect draws and subdivision work. |
+| `src/VulkanRendererVisibility.cpp`, `shaders/cull_visibility.comp` | Compact per-view cluster IDs, draw commands and subdivision work. The camera can use hierarchical Hi-Z. The light uses its own frustum. |
+| `src/VulkanRendererShadow.cpp`, `src/RenderPlanning.cpp` | Directional shadow map, fitted light projection, coverage control and depth readback. |
 | `src/ViewConfig.*`, `shaders/camera_depth.frag` | Save and replay viewer configurations, and display the stored main camera depth. |
 
-The viewer starts with the original geometry. Both manual levels and automatic per-region GPU selection feed visibility, drawing and subdivision. Module 04 uses the matching camera depth and conservative displacement bounds. The shadow pass retains its own caster list.
+The viewer starts with the original geometry. Both manual levels and automatic per-region GPU selection feed visibility, drawing and subdivision. Module 04 uses the matching camera depth and conservative displacement bounds. Module 08 draws from its own light-view caster list. The shadow and main passes can use different source or subdivided geometry selections in the same frame.
 
 ## Credits
 

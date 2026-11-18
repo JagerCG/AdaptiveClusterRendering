@@ -112,6 +112,7 @@ add_executable(AdaptiveClusterRendering
     tests/RenderIntegrationChecks.cpp
     tests/LodDepthChecks.cpp
     tests/VisibilityChecks.cpp
+    tests/ShadowCasterChecks.cpp
     tests/CameraDepthProbe.cpp
     src/VulkanRenderer.h
     src/SceneGpuData.h
@@ -200,12 +201,17 @@ if(BUILD_TESTING)
         file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu")
         add_test(NAME gpu-lod-camera-depth COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --lod-depth-smoke)
         add_test(NAME gpu-visibility-pipeline COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --visibility-smoke)
+        add_test(NAME gpu-shadow-caster-pipeline COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --shadow-cull-smoke)
+        add_test(NAME gpu-shadow-caster-report COMMAND "${CMAKE_COMMAND}" "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>"
+                 "-DASSET=${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ShadowCasterReport.cmake")
         add_test(NAME gpu-visibility-report COMMAND "${CMAKE_COMMAND}" "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>"
                  "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/VisibilityReport.cmake")
         add_test(NAME gpu-view-replay COMMAND "${CMAKE_COMMAND}" "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>"
                  "-DASSET=${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ViewReplay.cmake")
-        set_tests_properties(gpu-lod-camera-depth gpu-view-replay gpu-visibility-pipeline gpu-visibility-report PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS "gpu"
+        set_tests_properties(gpu-lod-camera-depth gpu-view-replay gpu-visibility-pipeline gpu-visibility-report
+            gpu-shadow-caster-pipeline gpu-shadow-caster-report PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS "gpu"
             FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         add_test(NAME gpu-hierarchy-roundtrip COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
                  --hierarchy-roundtrip "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/hierarchy.acr")
