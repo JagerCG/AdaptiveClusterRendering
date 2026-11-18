@@ -12,6 +12,34 @@
 
 namespace {
 void expect(bool condition, const char* message) { if (!condition) throw std::runtime_error(message); }
+void checkCameraPlaneDepth(const CameraDepthView& info, const std::vector<float>& pixels, double z)
+{
+    const auto w = info.extent.width, h = info.extent.height;
+    expect(info.view && info.sampler && info.solid && info.frame &&
+               info.layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL && pixels.size() == size_t(w) * h,
+           "Incomplete camera depth handoff.");
+    const glm::dmat4 vp = info.viewProjection, inverse = glm::inverse(vp);
+    for (double x : {-.3, 0., .3})
+        for (double y : {-.3, 0., .3}) {
+            auto clip = vp * glm::dvec4(x, y, z, 1);
+            clip /= clip.w;
+            const uint32_t px = uint32_t((clip.x * .5 + .5) * w), py = uint32_t((clip.y * .5 + .5) * h);
+            expect(px < w && py < h, "Plane sample outside viewport.");
+            glm::dvec4 ray{2 * (px + .5) / w - 1, 2 * (py + .5) / h - 1, 0, 1};
+            auto a = inverse * ray;
+            ray.z = 1;
+            auto b = inverse * ray;
+            a /= a.w;
+            b /= b.w;
+            const auto hit = a + (b - a) * ((z - a.z) / (b.z - a.z));
+            const auto projected = vp * hit;
+            expect(std::abs(pixels[size_t(py) * w + px] - projected.z / projected.w) < 3e-5,
+                   "Camera depth disagrees with projected plane.");
+        }
+    expect(std::all_of(pixels.begin(), pixels.end(), [](float d) { return std::isfinite(d) && d >= 0 && d <= 1; }),
+           "Invalid camera depth pixel.");
+}
+
 void checkPlaneDepth(const std::vector<float>& depth, const glm::mat4& light, float z)
 {
     const auto inverse = glm::inverse(light);
@@ -42,14 +70,14 @@ int runHierarchyChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& s
                sameSceneData(scene, restored.scene),
            "Expected a verified, multi-level ACR v2.");
     RenderSettings settings;
-    settings.shadows = settings.groupColors = true;
+    settings.shadows = true;
     r.setRenderSettings(settings);
     const auto draw = [&](bool generated, bool wire) {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         for (;;) {
             glfwPollEvents();
             expect(std::chrono::steady_clock::now() < until, "Hierarchy frame timed out.");
-            if (r.prepareFrame(window) && r.drawFrame(camera, false, true, -1, generated, wire, nullptr)) break;
+            if (r.prepareFrame(window) && r.drawFrame(camera, true, true, -1, generated, wire, nullptr)) break;
         }
     };
     std::vector<std::vector<float>> images;
@@ -122,9 +150,12 @@ int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window)
         ++frames;
     };
     render(false); // default shadows OFF must bind a valid initialized descriptor
+    renderer.checkCameraDepthSampling();
+    checkCameraPlaneDepth(renderer.cameraDepth(), renderer.readCameraDepth(), 0);
     settings.shadows = true; render(false);
     checkPlaneDepth(renderer.readShadowDepth(), renderer.lastLightMatrix(), 0);
     render(true);
+    checkCameraPlaneDepth(renderer.cameraDepth(), renderer.readCameraDepth(), .35);
     const auto displaced = renderer.readShadowDepth();
     checkPlaneDepth(displaced, renderer.lastLightMatrix(), .35f);
     expect(renderer.lastRecordedDraw().shadowTriangles == 32 && renderer.lastRecordedDraw().triangles == 32,
@@ -141,6 +172,8 @@ int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window)
     for (auto mode : {RenderDisplay::Depth, RenderDisplay::ShadowMap, RenderDisplay::Shaded}) {
         settings.display = mode; render(true, true, renderer.supportsWireframe());
         expect(renderer.lastRecordedDraw().shadowTriangles == 32, "Display change lost displaced shadow casters.");
+        if (mode == RenderDisplay::ShadowMap) expect(!renderer.cameraDepth().view, "Shadow map published camera depth.");
+        else if (renderer.supportsWireframe()) expect(!renderer.cameraDepth().solid, "Wireframe published solid camera depth.");
         if (mode == RenderDisplay::ShadowMap)
             expect(renderer.lastRecordedDraw().meshDrawCalls == 0 && renderer.lastRecordedDraw().boundsInstances == 0,
                    "Shadow map display should show light depth, not camera meshes/bounds.");
@@ -157,6 +190,9 @@ int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window)
     for (bool generated : {false, true}) for (bool colors : {false, true}) {
         render(generated, colors);
         const auto depth = renderer.readShadowDepth();
+        const auto cameraDepth = renderer.readCameraDepth();
+        expect(std::all_of(cameraDepth.begin(), cameraDepth.end(), [](float d) { return d == 1; }),
+               "Empty selection left stale camera depth.");
         expect(renderer.lastRecordedDraw().triangles == 0 && renderer.lastRecordedDraw().shadowTriangles == 0 &&
                renderer.lastRecordedDraw().boundsInstances == 0, "Explicit empty selection drew geometry.");
         expect(std::all_of(depth.begin(), depth.end(), [](float d) { return d == 1; }), "Empty selection retained stale shadows.");
@@ -175,7 +211,11 @@ int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window)
         expect(renderer.clusterSelection().ranges[0].sourceClusterId == 3 &&
                renderer.clusterSelection().ranges[1].sourceClusterId == 0, "Original cluster IDs/order changed.");
     }
+    const auto priorExtent = renderer.cameraDepth().extent;
     glfwSetWindowSize(window, 700, 510); render(true);
+    expect(renderer.cameraDepth().extent.width != priorExtent.width || renderer.cameraDepth().extent.height != priorExtent.height,
+           "Camera depth retained its old size.");
+    renderer.checkCameraDepthSampling();
     renderer.setDisplacement({false, .35f}); render(true);
     renderer.setClusterSelection({renderer.sceneGpuData().sceneRevision, ClusterSelectionMode::All, {}});
     render(false); const auto original = renderer.readShadowDepth();

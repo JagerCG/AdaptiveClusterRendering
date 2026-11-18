@@ -6,7 +6,7 @@ function(run_view)
         message(FATAL_ERROR "Viewer failed (${rc}): ${out}\n${err}")
     endif()
 endfunction()
-run_view("${ASSET}" --lod-pixels 96 --level-colors --shadows --depth-view --subdivision 2 --displacement 0.08 --hide-ui
+run_view("${ASSET}" --selection first-last --cluster-colors --shadows --depth-view --subdivision 2 --displacement 0.08 --hide-ui
     --save-view "${view}" --benchmark "${DIR}/live-view.json" --benchmark-warmup 1 --benchmark-samples 3)
 run_view(--view-config "${view}" --verify-gpu --benchmark "${DIR}/restored-view.json")
 file(READ "${DIR}/live-view.json" live)
@@ -29,20 +29,16 @@ string(JSON selectCount GET "${replay}" counts selected_triangles)
 string(JSON drawCount GET "${replay}" counts drawn_triangles)
 math(EXPR expected "4 * ${selectCount}")
 if(NOT expected EQUAL drawCount OR selectCount GREATER_EQUAL 3936)
-    message(FATAL_ERROR "Mixed-level GPU subdivision did not feed the draw")
+    message(FATAL_ERROR "Fixed-list GPU subdivision did not feed the draw")
 endif()
-foreach(key gpu_lod level_colors camera_depth_available camera_depth_solid lod_id_readback verification_readback_excluded)
+foreach(key cluster_colors camera_depth_available camera_depth_solid verification_readback_excluded)
     string(JSON enabled GET "${replay}" flags ${key})
     if(NOT enabled)
         message(FATAL_ERROR "Missing restored ${key}")
     endif()
 endforeach()
-string(JSON excludes_readback GET "${replay}" flags readback_excluded)
-if(excludes_readback)
-    message(FATAL_ERROR "Adaptive frames must account for the CPU count and ID readback")
-endif()
 string(JSON timing GET "${replay}" flags gpu_timestamps_supported)
-foreach(metric cpu_frame cpu_lod_and_wait gpu_lod gpu_main gpu_shadow)
+foreach(metric cpu_frame gpu_main gpu_shadow)
     if(metric MATCHES "^gpu_" AND NOT timing)
         continue()
     endif()
@@ -51,6 +47,29 @@ foreach(metric cpu_frame cpu_lod_and_wait gpu_lod gpu_main gpu_shadow)
         message(FATAL_ERROR "Missing measured ${metric} samples")
     endif()
 endforeach()
+# Replay a saved v3 view from the full M2 renderer. Its camera GPU choices have retired.
+set(oldView "${DIR}/legacy-view.acrview")
+file(WRITE "${oldView}" [=[ACR_VIEW 3
+source 9 ""
+window 640 480 1
+camera 0 0 1.5
+lod 0 1 96 1
+draw 1 0 0 -1 0 0 0
+light 1 .002 .6 .8 1
+preview 0 0
+geometry 1 2 1 .08
+height 0 ""
+sample 1 3
+culling 3 1 1 1
+shadow_cull 1 .3
+]=])
+run_view(--view-config "${oldView}" --benchmark "${DIR}/legacy-view.json")
+file(READ "${DIR}/legacy-view.json" old)
+string(JSON cameraTriangles GET "${old}" counts drawn_triangles)
+string(JSON lightTriangles GET "${old}" counts shadow_triangles)
+if(NOT cameraTriangles EQUAL 32 OR NOT lightTriangles EQUAL 16)
+    message(FATAL_ERROR "Incorrect fixed-selection or shadow count after legacy replay")
+endif()
 file(READ "${view}" valid)
 set(invalid "${DIR}/invalid-view.acrview")
 file(WRITE "${invalid}" "${valid}unexpected-field\n")
@@ -59,4 +78,4 @@ execute_process(COMMAND "${VIEWER}" --view-config "${invalid}" --save-view "${DI
 if(rc EQUAL 0 OR NOT err MATCHES "Malformed view configuration")
     message(FATAL_ERROR "An invalid preset must be rejected before drawing")
 endif()
-message(STATUS "Saved view reproduced the camera, LOD IDs, draw counts and enabled passes.")
+message(STATUS "Saved view reproduced the camera, ordered cluster IDs, draw counts and enabled passes.")

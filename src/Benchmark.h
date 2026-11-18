@@ -14,8 +14,7 @@ struct TimingSummary {
 struct BenchmarkSample {
     uint64_t generationRevision = 0;
     std::optional<double> cpuGenerateMs, gpuGenerateMs, gpuRenderMs, gpuMainMs, gpuShadowMs;
-    std::optional<double> cpuFrameMs, cpuLodMs, gpuLodMs;
-    std::optional<double> cpuCullMs, gpuCullMs, gpuPyramidMs;
+    std::optional<double> cpuFrameMs;
     std::optional<double> cpuShadowCullMs, gpuShadowCullMs;
 };
 // Export metadata is grouped by type; every numeric field names its unit.

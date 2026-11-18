@@ -37,9 +37,7 @@ void checkPath(const std::filesystem::path& path)
 void validateViewScene(const ViewConfig& view, const SceneData& scene)
 {
     const auto level = sceneLevel(scene, view.level);
-    const auto clusters = view.render.adaptiveLod && !scene.hierarchy.levels.empty()
-                              ? scene.dataset.clusters.size() + scene.hierarchy.coarse.clusters.size()
-                              : level.clusterCount;
+    const auto clusters = level.clusterCount;
     if (view.boundsId >= 0 && size_t(view.boundsId) >= clusters)
         throw std::runtime_error("Saved bounds ID exceeds the selected scene.");
 }
@@ -65,8 +63,6 @@ LoadedScene loadViewScene(const ViewConfig& v)
         return makeFixtureSceneWithStats(TessellationFixture::ClusterGrid);
     case SceneSourceKind::ShadowStage:
         return makeFixtureSceneWithStats(TessellationFixture::ShadowStage);
-    case SceneSourceKind::Occlusion:
-        return makeFixtureSceneWithStats(TessellationFixture::Occlusion);
     case SceneSourceKind::ShadowCasters:
         return makeFixtureSceneWithStats(TessellationFixture::ShadowCasters);
     }
@@ -84,7 +80,7 @@ ViewConfig loadViewConfig(const std::filesystem::path& path)
     int version, kind, display;
     std::string source, height;
     key(in, "ACR_VIEW");
-    if (!(in >> version) || version < 1 || version > 3)
+    if (!(in >> version) || version < 1 || version > 4)
         throw std::runtime_error("Unsupported view configuration version.");
     key(in, "source");
     in >> kind >> std::quoted(source);
@@ -92,10 +88,21 @@ ViewConfig loadViewConfig(const std::filesystem::path& path)
     in >> v.width >> v.height >> v.hidePanel;
     key(in, "camera");
     in >> v.pose.x >> v.pose.y >> v.pose.z;
-    key(in, "lod");
-    in >> v.level >> v.render.adaptiveLod >> v.render.lodPixels >> v.render.levelColors;
-    key(in, "draw");
-    in >> v.clusterColors >> v.render.groupColors >> v.bounds >> v.boundsId >> v.wire >> v.selection >> display;
+    if (version < 4) {
+        bool automatic = false, colors = false, groups = false;
+        float budget = 0;
+        key(in, "lod");
+        in >> v.level >> automatic >> budget >> colors;
+        const bool restoreBase = automatic || (kind != int(SceneSourceKind::Acr) && v.level != 0);
+        key(in, "draw");
+        in >> v.clusterColors >> groups >> v.bounds >> v.boundsId >> v.wire >> v.selection >> display;
+        if (restoreBase) { v.level = 0; v.boundsId = -1; }
+    } else {
+        key(in, "level");
+        in >> v.level;
+        key(in, "draw");
+        in >> v.clusterColors >> v.bounds >> v.boundsId >> v.wire >> v.selection >> display;
+    }
     key(in, "light");
     in >> v.render.shadows >> v.render.shadowBias >> v.render.lightDirection.x >> v.render.lightDirection.y >>
         v.render.lightDirection.z;
@@ -107,11 +114,11 @@ ViewConfig loadViewConfig(const std::filesystem::path& path)
     in >> v.heightPreset >> std::quoted(height);
     key(in, "sample");
     in >> v.sampling.warmup >> v.sampling.samples;
-    if (version >= 2) {
-        uint32_t mode = 0;
+    if (version == 2 || version == 3) {
+        uint32_t mode = 0, mip = 0;
+        bool preview = false, rejected = false;
         key(in, "culling");
-        in >> mode >> v.render.showHiZ >> v.render.hiZMip >> v.render.showRejectedBounds;
-        v.render.culling = static_cast<CullMode>(mode);
+        in >> mode >> preview >> mip >> rejected;
     }
     if (version >= 3) {
         key(in, "shadow_cull");
@@ -157,17 +164,16 @@ void saveViewConfig(const std::filesystem::path& path, const ViewConfig& v)
         out.imbue(std::locale::classic());
         out << std::setprecision(std::numeric_limits<float>::max_digits10);
         const auto& s = v.render;
-        out << "ACR_VIEW 3\nsource " << int(v.source) << ' ' << std::quoted(relative(v.sourcePath)) << "\nwindow "
+        out << "ACR_VIEW 4\nsource " << int(v.source) << ' ' << std::quoted(relative(v.sourcePath)) << "\nwindow "
             << v.width << ' ' << v.height << ' ' << v.hidePanel << "\ncamera " << v.pose.x << ' ' << v.pose.y << ' '
-            << v.pose.z << "\nlod " << v.level << ' ' << s.adaptiveLod << ' ' << s.lodPixels << ' ' << s.levelColors
-            << "\ndraw " << v.clusterColors << ' ' << s.groupColors << ' ' << v.bounds << ' ' << v.boundsId << ' '
+            << v.pose.z << "\nlevel " << v.level
+            << "\ndraw " << v.clusterColors << ' ' << v.bounds << ' ' << v.boundsId << ' '
             << v.wire << ' ' << v.selection << ' ' << int(s.display) << "\nlight " << s.shadows << ' ' << s.shadowBias
             << ' ' << s.lightDirection.x << ' ' << s.lightDirection.y << ' ' << s.lightDirection.z << "\npreview "
             << s.frustumPreview << ' ' << s.maxDistance << "\ngeometry " << v.generated << ' ' << v.segments << ' '
             << v.displacement.enabled << ' ' << v.displacement.amplitude << "\nheight " << v.heightPreset << ' '
             << std::quoted(relative(v.heightPath)) << "\nsample " << v.sampling.warmup << ' ' << v.sampling.samples
-            << "\nculling " << static_cast<uint32_t>(s.culling) << ' ' << s.showHiZ << ' ' << s.hiZMip << ' '
-            << s.showRejectedBounds << "\nshadow_cull " << s.shadowCulling << ' ' << s.shadowCoverage << '\n';
+            << "\nshadow_cull " << s.shadowCulling << ' ' << s.shadowCoverage << '\n';
         out.close();
         std::filesystem::rename(temp, path);
     }

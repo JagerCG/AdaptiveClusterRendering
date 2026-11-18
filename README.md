@@ -6,11 +6,9 @@ A C++ and Vulkan renderer for experimenting with cluster-based geometry. Milesto
 
 ## Development handoff
 
-The [M2 acceptance and demo guide](docs/milestone-2-acceptance.md) covers modules 01–08, including a one-minute off-camera shadow demo, a saved Suzanne view and measured results. From the repository root, launch `build/Release/AdaptiveClusterRendering.exe --view-config assets/views/m2-shadow-casters.acrview` after building Release.
+The `main` branch runs M2 Part 2 (02 storage and 07 subdivision/displacement) and Part 3 (05 rasterization, 06 depth/material display and timings, 08 shadows). OBJ imports use the M1 flat clusters. The complete pre-split M2 implementation is preserved on [Qingyao_Tian](https://github.com/JagerCG/AdaptiveClusterRendering/tree/Qingyao_Tian).
 
-The [01/02 mesh hierarchy demo](#m2-mesh-hierarchy-and-acr-v2) shows the resident geometry. The [03/06 demo](#m2-gpu-lod-and-camera-depth) shows the GPU choosing detail per region, drawing that selection and publishing the main camera depth.
-
-The [04/05/07 demo](#m2-gpu-visibility-drawing-and-subdivision) shows how GPU visibility changes the geometry submitted for source drawing or subdivision. It includes a stage with a known hidden surface.
+From the repository root, launch `build/Release/AdaptiveClusterRendering.exe --view-config assets/views/m2-shadow-casters.acrview` for the off-camera shadow demo. [Demo and acceptance checks](docs/milestone-2-acceptance.md)
 
 The [M2 Part 2 foundation and integration contract](docs/milestone-2-part2-contract.md)
 defines the working interfaces for storage and compute-based tessellation/displacement,
@@ -92,86 +90,11 @@ Preprocess and validate without creating a Vulkan device or a window:
 
 `--verify-gpu` compares the resident vertex, index, cluster and hierarchy buffers against the CPU records byte for byte. The [M1 interface contract](docs/milestone-1-interface.md) describes the flat ACR v1 layout.
 
-## M2 mesh hierarchy and ACR v2
+## Stored geometry and camera depth
 
-1. Launch the viewer with Suzanne. Compare **Cluster colors** and **Group colors** at L0. Group colors give adjacent clusters belonging to the same parent one color.
-2. Open **Mesh hierarchy** and choose a **Geometry level**. Keep the camera fixed and toggle **Wireframe** to compare the silhouette and edges. The panel shows the active triangle and cluster counts, node count, model-space error bound and original build time for that level.
-3. Use **Save + verify ACR...**, then **Reload saved ACR**. This restores the whole hierarchy and preserves the current camera, displayed level and cluster selection. **Storage** shows the serialized size, GPU payload and timings.
-4. Run `--hierarchy-roundtrip build/suzanne-check.acr` with the bundled OBJ to draw every level, read all resident records back and compare fixed-view light-depth images before and after reloading. Use `--geometry-level 2 --wireframe` to start a manual demo on a coarser level.
+Flat input saves as ACR v1. Existing ACR v2 files retain their stored levels, coarse indices, cluster bounds and child links across loading, device upload and saving. **Stored ACR geometry levels** selects one resident level from a multilevel cache. Opening an OBJ builds the original flat cluster partition.
 
-With the default capacity of 64 triangles per cluster, the bundled Suzanne has 3,936, 3,460, 1,826, 992, 498, 264 and 224 triangles at its protected levels L0–L6. Two distant levels contain 77 and 28 triangles. L0 and L2 make a clear same-camera wireframe comparison.
-
-Preprocessing grows connected groups across shared position edges and simplifies each group by collapsing edges onto existing vertices. It protects open boundaries, inter-group borders, split UV/normal seams and the outermost vertices along the axes and diagonals. A protected vertex can absorb an interior neighbor while staying in place. A collapse also has to keep each replacement face close to the removed vertex. The distance limit starts at 0.25% of the group's bounding-box diagonal at L1 and doubles at each coarser level. Each parent records its child IDs, conservative descendant bounds and a model-space error bound including the maximum inherited error. Disconnected components can form separate roots.
-
-Opening the OBJ builds the current hierarchy. To update an older saved ACR, open its source OBJ and use **Save + verify ACR...** to write a new file. Opening the old ACR directly displays the geometry it already contains.
-
-ACR v2 files containing distant levels set header flag bit 0 and store each level's maximum projected diameter in its final 32-bit word. Zero identifies a protected level. Earlier viewers reject this flag. The current viewer reads flat v1, ordinary v2 and v2 with distant levels.
-
-ACR v2 stores the original v1 payload and adds coarse index/cluster arrays, level records, hierarchy nodes and child IDs. A versioned 72-byte header gives all counts. ACR v1 still loads as one level, and the fixed mock retains its original format. All levels are uploaded once. `MeshHierarchy.h` defines the 32-byte level and 48-byte node records. `SceneGpuData::hierarchy` gives their word offsets in the storage buffer, the total geometry counts and the shared index-buffer offset. Each node covers contiguous global cluster IDs. Its children index the next finer level. The last level holds the roots. The viewer switches its active index range on the same buffers.
-
-## M2 GPU LOD and camera depth
-
-1. Start the viewer with the first command below. In **Mesh hierarchy**, **Automatic GPU LOD** lets the GPU choose a level independently for each region. **Level colors** shows the chosen levels on the mesh. The matching legend counts clusters at each level.
-2. At the initial 960 × 640 camera position, set **Allowed screen error** to 0 to draw all 3,936 Suzanne triangles. At 96 pixels the same view selects 1,640 triangles across two levels. Scroll over the model to zoom, then watch the colors and counts change. Turn off **Automatic GPU LOD** to compare against a fixed level. The counts refer to the source geometry before visibility culling and subdivision.
-3. Under **Rendering and shadows**, switch **Shaded** to **Depth (near is bright)**. Rotate the model to see its main camera depth change. **Shadow map (light view)** displays the separate light-space image. Use **Save view...** and **Open view...** to replay the asset, camera and render settings. F1 hides and restores the panel.
-4. The remaining commands save that starting view, measure consecutive frames from it and run the focused GPU checks. Reports include the camera matrix, source IDs, per-level counts, drawn triangles and CPU frame time. When timestamp queries are supported, GPU time is reported separately for selection, generation (when enabled), the main pass and shadows (when enabled).
-
-On the RTX 4070 Laptop GPU at 960 × 640, the 96-pixel acceptance run selects 3,518 source triangles at its near camera pose, 1,640 at the initial pose and 264 at its far pose. At the initial pose, subdivision with two segments per edge draws 6,560 triangles when camera culling is off. The test checks every generated triangle against the selected source patches.
-
-**Extreme-distance demo.** The scroll wheel covers 1.15–256 model radii. Open the preset below for a frontal view with shadows on and displacement off. Scroll away to see L7 and L8 in **Mesh hierarchy**. **Model bounds** gives the longer projected side of the fully framed mesh, including any displacement allowance. L7 first becomes eligible at 14 pixels and L8 at 6 pixels. Both still have to fit the selected screen-error budget. To inspect their geometry up close, turn off **Automatic GPU LOD**, choose L7 or L8 and zoom in. [Equal-magnification comparison and shadow map](docs/measurements/suzanne-distance-lod.png)
-
-```powershell
-.\build\Release\AdaptiveClusterRendering.exe --view-config assets/views/suzanne-distance-lod.acrview
-```
-
-Each distant mesh merges vertices in a coarse grid within one protected region and retains existing vertex attributes. With automatic LOD, its last protected geometry supplies the shadow caster. At the preset pose the camera draws 77 triangles and the light draws 224. At maximum zoom-out those counts are 28 and 224. The shadow-map display makes the light's silhouette visible at either distance.
-
-To inspect the crown, open `assets/views/suzanne-lod-crown.acrview` with **Open view...**. The preset faces Suzanne straight on with displacement off. Switch **Allowed screen error** between 0 and 96 to compare full and adaptive detail. The largest outline change across the central crown fell from 6 pixels to 0 at 96 pixels. The GPU test also checks the symmetry of the whole outline and the interior crown height from above. [Before and after at the right crown](docs/measurements/suzanne-lod-crown.png)
-
-```powershell
-.\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors
-.\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors --save-view build/suzanne-gpu-lod.acrview
-.\build\Release\AdaptiveClusterRendering.exe --view-config build/suzanne-gpu-lod.acrview --benchmark build/suzanne-gpu-lod.json --benchmark-warmup 5 --benchmark-samples 20
-ctest --test-dir build -C Debug -R "gpu-(lod-camera-depth|suzanne-lod-shape|view-replay)$" --output-on-failure
-```
-
-The selector projects each node's accumulated geometric error using the nearest depth of its conservative bounds and the vertical focal length in pixels. A node that crosses the near plane refines until it reaches a leaf. The compute shader emits global cluster IDs, indexed draw commands and a triangle work list consumed directly by subdivision. The CPU waits for a compact ID/count mirror for debug colors, bounds and exact output sizing. Ordinary interaction reuses an unchanged selection. The benchmark forces a fresh GPU selection for each measured frame.
-
-**Camera depth for module 04.** After a submitted shaded or camera-depth frame, `VulkanRenderer::cameraDepth()` exposes the D32 image view and sampler, the viewport extent, the producing view-projection matrix, frame serial and scene revision. Vulkan device depth runs from 0 at the near plane to 1 at the far plane, with empty pixels cleared to 1. Sample in `VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL` on the same graphics/compute queue before the next frame overwrites it. Check `view` and `solid` before treating it as an occluder. A resize or scene replacement invalidates the handle, the light-only display publishes no camera image, and wireframe has partial coverage. A compute-sampling test reads the attachment before and after resizing. Building a Hi-Z pyramid and culling clusters from it belong to module 04.
-
-## M2 GPU visibility, drawing and subdivision
-
-Start the first command and open **GPU visibility**. The foreground wall covers the middle patch. Another patch sticks out on the right, and a fourth is outside the starting view. Change the culling mode and compare the counts below. Click **Reset camera** to switch to an oblique view and reveal the middle patch.
-
-```powershell
-.\build\Release\AdaptiveClusterRendering.exe --fixture occlusion --cull hiz --cluster-colors --subdivision 2 --shadows
-.\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors --cull hiz --subdivision 2 --displacement 0.08
-ctest --test-dir build -C Debug -R "gpu-visibility-(pipeline|report)" --output-on-failure
-```
-
-The table uses the occlusion stage at its initial 960 × 640 view, with two segments per edge and shadows enabled.
-
-| Culling mode | Surviving clusters | Source triangles for the camera | Generated triangles drawn | Shadow triangles |
-| --- | ---: | ---: | ---: | ---: |
-| Off | 16 | 32 | 128 | 128 |
-| Frustum | 12 | 24 | 96 | 128 |
-| Hierarchy + frustum | 12 | 24 | 96 | 128 |
-| Hierarchy + frustum + Hi-Z | 8 | 16 | 64 | 128 |
-| Frustum + Hi-Z (per cluster) | 8 | 16 | 64 | 128 |
-
-Use `--cull hiz-flat` to test each cluster against the depth pyramid without visiting hierarchy nodes. The `hiz` mode can reject a whole branch from one parent test.
-
-**Inspect the result.** Enable **Cluster bounds** to see surviving bounds. **Show rejected bounds (orange)** draws rejected boxes through the foreground in shaded mode. **Show Hi-Z mip** displays the selected depth level. Mip 0 contains the previous matching camera depth. Each coarser pixel stores the farthest covered depth across its source pixels, including background. Odd-sized rows and columns contribute through the final 1 × 1 level. A camera move, resize, changed source selection or changed displaced surface withdraws the previous depth until a matching solid frame has been drawn. During that frame, frustum and hierarchy culling continue.
-
-**Follow the geometry.** Module 04 takes the ordered list from a manual level, an explicit selection or GPU LOD. It tests parent bounds from roots to leaves, then tests surviving cluster bounds. The bounds expand by the maximum travel permitted by the height map and amplitude. The GPU compacts surviving IDs, indexed draw commands and triangle work in candidate order. Module 05 can draw those commands directly. With module 07 enabled, subdivision consumes the same triangle work and an indirect dispatch, and 05 draws the resulting mesh. Module 08 starts from the candidates before camera culling and expands each automatic distant proxy to its protected caster clusters. Its default submits all casters. **Cull casters in light view** tests their padded bounds against the light frustum and submits the survivors, including off-camera casters that can shadow the scene. The CPU reads back counts and IDs for exact output sizing, diagnostics and debug colors.
-
-**Repeat a measurement.** Save the view or use a fixed command line as below. The report records candidate and visible counts, rejection reasons, Hi-Z depth provenance, drawn geometry, CPU wait time and separate GPU times for the pyramid, culling, generation and rendering. The full-camera-pass depth comparison and numerical readbacks run outside measured intervals.
-
-```powershell
-.\build\Release\AdaptiveClusterRendering.exe --fixture occlusion --cull hiz --subdivision 2 --displacement 0.08 --shadows --benchmark build/visibility-hiz.json --benchmark-warmup 5 --benchmark-samples 20
-```
-
-On an RTX 4070 Laptop GPU, a Release run at 960 × 640 with these settings took a median 0.016 ms for the hierarchy and cluster tests and 0.032 ms to build Hi-Z. The median frame time, including forced regeneration and CPU waits, was 2.35 ms with culling off and 3.67 ms with hierarchical Hi-Z. On this 16-cluster fixture the extra overhead outweighed the geometry savings. In the Suzanne preset, the 96-pixel LOD threshold selects 64 clusters across two levels. Camera Hi-Z keeps 62, and subdivision turns their 1,636 source triangles into 6,544 drawn triangles.
+The main pass draws the fixed cluster selection. `VulkanRenderer::cameraDepth()` exposes its sampled D32 image, extent, view-projection matrix, scene revision and frame serial to a future visibility pass. Empty pixels have depth 1. The camera-depth display shows near surfaces as bright. Directional shadow rendering can filter the same input independently in light space. The shadow pass also accepts off-camera geometry.
 
 ## M2 Part 2: storage diagnostics demo
 
@@ -483,7 +406,7 @@ rejection, cancellation and safe report validation. Four `gpu-benchmark-*` cases
 parse the actual JSON for all/partial/empty/source runs, verify sample counts,
 selection order and generation revisions, and perform readbacks outside the batch.
 
-The GPU LOD and camera depth case checks a four-cluster grid, then compares Suzanne cuts with an independent CPU traversal. It checks depth against projected plane samples, exercises a compute shader that samples the depth image, and covers displaced geometry, empty coverage and resizing. The replay case saves a configuration, restarts the viewer and checks identical cluster IDs, camera and triangle counts.
+The render integration test samples camera depth. The replay test compares the restored camera, fixed cluster IDs and draw counts. The shadow tests compare entire depth maps for all casters and filtered casters, including a patch outside the camera view.
 
 Run the full suite with Vulkan synchronization validation in Debug. Run it again with the Release binary for the configuration used in demos.
 
@@ -502,12 +425,12 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/ObjLoader.cpp`, `src/MeshSource.h` | Read OBJ positions, normals and UVs into an indexed mesh. Supply a face normal for corners that lack one. |
 | `src/ClusterBuilder.cpp` | Group edge-connected triangles on the CPU. Each cluster has at most 64 triangles, a contiguous index range, and a model-space bounding box. |
 | `src/QemClusterBuilder.*` | Experimental QEM-based ordering within baseline clusters and internal-edge score measurement. Geometry is unchanged; this library/test path is not selected by the viewer. |
-| `src/MeshHierarchy.*`, `src/QemSimplifier.*` | Connected region grouping, constrained QEM contractions, reclustering, hierarchy construction and validation. |
+| `src/MeshHierarchy.*` | Address and validate previously stored ACR levels, bounds and child links. |
 | `src/SceneData.*` | Shared scene handoff, fixed mock, strict validation, OBJ/ACR loading, and versioned persistence. |
 | `src/SceneDiagnostics.*` | Runtime source/file summaries, CPU preparation timing, payload byte counts and exact save/reload verification. Leaves ACR v1 unchanged. |
 | `src/TessellationFixtures.*` | Authored triangle, continuous-UV plane and four-cluster grid for module 07 correctness checks. |
 | `src/ClusterSelection.*` | Revision-bound All/Explicit selection, ordered source ranges and rejection of duplicate, invalid or stale IDs. |
-| `src/GeometryGenerationPlan.*` | Checked subdivision sizing and triangle address expansion for manual inputs. Adaptive inputs borrow their GPU work list. |
+| `src/GeometryGenerationPlan.*` | Check subdivision sizing and expand fixed ranges into triangle addresses. The shadow pass can supply device-generated work. |
 | `src/HeightField.*` | Linear height presets, PGM loading, displacement settings/bounds and CPU reference sampling. |
 | `src/ComputeGeometry.*`, `shaders/generate_geometry.comp` | GPU subdivision/displacement, height-image and generated-buffer ownership, cache identity, barriers and generation timings. |
 | `src/GeometryValidation.*` | Independent CPU reference checks for GPU readback; never generates the displayed geometry. |
@@ -515,12 +438,11 @@ For the CPU tests only: `ctest --test-dir build -C Debug -LE gpu --output-on-fai
 | `src/ClusterGpu.h`, `src/SceneGpuData.h` | Explicit 48-byte std430 cluster records and the non-owning GPU scene view. |
 | `src/VulkanRenderer.cpp`, `shaders/` | Upload geometry and cluster descriptors; depth-tested mesh and SSBO-driven bounds. In cluster color mode, draw each index range with its own color. |
 | `src/Viewer.cpp`, `src/OrbitCamera.cpp` | Manage model loading, camera controls, and the Model panel. |
-| `src/VulkanRendererLod.cpp`, `shaders/select_lod.comp` | Select and compact a camera-dependent regional hierarchy cut, indirect draws and subdivision work. |
-| `src/VulkanRendererVisibility.cpp`, `shaders/cull_visibility.comp` | Compact per-view cluster IDs, draw commands and subdivision work. The camera can use hierarchical Hi-Z. The light uses its own frustum. |
+| `src/VulkanRendererShadowCasters.cpp`, `shaders/select_shadow_casters.comp` | Filter padded cluster bounds against the directional light and compact caster draws and subdivision work. |
 | `src/VulkanRendererShadow.cpp`, `src/RenderPlanning.cpp` | Directional shadow map, fitted light projection, coverage control and depth readback. |
 | `src/ViewConfig.*`, `shaders/camera_depth.frag` | Save and replay viewer configurations, and display the stored main camera depth. |
 
-The viewer starts with the original geometry. Both manual levels and automatic per-region GPU selection feed visibility, drawing and subdivision. Module 04 uses the matching camera depth and conservative displacement bounds. Module 08 draws from its own light-view caster list. The shadow and main passes can use different source or subdivided geometry selections in the same frame.
+The main pass and shadow pass can draw different ordered cluster lists. Both consume source or displaced geometry.
 
 ## Credits
 

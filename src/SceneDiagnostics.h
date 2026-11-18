@@ -7,7 +7,7 @@
 #include <optional>
 
 // Runtime diagnostics only. None of these fields are serialized in ACR v1.
-enum class SceneSourceKind { Obj, Acr, Mock, Cube, Triangle, Plane, ClusterGrid, ShadowStage, Occlusion, ShadowCasters };
+enum class SceneSourceKind { Obj, Acr, Mock, Cube, Triangle, Plane, ClusterGrid, ShadowStage, ShadowCasters = 9 };
 
 struct SceneSourceInfo {
     SceneSourceKind kind = SceneSourceKind::Mock;

@@ -197,7 +197,7 @@ SceneData readScene(const std::filesystem::path& path)
                             readFloat(in), readU32(in)});
     }
     require(bool(flags & kDistantFootprints) == std::any_of(h.levels.begin(), h.levels.end(),
-                [](const LodLevel& l) { return l.maxDiameterPixels != 0; }), "Invalid ACR distant footprint flag.");
+                [](const AcrLevelRecord& l) { return l.maxDiameterPixels != 0; }), "Invalid ACR distant footprint flag.");
     h.nodes.reserve(nodes);
     for (uint32_t i = 0; i < nodes; ++i) {
         h.nodes.push_back({readVec3(in), readFloat(in), readVec3(in), readU32(in), readU32(in), readU32(in),
@@ -254,13 +254,9 @@ void validateScene(const SceneData& scene)
 
 SceneData buildScene(MeshSource mesh, uint32_t maxTrianglesPerCluster)
 {
-    const auto start = std::chrono::steady_clock::now();
     auto dataset = buildClusters(mesh, maxTrianglesPerCluster);
-    const auto ms = std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now() - start).count();
     SceneData result{std::move(mesh), std::move(dataset), maxTrianglesPerCluster, {}};
     validateScene(result);
-    buildMeshHierarchy(result, ms);
-    validateMeshHierarchy(result);
     return result;
 }
 

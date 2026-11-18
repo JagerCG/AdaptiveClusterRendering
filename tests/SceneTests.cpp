@@ -150,12 +150,9 @@ int main(int argc, char** argv)
             expect(obj.source.kind == SceneSourceKind::Obj && !obj.source.fileVersion &&
                    obj.source.fileBytes == std::filesystem::file_size(argv[2]), "OBJ source metadata mismatch.");
             const auto realSaved = saveSceneVerified(dir / "suzanne.acr", obj.scene);
-            const auto& h = obj.scene.hierarchy;
-            const uint64_t extra = 4*h.coarse.indices.size() + 48*h.coarse.clusters.size() +
-                32*h.levels.size() + 48*h.nodes.size() + 4*h.children.size();
-            expect(h.levels.size() > 1 && realSaved.fileBytes == 172576 + 8 + extra &&
-                   scenePayloadBytes(obj.scene).total() == 117232 + extra,
-                   "Unexpected Suzanne storage / GPU payload size.");
+            expect(obj.scene.hierarchy.levels.empty() && realSaved.fileBytes == 172576 &&
+                   scenePayloadBytes(obj.scene).total() == 117232,
+                   "Unexpected flat Suzanne storage or GPU payload size.");
             const auto cube = makeCubeSceneWithStats();
             expect(cube.source.kind == SceneSourceKind::Cube && !cube.source.fileBytes &&
                    !cube.source.fileVersion && cube.source.path.empty(), "Cube must be a generated source.");

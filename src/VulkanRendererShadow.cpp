@@ -13,9 +13,6 @@ constexpr VkImageSubresourceRange depthRange{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0,
 void VulkanRenderer::setRenderSettings(const RenderSettings& settings)
 {
     validateRenderSettings(settings);
-    if (settings.culling != renderSettings_.culling) {
-        cameraList_.active = false; hiZMips_.clear(); cameraList_.stats = {};
-    }
     if (settings.lightDirection != renderSettings_.lightDirection || settings.shadowCoverage != renderSettings_.shadowCoverage)
         lightFitRevision_ = 0;
     if (settings.shadowCulling != renderSettings_.shadowCulling || !lightFitRevision_)

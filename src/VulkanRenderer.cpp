@@ -68,9 +68,6 @@ constexpr uint32_t kShadowDebugFragmentShader[] = {
 constexpr uint32_t kCameraDepthFragmentShader[] = {
 #include "camera_depth.frag.inc"
 };
-constexpr uint32_t kHiZFragmentShader[] = {
-#include "show_hiz.frag.inc"
-};
 constexpr uint32_t kBoundsVertexShader[] = {
 #include "bounds.vert.inc"
 };
@@ -124,25 +121,16 @@ VulkanRenderer::~VulkanRenderer()
         vkDeviceWaitIdle(device_);
         compute_.reset(); // owns device resources; destroy before vkDestroyDevice
         shadowCompute_.reset();
-        destroyBuffer(lodResult_);
-        destroyBuffer(lodWork_);
-        vkDestroyQueryPool(device_, lodQueries_, nullptr);
-        vkDestroyPipeline(device_, lodPipeline_, nullptr);
-        vkDestroyPipelineLayout(device_, lodLayout_, nullptr);
-        vkDestroyDescriptorPool(device_, lodPool_, nullptr);
-        vkDestroyDescriptorSetLayout(device_, lodSetLayout_, nullptr);
         shutdownUi();
         destroySwapchain();
         destroyShadowResources();
         vkDestroyPipeline(device_, pipeline_, nullptr);
         vkDestroyPipeline(device_, wireframePipeline_, nullptr);
         vkDestroyPipeline(device_, boundsPipeline_, nullptr);
-        vkDestroyPipeline(device_, rejectedBoundsPipeline_, nullptr);
         vkDestroyPipeline(device_, shadowPipeline_, nullptr);
         vkDestroyPipeline(device_, shadowDebugPipeline_, nullptr);
         vkDestroyPipeline(device_, cameraDebugPipeline_, nullptr);
-        vkDestroyPipeline(device_, hiZDebugPipeline_, nullptr);
-        destroyVisibilityResources();
+        destroyShadowCasterResources();
         vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
         vkDestroyDescriptorPool(device_, scenePool_, nullptr);
         vkDestroyDescriptorSetLayout(device_, sceneLayout_, nullptr);
@@ -180,8 +168,7 @@ void VulkanRenderer::initialize(GLFWwindow* window)
     createDevice();
     selectDepthFormat();
     createFrameResources();
-    createLodResources();
-    createVisibilityResources();
+    createShadowCasterResources();
     createShadowResources();
     compute_ = std::make_unique<ComputeGeometry>();
     compute_->initialize(gpu_, device_, graphicsFamily_);
@@ -571,33 +558,6 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
                        scene.hierarchy.coarse.clusters.end());
     auto levels = scene.hierarchy.levels;
     if (levels.empty()) levels.push_back(sceneLevel(scene, 0));
-    std::vector<uint32_t> clusterLevels(allClusters.size());
-    for (uint32_t i = 0; i < levels.size(); ++i)
-        std::fill_n(clusterLevels.begin() + levels[i].firstCluster, levels[i].clusterCount, i);
-    auto lo = drawClusters.front().boundsMin, hi = drawClusters.front().boundsMax;
-    for (const auto& c : drawClusters) {
-        lo = glm::min(lo, c.boundsMin);
-        hi = glm::max(hi, c.boundsMax);
-    }
-    const auto firstDistant = std::find_if(levels.begin(), levels.end(), [](const LodLevel& l) { return l.maxDiameterPixels != 0; });
-    const auto firstDistantCluster = firstDistant == levels.end() ? packed.layout.totalClusters : firstDistant->firstCluster;
-    std::vector<ClusterSpan> casterSpans(allClusters.size() - firstDistantCluster);
-    for (auto it = firstDistant; it != levels.end(); ++it) {
-        for (uint32_t n = it->firstNode; n < it->firstNode + it->nodeCount; ++n) {
-            const auto& proxy = scene.hierarchy.nodes[n];
-            const auto& child = scene.hierarchy.nodes[scene.hierarchy.children[proxy.firstChild]];
-            const auto span = child.firstCluster < firstDistantCluster ? ClusterSpan{child.firstCluster, child.clusterCount}
-                                                                       : casterSpans[child.firstCluster - firstDistantCluster];
-            std::fill_n(casterSpans.begin() + (proxy.firstCluster - firstDistantCluster), proxy.clusterCount, span);
-        }
-    }
-    std::vector<uint32_t> groups(allClusters.size());
-    for (uint32_t i = 0; i < groups.size(); ++i)
-        groups[i] = i;
-    for (uint32_t i = 0; i < scene.hierarchy.nodes.size(); ++i) {
-        const auto& n = scene.hierarchy.nodes[i];
-        std::fill_n(groups.begin() + n.firstCluster, n.clusterCount, n.parent == kNoParent ? i : n.parent);
-    }
     const size_t vertexBytes = mesh.vertices.size() * sizeof(Vertex);
     const size_t indexBytes = indices.size() * sizeof(uint32_t);
     const size_t meshBytes = vertexBytes + indexBytes;
@@ -702,23 +662,10 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     sceneGpu_.activeLevel = sceneGpu_.firstCluster = 0;
     lightList_.active = separateShadowGeometry_ = false;
     lightList_.stats = {};
-    cameraList_.active = false;
-    cameraList_.stats = {};
-    hiZMips_.clear();
     ++candidateRevision_;
-    sceneGpu_.lodCommands = sceneGpu_.lodTriangleWork = VK_NULL_HANDLE;
-    sceneGpu_.lodRecordOffset = sceneGpu_.lodWorkAllocation = 0;
     cameraDepth_ = {};
-    lodStats_ = {};
-    clusterLevels_ = std::move(clusterLevels);
-    boundsMin_ = lo;
-    boundsMax_ = hi;
-    firstDistantCluster_ = firstDistantCluster;
-    distantCasterSpans_ = std::move(casterSpans);
-    regularCasters_ = {};
     residentClusters_ = std::move(allClusters);
     residentLevels_ = std::move(levels);
-    clusterGroups_ = std::move(groups);
     drawClusters_ = std::move(drawClusters);
     const VkDescriptorBufferInfo clusterInfo{clusterBuffer_.handle, 0, clusterBytes};
     VkWriteDescriptorSet write{};
@@ -752,12 +699,8 @@ void VulkanRenderer::setHierarchyLevel(uint32_t level)
     auto selection =
         resolveClusterSelection(active, l.indexCount, revision, {revision, ClusterSelectionMode::All, {}});
     sceneGpu_.activeLevel = level;
-    regularCasters_ = {};
-    cameraList_.active = lightList_.active = false;
+    lightList_.active = false;
     ++candidateRevision_;
-    sceneGpu_.lodCommands = sceneGpu_.lodTriangleWork = VK_NULL_HANDLE;
-    sceneGpu_.lodRecordOffset = sceneGpu_.lodWorkAllocation = 0;
-    lodStats_ = {};
     sceneGpu_.firstCluster = l.firstCluster;
     sceneGpu_.indexOffset = sceneGpu_.hierarchy.allIndexOffset + VkDeviceSize(l.firstIndex) * sizeof(uint32_t);
     sceneGpu_.indexCount = l.indexCount;
@@ -770,12 +713,11 @@ void VulkanRenderer::setHierarchyLevel(uint32_t level)
 
 void VulkanRenderer::setClusterSelection(const ClusterSelection& selection)
 {
-    if (sceneGpu_.activeLevel == kAdaptiveGeometryLevel) throw std::runtime_error("Manual lists require a manual geometry level.");
     // Resolve first so a rejected request preserves the active selection.
     auto next = resolveClusterSelection(drawClusters_, sceneGpu_.indexCount, sceneGpu_.sceneRevision, selection);
     if (!sameClusterSelection(selection_, next)) {
         compute_->invalidate();
-        cameraList_.active = lightList_.active = false;
+        lightList_.active = false;
         ++candidateRevision_;
     }
     selection_ = std::move(next);
@@ -783,7 +725,7 @@ void VulkanRenderer::setClusterSelection(const ClusterSelection& selection)
 
 bool VulkanRenderer::ensureGeneratedGeometry(bool force)
 {
-    const bool changed = generateFor(*compute_, mainScene(), mainSelection(), force);
+    const bool changed = generateFor(*compute_, sceneGpu_, selection_, force);
     prepareShadowPass(true, force);
     return changed;
 }
@@ -802,8 +744,7 @@ void VulkanRenderer::prepareShadowPass(bool generated, bool forceCulling)
     const bool shadowPass = renderSettings_.shadows || renderSettings_.display == RenderDisplay::ShadowMap;
     if (shadowPass && renderSettings_.shadowCulling) {
         if (forceCulling || !lightList_.active || lightCandidateRevision_ != candidateRevision_) {
-            buildVisibilityList(lightList_, lightMatrix_, {shadowMapSize, shadowMapSize}, padding, false, 0,
-                                shadowCandidates(), shadowSource());
+            selectShadowCasters(lightMatrix_, padding);
             lightCandidateRevision_ = candidateRevision_;
         }
     } else {
@@ -811,7 +752,7 @@ void VulkanRenderer::prepareShadowPass(bool generated, bool forceCulling)
         lightList_.stats = {};
     }
 
-    const auto& mainRanges = mainSelection().ranges;
+    const auto& mainRanges = selection_.ranges;
     const auto& lightRanges = shadowSelection().ranges;
     separateShadowGeometry_ = generated && shadowPass && &mainRanges != &lightRanges &&
         !std::equal(mainRanges.begin(), mainRanges.end(), lightRanges.begin(), lightRanges.end(),
@@ -878,10 +819,10 @@ void VulkanRenderer::setHeightField(const HeightField& field)
 
 void VulkanRenderer::verifyGeneratedGeometry(const SceneData& scene)
 {
-    const auto& selected = mainSelection();
+    const auto& selected = selection_;
     const auto& output = compute_->output();
     const uint64_t multiplier = uint64_t(edgeSegments_) * edgeSegments_;
-    if (!compute_->matches(mainScene(), selected, edgeSegments_, displacement_) ||
+    if (!compute_->matches(sceneGpu_, selected, edgeSegments_, displacement_) ||
         output.sourceRevision != sceneGpu_.sceneRevision || output.edgeSegments != edgeSegments_ ||
         output.sourceTriangleCount != selected.triangleCount() ||
         output.vertexCount != selected.indexCount * multiplier ||
@@ -987,8 +928,7 @@ void VulkanRenderer::verifyUpload(const SceneData& scene)
     const size_t indexBytes = packed.indices.size() * sizeof(uint32_t);
     const size_t meshBytes = vertexBytes + indexBytes;
     const size_t clusterBytes = packed.records.size()*sizeof(uint32_t);
-    auto active = sceneLevel(scene, sceneGpu_.lodCommands ? 0 : sceneGpu_.activeLevel);
-    if (sceneGpu_.lodCommands) { active.indexCount = packed.layout.totalIndices; active.clusterCount = packed.layout.totalClusters; }
+    const auto active = sceneLevel(scene, sceneGpu_.activeLevel);
     if (sceneGpu_.vertexCount != scene.mesh.vertices.size() || sceneGpu_.indexCount != active.indexCount ||
         sceneGpu_.clusterCount != active.clusterCount || sceneGpu_.firstCluster != active.firstCluster ||
         sceneGpu_.indexOffset != vertexBytes + VkDeviceSize(active.firstIndex)*4)
@@ -1168,14 +1108,10 @@ void VulkanRenderer::recreateSwapchain(int width, int height)
         wireframePipeline_ = VK_NULL_HANDLE;
         vkDestroyPipeline(device_, boundsPipeline_, nullptr);
         boundsPipeline_ = VK_NULL_HANDLE;
-        vkDestroyPipeline(device_, rejectedBoundsPipeline_, nullptr);
-        rejectedBoundsPipeline_ = VK_NULL_HANDLE;
         vkDestroyPipeline(device_, shadowDebugPipeline_, nullptr);
         shadowDebugPipeline_ = VK_NULL_HANDLE;
         vkDestroyPipeline(device_, cameraDebugPipeline_, nullptr);
         cameraDebugPipeline_ = VK_NULL_HANDLE;
-        vkDestroyPipeline(device_, hiZDebugPipeline_, nullptr);
-        hiZDebugPipeline_ = VK_NULL_HANDLE;
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         renderPass_ = VK_NULL_HANDLE;
         colorFormat_ = format.format;
@@ -1407,9 +1343,6 @@ void VulkanRenderer::createPipeline()
         rasterization.depthBiasSlopeFactor = -1.0f;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &boundsPipeline_),
               "vkCreateGraphicsPipelines(bounds)");
-        depthTest.depthTestEnable = VK_FALSE;
-        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &rejectedBoundsPipeline_),
-              "vkCreateGraphicsPipelines(rejected bounds)");
     } catch (...) {
         vkDestroyShaderModule(device_, fragment, nullptr);
         vkDestroyShaderModule(device_, vertex, nullptr);
@@ -1446,17 +1379,11 @@ void VulkanRenderer::createPipeline()
     passPipeline(kShadowDebugVertexShader, sizeof(kShadowDebugVertexShader), kShadowDebugFragmentShader, sizeof(kShadowDebugFragmentShader), shadowDebugPipeline_);
     info.subpass = 1;
     passPipeline(kShadowDebugVertexShader, sizeof(kShadowDebugVertexShader), kCameraDepthFragmentShader, sizeof(kCameraDepthFragmentShader), cameraDebugPipeline_);
-    info.layout = visLayout_;
-    passPipeline(kShadowDebugVertexShader, sizeof(kShadowDebugVertexShader), kHiZFragmentShader,
-                 sizeof(kHiZFragmentShader), hiZDebugPipeline_);
 }
 
 void VulkanRenderer::destroySwapchain()
 {
     cameraDepth_ = {};
-    cameraList_.active = false;
-    cameraList_.stats = {};
-    hiZMips_.clear();
     for (const auto& image : swapchainImages_) {
         vkDestroyFramebuffer(device_, image.framebuffer, nullptr);
         vkDestroyImageView(device_, image.view, nullptr);
@@ -1523,13 +1450,13 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
     stats.display = renderSettings_.display;
     stats.shadowPass = renderSettings_.shadows || stats.display == RenderDisplay::ShadowMap;
     if (wireframe && !wireframeSupported_) throw std::runtime_error("Wireframe is not supported by this GPU.");
-    if (computeGeometry && !compute_->matches(mainScene(), mainSelection(), edgeSegments_, displacement_))
+    if (computeGeometry && !compute_->matches(sceneGpu_, selection_, edgeSegments_, displacement_))
         throw std::runtime_error("Cannot draw stale or missing compute geometry.");
     stats.boundsPadding = computeGeometry ? compute_->output().maxDisplacement : 0;
     const float aspect = float(extent_.width) / float(extent_.height);
     const auto viewProjection = camera.viewProjection(aspect);
     if (stats.shadowPass) {
-        stats.shadowCandidates = static_cast<uint32_t>(shadowCandidates().ranges.size());
+        stats.shadowCandidates = static_cast<uint32_t>(selection_.ranges.size());
         stats.shadowCasters = static_cast<uint32_t>(shadowSelection().ranges.size());
     }
     const LightingUniform lighting{lightMatrix_, glm::vec4(glm::normalize(renderSettings_.lightDirection), 0)};
@@ -1537,7 +1464,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
     check(vkMapMemory(device_, lightingBuffer_.memory, 0, sizeof(lighting), 0, &mapped), "vkMapMemory(lighting)");
     std::memcpy(mapped, &lighting, sizeof(lighting)); vkUnmapMemory(device_, lightingBuffer_.memory);
     std::vector<bool> visible(drawClusters_.size(), false);
-    for (const auto& range : mainSelection().ranges) {
+    for (const auto& range : selection_.ranges) {
         const auto id = range.sourceClusterId;
         visible[id] = clusterVisible(drawClusters_[id], stats.boundsPadding, viewProjection, camera.eyePosition(aspect), renderSettings_);
         if (visible[id]) ++stats.visibleClusters;
@@ -1568,14 +1495,13 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         vkCmdBindIndexBuffer(commandBuffer_, geometry.indexBuffer, geometry.indexOffset, VK_INDEX_TYPE_UINT32);
         auto& calls = shadow ? stats.shadowDrawCalls : stats.meshDrawCalls;
         auto& triangles = shadow ? stats.shadowTriangles : stats.triangles;
-        const bool sharedState =
-            shadow || (!clusterColors && !renderSettings_.groupColors && !renderSettings_.levelColors && !filtered);
-        const auto& source = shadow ? shadowScene() : mainScene();
-        const bool gpuCommands = source.lodCommands && !computeGeometry;
+        const bool sharedState = shadow || (!clusterColors && !filtered);
+        const auto& source = shadow ? shadowScene() : sceneGpu_;
+        const bool gpuCommands = source.indirectCommands && !computeGeometry;
         const auto indirect = [&](size_t slot, uint32_t count) {
-            const auto offset = source.lodRecordOffset + slot * SceneGpuData::lodRecordStride + sizeof(uint32_t);
-            vkCmdDrawIndexedIndirect(commandBuffer_, source.lodCommands, offset, count,
-                                     SceneGpuData::lodRecordStride);
+            const auto offset = source.drawRecordOffset + slot * SceneGpuData::drawRecordStride + sizeof(uint32_t);
+            vkCmdDrawIndexedIndirect(commandBuffer_, source.indirectCommands, offset, count,
+                                     SceneGpuData::drawRecordStride);
         };
         if (gpuCommands && sharedState) {
             // The selector writes adjacent commands. Color/debug filtering below needs per-cluster state.
@@ -1585,15 +1511,13 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
                 first += count;
                 ++calls;
             }
-            triangles += (shadow ? shadowSelection() : mainSelection()).triangleCount();
+            triangles += (shadow ? shadowSelection() : selection_).triangleCount();
             return;
         }
         const auto draw = [&](uint32_t first, uint32_t count, uint32_t id, size_t slot) {
             if (!shadow) {
                 const auto global = sceneGpu_.firstCluster + id;
-                push.baseColor = renderSettings_.levelColors ? lodLevelColor(clusterLevels_[global]) :
-                                 renderSettings_.groupColors ? clusterColor(clusterGroups_[global]) :
-                                 clusterColors ? clusterColor(global) : kShadedColor;
+                push.baseColor = clusterColors ? clusterColor(global) : kShadedColor;
                 vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                    64, sizeof(glm::vec4), &push.baseColor);
             }
@@ -1617,8 +1541,8 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
             drawMesh(output, output.ranges, true, shadow);
         }
         else {
-            const auto& selected = shadow ? shadowSelection() : mainSelection();
-            drawMesh(shadow ? shadowScene() : mainScene(), selected.ranges, selected.allClusters, shadow);
+            const auto& selected = shadow ? shadowSelection() : selection_;
+            drawMesh(shadow ? shadowScene() : sceneGpu_, selected.ranges, selected.allClusters, shadow);
         }
     };
     if (stats.shadowPass) {
@@ -1660,44 +1584,14 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         drawActiveMesh(false);
         if (showBounds) {
             vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundsPipeline_);
-            for (const auto& range : mainSelection().ranges) {
+            for (const auto& range : selection_.ranges) {
                 if (!visible[range.sourceClusterId] || (boundsCluster >= 0 && range.sourceClusterId != uint32_t(boundsCluster))) continue;
                 vkCmdDraw(commandBuffer_, 24, 1, 0, sceneGpu_.firstCluster + range.sourceClusterId); ++stats.boundsInstances;
             }
         }
     }
-    if (cameraList_.active && renderSettings_.showRejectedBounds && stats.display == RenderDisplay::Shaded) {
-        // Draw rejected boxes through the wall for inspection. This pipeline never writes depth.
-        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, rejectedBoundsPipeline_);
-        const uint32_t rejectedDisplay = 3;
-        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           84, sizeof(rejectedDisplay), &rejectedDisplay);
-        // Survivors preserve candidate order, including reversed manual lists.
-        size_t next = 0;
-        for (const auto& candidate : selection_.ranges) {
-            if (next < cameraList_.selection.ranges.size() &&
-                cameraList_.selection.ranges[next].sourceClusterId == candidate.sourceClusterId) {
-                ++next;
-                continue;
-            }
-            vkCmdDraw(commandBuffer_, 24, 1, 0, sceneGpu_.firstCluster + candidate.sourceClusterId);
-            ++stats.rejectedBoundsInstances;
-        }
-    }
     vkCmdNextSubpass(commandBuffer_, VK_SUBPASS_CONTENTS_INLINE);
-    if (renderSettings_.showHiZ && stats.display != RenderDisplay::ShadowMap && cameraList_.active &&
-        !hiZMips_.empty()) {
-        setViewport(extent_.width, extent_.height);
-        const auto mip = hiZMips_[std::min<size_t>(renderSettings_.hiZMip, hiZMips_.size() - 1)];
-        const uint32_t args[] = {mip.width, mip.height, mip.offset, 0};
-        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, hiZDebugPipeline_);
-        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, visLayout_, 1, 1, &cameraList_.set, 0,
-                                nullptr);
-        vkCmdPushConstants(commandBuffer_, visLayout_, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof(args), args);
-        vkCmdDraw(commandBuffer_, 3, 1, 0, 0);
-    }
-    else if (stats.display == RenderDisplay::Depth) {
+    if (stats.display == RenderDisplay::Depth) {
         setViewport(extent_.width, extent_.height);
         vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1, &cameraDepthSet_, 0, nullptr);
         vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, cameraDebugPipeline_);
@@ -1751,7 +1645,6 @@ bool VulkanRenderer::drawFrame(const OrbitCamera& camera, bool clusterColors, bo
     submit.pSignalSemaphores = &renderFinished;
     check(vkQueueSubmit(graphicsQueue_, 1, &submit, frameFence_), "vkQueueSubmit");
     ++frameSerial_;
-    depthInputs_ = {candidateRevision_, heightRevision(), edgeSegments_, displacement_, computeGeometry};
     cameraDepth_ = {};
     if (renderSettings_.display != RenderDisplay::ShadowMap) {
         cameraDepth_ = {depthView_, shadowSampler_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, extent_,

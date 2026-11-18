@@ -42,7 +42,7 @@ target_link_libraries(imgui PRIVATE glfw Vulkan::Vulkan)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>")
 set(SHADER_SOURCES)
 set(COMPILED_SHADERS)
-foreach(SHADER IN ITEMS mesh.vert mesh.frag shadow.vert shadow.frag shadow_debug.vert shadow_debug.frag camera_depth.frag bounds.vert bounds.frag generate_geometry.comp select_lod.comp probe_camera_depth.comp cull_visibility.comp build_hiz.comp show_hiz.frag)
+foreach(SHADER IN ITEMS mesh.vert mesh.frag shadow.vert shadow.frag shadow_debug.vert shadow_debug.frag camera_depth.frag bounds.vert bounds.frag generate_geometry.comp probe_camera_depth.comp select_shadow_casters.comp)
     set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}")
     set(SHADER_OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER}.inc")
     add_custom_command(
@@ -71,8 +71,6 @@ add_library(acr_scene STATIC
     src/QemClusterBuilder.h
     src/MeshHierarchy.cpp
     src/MeshHierarchy.h
-    src/QemSimplifier.cpp
-    src/QemSimplifier.h
     src/MeshSource.cpp
     src/MeshSource.h
     src/ObjLoader.cpp
@@ -107,11 +105,8 @@ add_executable(AdaptiveClusterRendering
     src/ViewConfig.h
     src/VulkanRenderer.cpp
     src/VulkanRendererShadow.cpp
-    src/VulkanRendererLod.cpp
-    src/VulkanRendererVisibility.cpp
+    src/VulkanRendererShadowCasters.cpp
     tests/RenderIntegrationChecks.cpp
-    tests/LodDepthChecks.cpp
-    tests/VisibilityChecks.cpp
     tests/ShadowCasterChecks.cpp
     tests/CameraDepthProbe.cpp
     src/VulkanRenderer.h
@@ -172,8 +167,8 @@ if(BUILD_TESTING)
     endforeach()
     add_executable(hierarchy_tests tests/HierarchyTests.cpp)
     target_link_libraries(hierarchy_tests PRIVATE acr_scene)
-    add_test(NAME scene-hierarchy COMMAND hierarchy_tests "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
-             "${CMAKE_CURRENT_BINARY_DIR}/test-data/hierarchy")
+    add_test(NAME scene-stored-levels COMMAND hierarchy_tests "${CMAKE_CURRENT_BINARY_DIR}/test-data/hierarchy")
+    set_tests_properties(scene-stored-levels PROPERTIES FIXTURES_SETUP stored_levels)
     add_executable(fixture_tests tests/FixtureTests.cpp)
     target_link_libraries(fixture_tests PRIVATE acr_scene)
     foreach(CASE IN ITEMS triangle plane grid selection)
@@ -199,24 +194,19 @@ if(BUILD_TESTING)
         set_tests_properties(gpu-render-integration PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS "gpu"
             FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu")
-        add_test(NAME gpu-lod-camera-depth COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --lod-depth-smoke)
-        add_test(NAME gpu-suzanne-lod-shape COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --suzanne-lod-shape-smoke)
-        add_test(NAME gpu-visibility-pipeline COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --visibility-smoke)
         add_test(NAME gpu-shadow-caster-pipeline COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" --shadow-cull-smoke)
         add_test(NAME gpu-shadow-caster-report COMMAND "${CMAKE_COMMAND}" "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>"
                  "-DASSET=${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ShadowCasterReport.cmake")
-        add_test(NAME gpu-visibility-report COMMAND "${CMAKE_COMMAND}" "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>"
-                 "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/VisibilityReport.cmake")
         add_test(NAME gpu-view-replay COMMAND "${CMAKE_COMMAND}" "-DVIEWER=$<TARGET_FILE:AdaptiveClusterRendering>"
                  "-DASSET=${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj" "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ViewReplay.cmake")
-        set_tests_properties(gpu-lod-camera-depth gpu-suzanne-lod-shape gpu-view-replay gpu-visibility-pipeline gpu-visibility-report
+        set_tests_properties(gpu-view-replay
             gpu-shadow-caster-pipeline gpu-shadow-caster-report PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS "gpu"
             FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
-        add_test(NAME gpu-hierarchy-roundtrip COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_SOURCE_DIR}/assets/suzanne.obj"
+        add_test(NAME gpu-hierarchy-roundtrip COMMAND AdaptiveClusterRendering "${CMAKE_CURRENT_BINARY_DIR}/test-data/hierarchy/hierarchy.acr"
                  --hierarchy-roundtrip "${CMAKE_CURRENT_BINARY_DIR}/test-data/gpu/hierarchy.acr")
-        set_tests_properties(gpu-hierarchy-roundtrip PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS "gpu"
+        set_tests_properties(gpu-hierarchy-roundtrip PROPERTIES FIXTURES_REQUIRED stored_levels TIMEOUT 90 RUN_SERIAL TRUE LABELS "gpu"
             FAIL_REGULAR_EXPRESSION "Vulkan validation (error|warning)")
         foreach(CASE IN ITEMS all partial empty source shadows shadow-map)
             add_test(NAME gpu-benchmark-${CASE} COMMAND "${CMAKE_COMMAND}"

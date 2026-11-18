@@ -36,9 +36,6 @@
 
 int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window);
 int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
-int runVisibilityChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
-int runLodDepthChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera,
-                      bool suzanneShape);
 int runHierarchyChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene,
                        const OrbitCamera& camera, const std::filesystem::path& output);
 
@@ -126,7 +123,7 @@ ViewerModel makeModel(LoadedScene loaded)
 {
     validateScene(loaded.scene);
     auto camera = frameMesh(loaded.scene.mesh);
-    if (loaded.source.kind == SceneSourceKind::Occlusion || loaded.source.kind == SceneSourceKind::ShadowCasters) {
+    if (loaded.source.kind == SceneSourceKind::ShadowCasters) {
         camera = OrbitCamera({0, 0, 0}, 2);
         camera.setPose({0, 0, loaded.source.kind == SceneSourceKind::ShadowCasters ? 1.5f : 3.f});
     }
@@ -221,7 +218,6 @@ enum class ModelAction {
     Plane,
     ClusterGrid,
     ShadowStage,
-    Occlusion,
     ShadowCasters,
     HeightPreset,
     OpenHeight,
@@ -350,11 +346,6 @@ void drawBenchmarkPanel(BenchmarkSession& benchmark, BenchmarkOptions& options,
         metric("GPU shadow caster culling", &BenchmarkSample::gpuShadowCullMs);
         metric("CPU shadow cull + wait", &BenchmarkSample::cpuShadowCullMs);
         metric("CPU frame (wall time)", &BenchmarkSample::cpuFrameMs);
-        metric("CPU LOD + wait", &BenchmarkSample::cpuLodMs);
-        metric("GPU LOD selection", &BenchmarkSample::gpuLodMs);
-        metric("GPU visibility", &BenchmarkSample::gpuCullMs);
-        metric("GPU Hi-Z build", &BenchmarkSample::gpuPyramidMs);
-        metric("CPU visibility + wait", &BenchmarkSample::cpuCullMs);
         ImGui::TextWrapped("GPU render total covers shadows, the main pass and any visible UI. CPU frame time includes queue and presentation waits.");
         if (!exported.empty()) ImGui::TextWrapped("JSON: %s", exported.u8string().c_str());
     }
@@ -368,7 +359,7 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     const auto& device = renderer.deviceProperties();
     const auto& settings = renderer.renderSettings();
     const auto& source = renderer.sceneGpuData();
-    const auto& selection = renderer.mainSelection();
+    const auto& selection = renderer.clusterSelection();
     const auto& output = renderer.generatedGeometry();
     const auto& upload = renderer.uploadStats();
     const auto extent = renderer.renderExtent();
@@ -384,8 +375,8 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
         {"vulkan_api_version_raw", device.apiVersion}, {"timestamp_valid_bits", renderer.timestampValidBits()},
         {"width_pixels", extent.width}, {"height_pixels", extent.height}, {"source_revision", source.sceneRevision},
         {"height_revision", renderer.heightRevision()}, {"segments_per_edge", renderer.edgeSegments()},
-        {"source_vertices", source.vertexCount}, {"source_triangles", source.lodCommands ? model.loaded.scene.dataset.indices.size() / 3 : source.indexCount / 3},
-        {"source_clusters", source.lodCommands ? model.loaded.scene.dataset.clusters.size() : source.clusterCount},
+        {"source_vertices", source.vertexCount}, {"source_triangles", source.indexCount / 3},
+        {"source_clusters", source.clusterCount},
         {"selected_clusters", selection.ranges.size()}, {"selected_triangles", selection.triangleCount()},
         {"generated_vertices", generated ? output.vertexCount : 0}, {"generated_triangles", generated ? output.indexCount / 3 : 0},
         {"drawn_triangles", renderer.lastRecordedDraw().triangles}, {"mesh_draw_calls", renderer.lastRecordedDraw().meshDrawCalls},
@@ -406,52 +397,17 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     context.flags = {{"generated_geometry", generated}, {"displacement_enabled", displacement.enabled}, {"wireframe", wireframe},
         {"cluster_colors", colors}, {"bounds_enabled", bounds}, {"all_clusters", selection.allClusters},
         {"app_enabled_validation", renderer.validationEnabled()}, {"gpu_timestamps_supported", renderer.supportsTimestamps()},
-        {"ui_rendered", uiRendered}, {"readback_excluded", !source.lodCommands},
-        {"verification_readback_excluded", true}, {"lod_id_readback", source.lodCommands != VK_NULL_HANDLE},
+        {"ui_rendered", uiRendered}, {"readback_excluded", true}, {"verification_readback_excluded", true},
         {"reallocates_each_generation", generated}};
     context.counts["display_mode"] = static_cast<uint32_t>(settings.display);
-    if (!source.lodCommands) context.counts["geometry_level"] = source.activeLevel;
-    context.flags["gpu_lod"] = source.lodCommands != VK_NULL_HANDLE;
-    const auto& vis = renderer.visibilityStats();
-    context.counts["cull_mode"] = static_cast<uint32_t>(settings.culling);
-    constexpr const char* modeNames[] = {"off", "frustum", "hierarchy", "hiz", "hiz-flat"};
-    context.labels["culling"] = modeNames[static_cast<uint32_t>(settings.culling)];
+    context.counts["geometry_level"] = source.activeLevel;
     context.counts["candidate_clusters"] = renderer.clusterSelection().ranges.size();
     context.counts["candidate_triangles"] = renderer.clusterSelection().triangleCount();
-    context.counts["frustum_rejected"] = vis.frustum;
-    context.counts["hierarchy_frustum_rejected"] = vis.hierarchy;
-    context.counts["occlusion_rejected"] = vis.occluded;
-    context.counts["rejected_bounds_drawn"] = renderer.lastRecordedDraw().rejectedBoundsInstances;
-    context.flags["show_rejected_bounds"] = settings.showRejectedBounds;
-    context.counts["hierarchy_nodes_tested"] = vis.testedNodes;
-    context.counts["hierarchy_nodes_skipped"] = vis.skippedNodes;
-    context.counts["hiz_levels"] = vis.mipCount;
-    context.counts["hiz_source_frame"] = vis.depthFrame;
-    context.flags["hiz_used"] = vis.depthFrame != 0;
-    context.flags["hiz_preview"] = settings.showHiZ;
-    context.counts["requested_hiz_mip"] = settings.hiZMip;
-    if (settings.culling != CullMode::Off) {
-        context.flags["readback_excluded"] = false;
-        context.labels["visibility_scope"] =
-            "GPU bounds tests and stable compaction. Hi-Z reduction is timed separately. CPU visibility includes the "
-            "ID/count mirror and queue waits.";
-    }
-    context.flags["level_colors"] = settings.levelColors;
-    context.values["lod_error_pixels"] = settings.lodPixels;
-    if (renderer.lodStats().footprintPixels)
-        context.values["lod_bounds_diameter_pixels"] = *renderer.lodStats().footprintPixels;
-    const auto& hist = renderer.lodStats().clustersPerLevel;
-    for (size_t i=0; i<hist.size(); ++i) context.counts["lod_L"+std::to_string(i)+"_clusters"] = hist[i];
     context.counts["resident_cluster_count"] = source.hierarchy.totalClusters;
     context.flags["camera_depth_available"] = renderer.cameraDepth().view != VK_NULL_HANDLE;
     context.flags["camera_depth_solid"] = renderer.cameraDepth().solid;
-    context.labels["cpu_frame_scope"] = "Wall time from frame preparation to present return, including LOD/generation waits and pacing; excludes benchmark timestamp collection.";
-    if (source.lodCommands) {
-        context.labels["lod_scope"] = "GPU classifies nodes, compacts clusters and builds indirect draws/triangle work. CPU interval includes queue wait and ID mirror. Forced each measured frame.";
-        context.labels["generation_scope"] = "CPU plans sized outputs from selected ranges and waits. GPU subdivision uses the selector's device work list and indirect dispatch.";
-    }
+    context.labels["cpu_frame_scope"] = "Wall time from frame preparation to present, including generation and shadow waits.";
     context.counts["first_cluster_id"] = source.firstCluster;
-    context.flags["group_colors"] = settings.groupColors;
     context.counts["shadow_triangles"] = renderer.lastRecordedDraw().shadowTriangles;
     context.counts["shadow_draw_calls"] = renderer.lastRecordedDraw().shadowDrawCalls;
     const auto& draw = renderer.lastRecordedDraw();
@@ -475,16 +431,8 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     context.flags["shadows_enabled"] = settings.shadows;
     context.flags["shadow_pass"] = renderer.lastRecordedDraw().shadowPass;
     context.flags["cpu_frustum_preview"] = settings.frustumPreview;
-    context.labels["selection_scope"] = source.lodCommands ? "GPU screen-error cut. Global cluster IDs; GPU-produced draw commands and triangle work." :
-        "Manual level and input list. Optional CPU visibility filters main draws only.";
-    if (settings.culling != CullMode::Off) {
-        context.labels["selection_scope"] = "GPU-visible list after the candidate cut, in original candidate order. "
-                                            "IDs are relative to first_cluster_id.";
-        context.labels["generation_scope"] =
-            "Main-view generation uses GPU-visible triangle addresses and indirect dispatch. Additional shadow "
-            "geometry is cached using the light's caster list.";
-    }
-    context.labels["shadow_scope"] = "The light uses the pre-visibility list. Automatic distant proxies cast with their last protected region. Caster IDs use the same first_cluster_id base as the main view.";
+    context.labels["selection_scope"] = "Fixed level and ordered input list. CPU preview filters main draws only.";
+    context.labels["shadow_scope"] = "Directional light processes the input list independently of the main camera.";
     for (const auto& range : selection.ranges) context.selectedClusterIds.push_back(range.sourceClusterId);
     const auto view = model.camera.viewProjection(float(extent.width) / float(extent.height));
     for (int column = 0; column < 4; ++column) for (int row = 0; row < 4; ++row) {
@@ -501,8 +449,7 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
                       const HeightField& height, uint64_t heightBytes, const SceneUploadStats& upload,
                       std::string& status, BenchmarkSession& benchmark, BenchmarkOptions& benchmarkOptions,
                       const std::filesystem::path& exported, bool& startBenchmark, RenderSettings& renderSettings,
-                      const SourceDrawStats& lastDraw, const LodSelectionStats& lod, const VisibilityStats& vis,
-                      const VisibilityStats& shadowVis)
+                      const SourceDrawStats& lastDraw, const ShadowCasterStats& shadowVis)
 {
     const auto& scene = model.loaded.scene;
     ModelAction action = ModelAction::None;
@@ -514,96 +461,31 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
         ImGui::TextWrapped("%s", model.name.c_str());
         ImGui::Text("Vertices: %zu", scene.mesh.vertices.size());
         const auto active = sceneLevel(scene,model.geometryLevel);
-        const bool mixed = renderSettings.adaptiveLod && !scene.hierarchy.levels.empty();
-        const bool selectedCounts = mixed || renderSettings.culling != CullMode::Off;
-        ImGui::Text(
-            "%s triangles: %llu", selectedCounts ? "Selected source" : "Source",
-            static_cast<unsigned long long>(selectedCounts ? selection.triangleCount() : active.indexCount / 3));
-        ImGui::Text("Clusters: %u",
-                    selectedCounts ? static_cast<uint32_t>(selection.ranges.size()) : active.clusterCount);
+        ImGui::Text("Source triangles: %u", active.indexCount / 3);
+        ImGui::Text("Clusters: %u", active.clusterCount);
         ImGui::Text("Drawn triangles: %llu", static_cast<unsigned long long>(lastDraw.triangles));
         ImGui::Text("Triangles / cluster: <= %u", scene.maxTrianglesPerCluster);
         drawBenchmarkPanel(benchmark, benchmarkOptions, exported, startBenchmark, status);
         ImGui::Separator();
         ImGui::BeginDisabled(benchmark.active() || startBenchmark);
-        if (ImGui::Checkbox("Cluster colors", &clusterColors) && clusterColors)
-            renderSettings.groupColors = renderSettings.levelColors = false;
+        ImGui::Checkbox("Cluster colors", &clusterColors);
         ImGui::BeginDisabled(!wireframeSupported);
         ImGui::Checkbox("Wireframe", &wireframe);
         ImGui::EndDisabled();
         if (!wireframeSupported) ImGui::TextWrapped("Wireframe unavailable on this GPU.");
-        if (!scene.hierarchy.levels.empty() &&
-            ImGui::CollapsingHeader("Mesh hierarchy", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox("Automatic GPU LOD", &renderSettings.adaptiveLod);
-            if (ImGui::Checkbox("Level colors", &renderSettings.levelColors) && renderSettings.levelColors)
-                clusterColors = renderSettings.groupColors = false;
-            if (ImGui::Checkbox("Group colors", &renderSettings.groupColors) && renderSettings.groupColors)
-                clusterColors = renderSettings.levelColors = false;
-            if (renderSettings.adaptiveLod) {
-                ImGui::TextUnformatted("Allowed screen error (pixels)");
-                ImGui::SetNextItemWidth(-1);
-                ImGui::SliderFloat("##lodPixels", &renderSettings.lodPixels, 0, 1024, "%.1f px",
-                                   ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
-                if (lod.gpuMs)
-                    ImGui::Text("GPU selection: %.4f ms", *lod.gpuMs);
-                else
-                    ImGui::TextUnformatted("GPU selection timing: N/A");
-                ImGui::Text("CPU selection + wait: %.3f ms", lod.cpuMs);
-                if (lod.footprintPixels) ImGui::Text("Model bounds: %.1f px", *lod.footprintPixels);
-                for (size_t i = 0; i < lod.clustersPerLevel.size(); ++i)
-                    if (lod.clustersPerLevel[i]) {
-                        const auto c = lodLevelColor(static_cast<uint32_t>(i));
-                        const auto distant = scene.hierarchy.levels[i].maxDiameterPixels != 0;
-                        ImGui::TextColored({c.r, c.g, c.b, 1}, "L%zu%s: %u clusters", i, distant ? " (distant)" : "",
-                                           lod.clustersPerLevel[i]);
-                    }
-            }
-            else {
-                ImGui::TextUnformatted("Geometry level (L0 is original)");
-                ImGui::SetNextItemWidth(-1);
-                const auto label = [](int i, const LodLevel& l) {
-                    return "L" + std::to_string(i) + (l.maxDiameterPixels ? " (distant)" : "") +
-                           "  |  " + std::to_string(l.indexCount / 3) + " triangles";
-                };
-                if (ImGui::BeginCombo("##geometryLevel", label(model.geometryLevel, active).c_str())) {
-                    for (int i = 0; i < static_cast<int>(scene.hierarchy.levels.size()); ++i) {
-                        if (ImGui::Selectable(label(i, scene.hierarchy.levels[i]).c_str(), i == model.geometryLevel))
-                            model.geometryLevel = i;
-                    }
-                    ImGui::EndCombo();
-                }
-                float error = 0;
-                for (uint32_t i = 0; i < active.nodeCount; ++i)
-                    error = std::max(error, scene.hierarchy.nodes[active.firstNode + i].error);
-                ImGui::Text("Nodes: %u   Build: %.2f ms", active.nodeCount, active.buildMs);
-                ImGui::Text("Max error bound: %.4g units", error);
-            }
-        }
-        if (ImGui::CollapsingHeader("GPU visibility", ImGuiTreeNodeFlags_DefaultOpen)) {
-            int mode = static_cast<int>(renderSettings.culling);
+        if (scene.hierarchy.levels.size() > 1 && ImGui::CollapsingHeader("Stored ACR geometry levels")) {
+            ImGui::TextUnformatted("Geometry level (L0 is original)");
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##cull", &mode, "Off\0Frustum\0Hierarchy + frustum\0Hierarchy + frustum + Hi-Z\0Frustum + Hi-Z\0"))
-                renderSettings.culling = static_cast<CullMode>(mode);
-            if (renderSettings.culling != CullMode::Off) {
-                ImGui::Text("Visible clusters: %u / %u", vis.visible, vis.candidates);
-                ImGui::Text("Rejected: %u frustum, %u hierarchy", vis.frustum, vis.hierarchy);
-                ImGui::Text("Occluded: %u", vis.occluded);
-                ImGui::Checkbox("Show rejected bounds (orange)", &renderSettings.showRejectedBounds);
-                if (vis.gpuCullMs) ImGui::Text("GPU culling: %.4f ms", *vis.gpuCullMs);
-                if (usesHiZ(renderSettings.culling)) {
-                    if (vis.depthFrame)
-                        ImGui::Text("Hi-Z: %u levels, frame %llu", vis.mipCount,
-                                    static_cast<unsigned long long>(vis.depthFrame));
-                    else
-                        ImGui::TextWrapped("Hi-Z waits for matching solid camera depth.");
-                    if (vis.gpuPyramidMs) ImGui::Text("GPU Hi-Z build: %.4f ms", *vis.gpuPyramidMs);
-                    ImGui::Checkbox("Show Hi-Z mip", &renderSettings.showHiZ);
-                    if (renderSettings.showHiZ && vis.mipCount) {
-                        int mip = std::min<int>(renderSettings.hiZMip, vis.mipCount - 1);
-                        if (ImGui::SliderInt("Mip", &mip, 0, static_cast<int>(vis.mipCount - 1)))
-                            renderSettings.hiZMip = mip;
-                    }
+            const auto label = [](int i, const AcrLevelRecord& l) {
+                return "L" + std::to_string(i) + (l.maxDiameterPixels ? " (distant)" : "") +
+                       "  |  " + std::to_string(l.indexCount / 3) + " triangles";
+            };
+            if (ImGui::BeginCombo("##geometryLevel", label(model.geometryLevel, active).c_str())) {
+                for (int i = 0; i < static_cast<int>(scene.hierarchy.levels.size()); ++i) {
+                    if (ImGui::Selectable(label(i, scene.hierarchy.levels[i]).c_str(), i == model.geometryLevel))
+                        model.geometryLevel = i;
                 }
+                ImGui::EndCombo();
             }
         }
         if (ImGui::CollapsingHeader("Rendering and shadows")) {
@@ -637,7 +519,7 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
         if (showBounds) {
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderInt("##bounds", &boundsCluster, -1,
-                             static_cast<int>((mixed ? scene.dataset.clusters.size()+scene.hierarchy.coarse.clusters.size() : active.clusterCount) - 1), "Cluster %d");
+                             static_cast<int>(active.clusterCount - 1), "Cluster %d");
             ImGui::TextUnformatted("-1: all selected bounds");
         }
         if (ImGui::Button("Reset camera")) {
@@ -657,21 +539,16 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
             ImGui::SetNextItemWidth(-1);
             if (ImGui::BeginCombo("##fixture", "Load test scene...")) {
                 if (ImGui::Selectable("Shadow stage (receiver + patch)")) action = ModelAction::ShadowStage;
-                if (ImGui::Selectable("Occlusion stage")) action = ModelAction::Occlusion;
                 if (ImGui::Selectable("Off-camera shadow caster")) action = ModelAction::ShadowCasters;
                 if (ImGui::Selectable("Single triangle")) action = ModelAction::Triangle;
                 if (ImGui::Selectable("Continuous UV plane")) action = ModelAction::Plane;
                 if (ImGui::Selectable("Fixed cluster grid (2 x 2)")) action = ModelAction::ClusterGrid;
                 ImGui::EndCombo();
             }
-            ImGui::BeginDisabled(mixed);
             ImGui::TextUnformatted("Manual selection");
             ImGui::SetNextItemWidth(-1);
             ImGui::Combo("##selection", &selectionPreset, "All clusters\0First + last cluster\0Empty list\0Last + first cluster\0");
-            ImGui::EndDisabled();
-            if (renderSettings.culling != CullMode::Off) ImGui::Text("After culling: %zu clusters", selection.ranges.size());
-            else if (mixed) ImGui::Text("GPU-selected: %zu clusters", selection.ranges.size());
-            else ImGui::Text("Selected: %zu / %u clusters", selection.ranges.size(), active.clusterCount);
+            ImGui::Text("Selected: %zu / %u clusters", selection.ranges.size(), active.clusterCount);
             ImGui::Text("Selected triangles: %llu", static_cast<unsigned long long>(selection.triangleCount()));
             if (!selection.allClusters && !selection.ranges.empty()) {
                 ImGui::Text("Source IDs: %u", selection.ranges.front().sourceClusterId);
@@ -797,7 +674,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     ViewerInput input;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_VISIBLE,
-                   (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || options.visibilitySmoke || options.shadowCullSmoke ||
+                   (options.smokeTest || options.renderSmoke || options.shadowCullSmoke ||
                     cliBenchmark || !options.saveConfigPath.empty() || !options.hierarchyRoundtripPath.empty())
                        ? GLFW_FALSE
                        : GLFW_TRUE);
@@ -826,15 +703,11 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     renderer.uploadScene(model.loaded.scene);
     renderer.setHierarchyLevel(options.geometryLevel);
     model.geometryLevel = static_cast<int>(options.geometryLevel);
-    if (model.loaded.scene.hierarchy.levels.empty()) options.renderSettings.groupColors = false;
     renderer.setRenderSettings(options.renderSettings);
     if (!options.hierarchyRoundtripPath.empty())
         return runHierarchyChecks(renderer,window.get(),model.loaded.scene,model.camera,options.hierarchyRoundtripPath);
     if (options.renderSmoke) return runRenderIntegrationChecks(renderer, window.get());
     if (options.shadowCullSmoke) return runShadowCasterChecks(renderer, window.get(), model.loaded.scene, model.camera);
-    if (options.visibilitySmoke) return runVisibilityChecks(renderer, window.get(), model.loaded.scene, model.camera);
-    if (options.lodDepthSmoke)
-        return runLodDepthChecks(renderer, window.get(), model.loaded.scene, model.camera, options.suzanneShapeSmoke);
     if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(model.loaded.scene);
     showModelInfo(window.get(), model, renderer.uploadStats());
 
@@ -887,7 +760,6 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
         auto next = makeModel(std::move(replacement));
         next.geometryLevel = level;
         auto previousSelection = selectionRequest(renderer.clusterSelection());
-        const bool hadGpuCut = renderer.sceneGpuData().lodCommands != VK_NULL_HANDLE;
         if (preserveView) {
             if (!sameSceneData(model.loaded.scene, next.loaded.scene)) {
                 throw std::runtime_error("Saved file changed; use Open to load it as a new scene.");
@@ -899,7 +771,6 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
         renderer.uploadScene(next.loaded.scene);
         renderer.setHierarchyLevel(static_cast<uint32_t>(next.geometryLevel));
         model = std::move(next);
-        if (model.loaded.scene.hierarchy.levels.empty()) renderSettings.groupColors = false;
         if (options.smokeTest) {
             bool rejected = false;
             try { renderer.setClusterSelection(previousSelection); } catch (const std::exception&) { rejected = true; }
@@ -908,10 +779,10 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                 throw std::runtime_error("Source replacement did not invalidate the previous selection revision.");
             }
         }
-        if (preserveView && !hadGpuCut) {
+        if (preserveView) {
             previousSelection.sceneRevision = renderer.sceneGpuData().sceneRevision;
             renderer.setClusterSelection(previousSelection);
-        } else if (!preserveView) {
+        } else {
             boundsCluster = -1;
             selectionPreset = appliedPreset = 0;
         }
@@ -1049,39 +920,23 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
             cliBenchmark || options.hidePanel
                 ? ModelAction::None
                 : drawPanel(model, clusterColors, showBounds, boundsCluster, selectionPreset,
-                            renderer.mainSelection(), computeGeometry, regenerate, renderer.generatedGeometry(),
+                            renderer.clusterSelection(), computeGeometry, regenerate, renderer.generatedGeometry(),
                             segmentPreset, wireframe, renderer.supportsWireframe(), displacement, heightPreset,
                             renderer.heightField(), renderer.heightAllocationBytes(), renderer.uploadStats(), status,
                             benchmark, options.benchmarkOptions, exportedBenchmark, benchmarkRequested,
-                            renderSettings, renderer.lastRecordedDraw(), renderer.lodStats(),
-                            renderer.visibilityStats(), renderer.shadowVisibilityStats());
+                             renderSettings, renderer.lastRecordedDraw(), renderer.shadowVisibilityStats());
         if (benchmarkRequested && !alreadyRequested) benchmarkStarted = std::chrono::steady_clock::now();
         renderer.setRenderSettings(renderSettings);
         renderer.setEdgeSegments(1u << segmentPreset);
         renderer.setDisplacement(displacement);
-        const bool gpuLod = renderSettings.adaptiveLod && !model.loaded.scene.hierarchy.levels.empty();
-        if (gpuLod) {
-            renderer.selectLod(model.camera, computeGeometry ? renderer.plannedDisplacementBound() : 0, benchmark.active());
-            appliedPreset = -1;
-        } else if (static_cast<uint32_t>(model.geometryLevel) != renderer.sceneGpuData().activeLevel) {
+        if (static_cast<uint32_t>(model.geometryLevel) != renderer.sceneGpuData().activeLevel) {
             renderer.setHierarchyLevel(static_cast<uint32_t>(model.geometryLevel));
             appliedPreset = -1;
             boundsCluster = -1;
         }
-        if (!gpuLod && selectionPreset != appliedPreset) {
+        if (selectionPreset != appliedPreset) {
             renderer.setClusterSelection(previewSelection(renderer.sceneGpuData(), selectionPreset));
             appliedPreset = selectionPreset;
-        }
-        try {
-            renderer.selectVisibility(model.camera, computeGeometry, wireframe);
-        }
-        catch (const std::exception& failure) {
-            if (cliBenchmark || options.smokeTest) throw;
-            benchmark.cancel();
-            benchmarkRequested = false;
-            renderSettings.culling = CullMode::Off;
-            renderer.setRenderSettings(renderSettings);
-            status = std::string("Culling disabled for this scene. ") + failure.what();
         }
         if (computeGeometry) {
             try {
@@ -1133,8 +988,6 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                 if (options.smokeTest || cliBenchmark) throw;
                 benchmark.cancel(); benchmarkRequested = false;
                 computeGeometry = false;
-                if (gpuLod) renderer.selectLod(model.camera, 0);
-                renderer.selectVisibility(model.camera, false, wireframe);
                 status = std::string("GPU generation failed; drawing source. ") + failure.what();
                 std::cerr << status << '\n';
             }
@@ -1155,15 +1008,6 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                     const auto& light = renderer.shadowVisibilityStats();
                     sample.cpuShadowCullMs = light.cpuMs;
                     sample.gpuShadowCullMs = light.gpuCullMs;
-                }
-                if (renderSettings.culling != CullMode::Off) {
-                    sample.cpuCullMs = renderer.visibilityStats().cpuMs;
-                    sample.gpuCullMs = renderer.visibilityStats().gpuCullMs;
-                    sample.gpuPyramidMs = renderer.visibilityStats().gpuPyramidMs;
-                }
-                if (gpuLod) {
-                    sample.cpuLodMs = renderer.lodStats().cpuMs;
-                    sample.gpuLodMs = renderer.lodStats().gpuMs;
                 }
                 if (computeGeometry) {
                     sample.generationRevision = renderer.generatedGeometry().generationRevision;
@@ -1207,17 +1051,13 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                     if (cliBenchmark) break;
                 }
             }
-            const bool awaitDepth = usesHiZ(renderSettings.culling) && !wireframe &&
-                                    !renderSettings.frustumPreview && renderSettings.maxDistance == 0 &&
-                                    renderSettings.display != RenderDisplay::ShadowMap &&
-                                    !renderer.visibilityStats().depthFrame;
-            if (benchmarkRequested && !awaitDepth) {
+            if (benchmarkRequested) {
                 exportedBenchmark.clear(); status.clear();
                 benchmark.begin(captureBenchmark(model, renderer, computeGeometry, wireframe, clusterColors,
                                                  showBounds, boundsCluster, displacement, heightPath,
                                                  !cliBenchmark && !options.hidePanel),
                                 options.benchmarkOptions, computeGeometry, renderer.supportsTimestamps(),
-                                renderer.mainSelection().indexCount > 0);
+                                renderer.clusterSelection().indexCount > 0);
                 benchmarkRequested = false;
                 benchmarkStarted = std::chrono::steady_clock::now();
             }
@@ -1231,7 +1071,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                     }
                 }
                 const auto expectedCalls = selected.ranges.empty() ? 0u :
-                    (!clusterColors && !renderSettings.groupColors && !renderSettings.levelColors && (computeGeometry || selected.allClusters) ? 1u : static_cast<uint32_t>(selected.ranges.size()));
+                    (!clusterColors && (computeGeometry || selected.allClusters) ? 1u : static_cast<uint32_t>(selected.ranges.size()));
                 const auto expectedTriangles = selected.triangleCount() * (computeGeometry ? uint64_t(renderer.edgeSegments()) * renderer.edgeSegments() : 1);
                 if (recorded.triangles != expectedTriangles || recorded.meshDrawCalls != expectedCalls || recorded.wireframe != wireframe ||
                     recorded.boundsInstances != expectedBounds || recorded.usesGeneratedGeometry != computeGeometry ||
@@ -1307,12 +1147,11 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                 }
                 else if (action == ModelAction::Triangle || action == ModelAction::Plane ||
                          action == ModelAction::ClusterGrid || action == ModelAction::ShadowStage ||
-                         action == ModelAction::Occlusion || action == ModelAction::ShadowCasters) {
+                         action == ModelAction::ShadowCasters) {
                     const auto fixture = action == ModelAction::Triangle      ? TessellationFixture::Triangle
                                          : action == ModelAction::Plane       ? TessellationFixture::Plane
                                          : action == ModelAction::ShadowStage ? TessellationFixture::ShadowStage
                                          : action == ModelAction::ShadowCasters ? TessellationFixture::ShadowCasters
-                                         : action == ModelAction::Occlusion   ? TessellationFixture::Occlusion
                                                                               : TessellationFixture::ClusterGrid;
                     replaceModel(makeFixtureSceneWithStats(fixture));
                     status.clear();

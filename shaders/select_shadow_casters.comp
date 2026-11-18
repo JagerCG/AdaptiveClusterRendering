@@ -1,98 +1,37 @@
 #version 450
 layout(local_size_x=64) in;
 layout(std430,set=0,binding=0) readonly buffer Scene { uint w[]; } scene;
-layout(std430,set=1,binding=0) readonly buffer Pyramid { float z[]; } pyramid;
-layout(std430,set=1,binding=2) readonly buffer Candidates { uint w[]; } inputList;
-layout(std430,set=1,binding=3) buffer Result { uint w[]; } result;
-layout(std430,set=1,binding=4) writeonly buffer Work { uint firstIndex[]; } work;
+layout(std430,set=1,binding=0) readonly buffer Candidates { uint w[]; } inputList;
+layout(std430,set=1,binding=1) buffer Result { uint w[]; } result;
+layout(std430,set=1,binding=2) writeonly buffer Work { uint firstIndex[]; } work;
 layout(push_constant) uniform Params {
     mat4 vp;
-    uint candidates, firstCluster, firstIndex, inputBase;
-    uint stride, nodeWord, nodes, useHierarchy;
-    uint phase, firstNode, count, gridX;
-    uint width, height, useDepth; float padding;
+    uint candidates, firstCluster, firstIndex, phase;
+    uint gridX; float padding;
 } p;
 shared uvec2 prefix[64];
-// After the counts / indirect-dispatch header: node results, candidate scan scratch,
-// per-block totals, then compact records (source ID plus an indexed draw command).
+// Counts and indirect commands precede scan scratch, per-block totals and ordered draw records.
 const uint header=24u;
 uint blocks() { return (p.candidates+63u)/64u; }
-uint scratch(uint i) { return header+p.nodes+3u*i; }
+uint scratch(uint i) { return header+3u*i; }
 uint blockWord(uint b) { return scratch(p.candidates)+2u*b; }
-uint node(uint i) { return p.nodeWord + 12u * i; }
 vec3 readVec(uint at) { return uintBitsToFloat(uvec3(scene.w[at], scene.w[at + 1], scene.w[at + 2])); }
 
-// 0 survives, 1 outside the frustum, 3 behind solid coverage.
-uint classify(uint at) {
+bool outsideLight(uint at) {
     vec3 lo = readVec(at) - p.padding, hi = readVec(at + 4u) + p.padding;
     uint outside = 63u;
-    vec2 lower = vec2(1), upper = vec2(-1);
-    float nearest = 1;
-    bool projectable = true;
     for (uint i = 0u; i < 8u; ++i) {
         vec4 v = p.vp * vec4(mix(lo, hi, notEqual(uvec3(i) & uvec3(1, 2, 4), uvec3(0))), 1);
         float guard = 2e-6 * max(1.0, abs(v.w));
         uint mask = uint(v.x < -v.w - guard) | (uint(v.x > v.w + guard) << 1) | (uint(v.y < -v.w - guard) << 2) |
                     (uint(v.y > v.w + guard) << 3) | (uint(v.z < -guard) << 4) | (uint(v.z > v.w + guard) << 5);
         outside &= mask;
-        if (v.w <= 1e-6 || v.z <= 0) {
-            projectable = false;
-            continue;
-        }
-        vec3 ndc = v.xyz / v.w;
-        lower = min(lower, ndc.xy);
-        upper = max(upper, ndc.xy);
-        nearest = min(nearest, ndc.z);
     }
-    if (outside != 0u) return 1u;
-    if (p.useDepth == 0u || !projectable) return 0u;
-    ivec2 size = ivec2(p.width, p.height);
-    // Enlarge the footprint by one pixel for edge/roundoff uncertainty.
-    ivec2 a = clamp(ivec2(floor((clamp(lower, -1, 1) * .5 + .5) * size)) - 1, ivec2(0), size - 1);
-    ivec2 b = clamp(ivec2(ceil((clamp(upper, -1, 1) * .5 + .5) * size)) + 1, a, size - 1);
-    uint offset = 0;
-    while (any(greaterThan(b - a, ivec2(1)))) {
-        offset += uint(size.x * size.y);
-        size = (size + 1) / 2;
-        a /= 2;
-        b /= 2;
-    }
-    float farthest = 0;
-    for (int y = a.y; y <= b.y; ++y)
-        for (int x = a.x; x <= b.x; ++x)
-            farthest = max(farthest, pyramid.z[offset + uint(y * size.x + x)]);
-    return nearest > farthest + 2e-5 ? 3u : 0u;
+    return outside != 0u;
 }
-
-// Node records are ordered by first global cluster. Each cluster has one owner.
-uint owner(uint id) {
-    uint lo = 0, hi = p.nodes;
-    while (hi - lo > 1u) {
-        uint mid = lo + (hi - lo) / 2u;
-        if (scene.w[node(mid) + 8u] <= id)
-            lo = mid;
-        else
-            hi = mid;
-    }
-    return lo;
-}
-uint sourceID(uint slot) { return inputList.w[p.inputBase + p.stride * slot]; }
 void main() {
     uint block = gl_WorkGroupID.x + p.gridX * gl_WorkGroupID.y, lane = gl_LocalInvocationID.x;
     uint i = 64u * block + lane;
-    if (p.phase == 0u) { // one dispatch per hierarchy level, roots first
-        if (i >= p.count) return;
-        uint id = p.firstNode + i, at = node(id), parent = scene.w[at + 7u];
-        uint reason = parent == 0xffffffffu ? 0u : result.w[header + parent];
-        if (reason != 0u)
-            atomicAdd(result.w[22], 1u);
-        else if (scene.w[at + 11u] != 0u) {
-            reason = classify(at);
-            atomicAdd(result.w[21], 1u);
-        }
-        result.w[header + id] = reason;
-        return;
-    }
     if (p.phase == 2u) { // prefix of workgroup totals and indirect dispatch header
         if (lane != 0u) return;
         uvec2 total = uvec2(0);
@@ -117,12 +56,8 @@ void main() {
     if (p.phase == 1u) {
         uvec2 size = uvec2(0);
         if (i < p.candidates) {
-            uint id = sourceID(i) + p.firstCluster, reason = 0u;
-            if (p.useHierarchy != 0u) {
-                uint inherited = result.w[header + owner(id)];
-                if (inherited != 0u) reason = inherited + 1u; // 2: hierarchy frustum, 4: hierarchy occlusion
-            }
-            if (reason == 0u) reason = classify(12u * id);
+            uint id = inputList.w[i] + p.firstCluster;
+            uint reason = outsideLight(12u * id) ? 1u : 0u;
             result.w[scratch(i) + 2u] = reason;
             if (reason == 0u)
                 size = uvec2(1, scene.w[12u * id + 9u] / 3u);
@@ -146,7 +81,7 @@ void main() {
             result.w[blockWord(block) + 1u] = prefix[lane].y;
         }
     } else if (i < p.candidates && result.w[scratch(i) + 2u] == 0u) {
-        uint id = sourceID(i), at = 12u * (id + p.firstCluster);
+        uint id = inputList.w[i], at = 12u * (id + p.firstCluster);
         uint first = scene.w[at + 8u] - p.firstIndex, count = scene.w[at + 9u];
         uint slot = result.w[blockWord(block)] + result.w[scratch(i)];
         uint tri = result.w[blockWord(block) + 1u] + result.w[scratch(i) + 1u];

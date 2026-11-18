@@ -6,18 +6,10 @@
 #include <limits>
 #include <stdexcept>
 
-glm::vec4 lodLevelColor(uint32_t level)
-{
-    constexpr glm::vec4 colors[] = {{.10f,.68f,.91f,1}, {.13f,.78f,.46f,1}, {.94f,.78f,.14f,1},
-        {.98f,.40f,.12f,1}, {.90f,.23f,.54f,1}, {.60f,.30f,.88f,1}};
-    return colors[level % std::size(colors)];
-}
-
 void validateRenderSettings(const RenderSettings& s)
 {
     const auto finite = [](float f) { return std::isfinite(f); };
-    if (s.culling > CullMode::FlatHiZ || s.hiZMip > 31 || !finite(s.lodPixels) || s.lodPixels < 0 || s.lodPixels > 65536 ||
-        s.display > RenderDisplay::ShadowMap || !finite(s.shadowBias) || s.shadowBias < 0 || s.shadowBias > .08f ||
+    if (s.display > RenderDisplay::ShadowMap || !finite(s.shadowBias) || s.shadowBias < 0 || s.shadowBias > .08f ||
         !finite(s.shadowCoverage) || s.shadowCoverage < .05f || s.shadowCoverage > 1 ||
         !finite(s.maxDistance) || s.maxDistance < 0 || !finite(s.lightDirection.x) ||
         !finite(s.lightDirection.y) || !finite(s.lightDirection.z) || glm::length(s.lightDirection) < 1e-4f ||
@@ -67,18 +59,4 @@ glm::mat4 shadowViewProjection(const std::vector<Cluster>& clusters, float paddi
                                      std::max(.001f, -lightHi.z - margin), -lightLo.z + margin);
     projection[1][1] *= -1; // same positive-height Vulkan viewport in both passes
     return projection * view;
-}
-
-float projectedDiameterPixels(glm::vec3 lo, glm::vec3 hi, const glm::mat4& vp, uint32_t width, uint32_t height)
-{
-    glm::vec2 lower(std::numeric_limits<float>::infinity()), upper(-lower);
-    for (uint32_t i = 0; i < 8; ++i) {
-        const auto p = vp * glm::vec4(i & 1 ? hi.x : lo.x, i & 2 ? hi.y : lo.y, i & 4 ? hi.z : lo.z, 1);
-        if (p.w <= 0 || p.z <= 0) return std::numeric_limits<float>::infinity();
-        const glm::vec2 ndc = glm::vec2(p) / p.w;
-        lower = glm::min(lower, ndc);
-        upper = glm::max(upper, ndc);
-    }
-    const glm::vec2 extent = (upper - lower) * .5f * glm::vec2(width, height);
-    return std::max(extent.x, extent.y);
 }

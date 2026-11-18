@@ -94,7 +94,6 @@ LoadedScene makeFixtureSceneWithStats(TessellationFixture fixture)
     LoadedScene result;
     result.scene = makeTessellationFixture(fixture);
     switch (fixture) {
-    case TessellationFixture::Occlusion: result.source.kind = SceneSourceKind::Occlusion; break;
     case TessellationFixture::ShadowCasters: result.source.kind = SceneSourceKind::ShadowCasters; break;
     case TessellationFixture::ShadowStage: result.source.kind = SceneSourceKind::ShadowStage; break;
     case TessellationFixture::Triangle: result.source.kind = SceneSourceKind::Triangle; break;
@@ -109,7 +108,6 @@ const char* sceneSourceName(SceneSourceKind kind)
 {
     switch (kind) {
     case SceneSourceKind::Obj: return "OBJ";
-    case SceneSourceKind::Occlusion: return "Occlusion stage";
     case SceneSourceKind::ShadowCasters: return "Off-camera shadow caster";
     case SceneSourceKind::Acr: return "ACR";
     case SceneSourceKind::Mock: return "Mock (4 clusters)";
@@ -136,7 +134,7 @@ ScenePayloadBytes scenePayloadBytes(const SceneData& scene)
     return {uint64_t(scene.mesh.vertices.size()) * sizeof(Vertex),
             uint64_t(scene.dataset.indices.size() + scene.hierarchy.coarse.indices.size()) * sizeof(uint32_t),
             uint64_t(scene.dataset.clusters.size() + scene.hierarchy.coarse.clusters.size()) * sizeof(GpuClusterDesc),
-            scene.hierarchy.levels.size() * sizeof(LodLevel) + scene.hierarchy.nodes.size() * sizeof(LodNode) +
+            scene.hierarchy.levels.size() * sizeof(AcrLevelRecord) + scene.hierarchy.nodes.size() * sizeof(AcrNodeRecord) +
                 scene.hierarchy.children.size() * sizeof(uint32_t)};
 }
 

@@ -21,6 +21,6 @@ inline uint32_t sceneFileVersion(const SceneData& scene) { return scene.hierarch
 SceneData buildScene(MeshSource mesh, uint32_t maxTrianglesPerCluster = 64);
 SceneData makeMockScene();
 void validateScene(const SceneData& scene);
-// .obj builds the cluster hierarchy; .acr restores the stored geometry and links.
+// OBJ imports the M1 flat partition. ACR restores any geometry levels supplied in the file.
 SceneData loadScene(const std::filesystem::path& path);
 void saveScene(const std::filesystem::path& path, const SceneData& scene);

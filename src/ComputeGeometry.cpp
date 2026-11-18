@@ -309,7 +309,7 @@ void ComputeGeometry::prepare(const SceneGpuData& source, const ResolvedClusterS
         throw std::runtime_error("Source descriptor exceeds maxStorageBufferRange.");
     }
     auto plan = makeGeometryGenerationPlan(source.indexCount, source.clusterCount, selection, edgeSegments, limits_,
-                                           source.lodTriangleWork == VK_NULL_HANDLE);
+                                           source.triangleWork == VK_NULL_HANDLE);
     auto nextSelection = selection;
     GeneratedGeometry next;
     next.sourceRevision = source.sceneRevision;
@@ -337,8 +337,8 @@ void ComputeGeometry::prepare(const SceneGpuData& source, const ResolvedClusterS
             if (next.allocatedOutputBytes > limits_.maxOutputBytes) {
                 throw std::runtime_error("Aligned compute output allocation exceeds the 128 MiB budget.");
             }
-            if (source.lodTriangleWork) {
-                next.allocatedWorklistBytes = source.lodWorkAllocation;
+            if (source.triangleWork) {
+                next.allocatedWorklistBytes = source.triangleWorkAllocation;
             } else {
                 createBuffer(work, plan.worklistBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -351,7 +351,7 @@ void ComputeGeometry::prepare(const SceneGpuData& source, const ResolvedClusterS
             const VkDescriptorBufferInfo buffers[] = {
                 {source.vertexBuffer, 0, source.vertexOffset + vertexBytes},
                 {source.indexBuffer, 0, source.indexOffset + indexBytes},
-                {source.lodTriangleWork ? source.lodTriangleWork : work.handle, 0, plan.worklistBytes},
+                {source.triangleWork ? source.triangleWork : work.handle, 0, plan.worklistBytes},
                 {vertices.handle, 0, plan.vertexBytes},
                 {indices.handle, 0, plan.indexBytes}
             };
@@ -406,9 +406,9 @@ void ComputeGeometry::record(VkCommandBuffer command)
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
     vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), &params);
-    if (source_.lodCommands) {
+    if (source_.indirectCommands) {
         const uint32_t level = output_.edgeSegments == 8 ? 3 : output_.edgeSegments == 4 ? 2 : output_.edgeSegments == 2 ? 1 : 0;
-        vkCmdDispatchIndirect(command, source_.lodCommands, 16 + level * sizeof(VkDispatchIndirectCommand));
+        vkCmdDispatchIndirect(command, source_.indirectCommands, 16 + level * sizeof(VkDispatchIndirectCommand));
     } else {
         vkCmdDispatch(command, output_.workgroups, 1, 1);
     }

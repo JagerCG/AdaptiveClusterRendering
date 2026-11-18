@@ -78,8 +78,7 @@ void BenchmarkSession::add(const BenchmarkSample& sample)
 {
     require(active_, "No active benchmark accepts this sample.");
     checkTime(sample.gpuMainMs); checkTime(sample.gpuShadowMs);
-    checkTime(sample.cpuFrameMs); checkTime(sample.cpuLodMs); checkTime(sample.gpuLodMs);
-    checkTime(sample.cpuCullMs); checkTime(sample.gpuCullMs); checkTime(sample.gpuPyramidMs);
+    checkTime(sample.cpuFrameMs);
     checkTime(sample.cpuShadowCullMs); checkTime(sample.gpuShadowCullMs);
     checkTime(sample.cpuGenerateMs); checkTime(sample.gpuGenerateMs); checkTime(sample.gpuRenderMs);
     require(sample.cpuGenerateMs.has_value() == generated_, "Benchmark CPU generation timing has the wrong scope.");
@@ -143,11 +142,6 @@ std::string benchmarkJson(const BenchmarkReport& report)
     summary("gpu_main", &BenchmarkSample::gpuMainMs, true);
     summary("gpu_shadow", &BenchmarkSample::gpuShadowMs, true);
     summary("cpu_frame", &BenchmarkSample::cpuFrameMs, true);
-    summary("cpu_lod_and_wait", &BenchmarkSample::cpuLodMs, true);
-    summary("gpu_lod", &BenchmarkSample::gpuLodMs, true);
-    summary("cpu_visibility_and_wait", &BenchmarkSample::cpuCullMs, true);
-    summary("gpu_cull", &BenchmarkSample::gpuCullMs, true);
-    summary("gpu_hiz", &BenchmarkSample::gpuPyramidMs, true);
     summary("cpu_shadow_cull_and_wait", &BenchmarkSample::cpuShadowCullMs, true);
     summary("gpu_shadow_cull", &BenchmarkSample::gpuShadowCullMs, true);
     out << "\n  },\n  \"samples\": [";
@@ -161,11 +155,6 @@ std::string benchmarkJson(const BenchmarkReport& report)
         out << ",\"gpu_main_ms\":"; optionalTime(out, sample.gpuMainMs);
         out << ",\"gpu_shadow_ms\":"; optionalTime(out, sample.gpuShadowMs);
         out << ",\"cpu_frame_ms\":"; optionalTime(out, sample.cpuFrameMs);
-        out << ",\"cpu_lod_and_wait_ms\":"; optionalTime(out, sample.cpuLodMs);
-        out << ",\"gpu_lod_ms\":"; optionalTime(out, sample.gpuLodMs);
-        out << ",\"cpu_visibility_and_wait_ms\":"; optionalTime(out,sample.cpuCullMs);
-        out << ",\"gpu_cull_ms\":"; optionalTime(out,sample.gpuCullMs);
-        out << ",\"gpu_hiz_ms\":"; optionalTime(out,sample.gpuPyramidMs);
         out << ",\"cpu_shadow_cull_and_wait_ms\":"; optionalTime(out, sample.cpuShadowCullMs);
         out << ",\"gpu_shadow_cull_ms\":"; optionalTime(out, sample.gpuShadowCullMs); out << '}';
     }

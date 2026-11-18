@@ -31,15 +31,13 @@ int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const Sc
     RenderSettings settings;
     settings.shadows = true;
     settings.shadowCoverage = .30f;
-    settings.culling = CullMode::Frustum;
+    settings.frustumPreview = true;
     const auto draw = [&](bool generated = false) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         do {
             glfwPollEvents();
             if (!renderer.prepareFrame(window)) continue;
             renderer.setRenderSettings(settings);
-            if (settings.adaptiveLod) renderer.selectLod(camera, generated ? renderer.plannedDisplacementBound() : 0);
-            renderer.selectVisibility(camera, generated, false);
             if (generated) renderer.ensureGeneratedGeometry();
             if (renderer.drawFrame(camera, false, false, -1, generated, false, nullptr, true)) {
                 renderer.finishRenderMeasurement();
@@ -68,8 +66,9 @@ int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const Sc
 
     compare(false);
     const std::vector<uint32_t> mainIds{0,2,3}, casterIds{0,1};
-    expect(ids(renderer.mainSelection()) == mainIds && ids(renderer.shadowSelection()) == casterIds,
-           "Camera and light did not produce the two authored lists.");
+    expect(ids(renderer.clusterSelection()) == std::vector<uint32_t>({0,1,2,3}) &&
+           renderer.lastRecordedDraw().visibleClusters == mainIds.size() && ids(renderer.shadowSelection()) == casterIds,
+           "The camera preview and light did not draw the authored clusters.");
     RenderSettings cpu;
     cpu.frustumPreview = true;
     std::vector<uint32_t> expected;
@@ -100,10 +99,10 @@ int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const Sc
     renderer.setDisplacement({true,.08f});
     select({2,1,0});
     compare(true);
-    expect(ids(renderer.mainSelection()) == std::vector<uint32_t>({2,0}) &&
+    expect(ids(renderer.clusterSelection()) == std::vector<uint32_t>({2,1,0}) &&
            ids(renderer.shadowSelection()) == std::vector<uint32_t>({1,0}) &&
            renderer.lastRecordedDraw().shadowTriangles == 16,
-           "Equal-sized camera/light lists with different IDs incorrectly shared generated geometry.");
+           "Shadow generation did not preserve candidate order and displacement.");
     select({2,3});
     compare(true);
     const auto empty = renderer.readShadowDepth();
@@ -120,17 +119,15 @@ int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const Sc
            "Empty authored input fell back to all casters.");
 
     renderer.setClusterSelection({renderer.sceneGpuData().sceneRevision, ClusterSelectionMode::All, {}});
-    settings.culling = CullMode::HiZ;
     compare(true);
     const auto fixedLight = renderer.lastLightMatrix();
     const auto fixedMap = renderer.readShadowDepth();
     const auto fixedIds = ids(renderer.shadowSelection());
     camera.setPose({3.14159265f,0,1.5f});
     draw(true);
-    draw(true);
-    expect(renderer.visibilityStats().depthFrame && renderer.lastLightMatrix() == fixedLight &&
+    expect(renderer.lastLightMatrix() == fixedLight &&
            ids(renderer.shadowSelection()) == fixedIds && renderer.readShadowDepth() == fixedMap,
-           "Camera movement or its Hi-Z history changed the fixed-LOD light view.");
+           "Moving the camera changed a fixed light view.");
     settings.lightDirection = {-1,.7f,1};
     compare(true);
     expect(renderer.lastLightMatrix() != fixedLight && renderer.readShadowDepth() != fixedMap,
@@ -155,7 +152,7 @@ int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const Sc
     settings.shadows = true;
     settings.lightDirection = {0,0,1};
     settings.shadowCoverage = .30f;
-    settings.culling = CullMode::Off;
+    settings.frustumPreview = false;
     draw();
     expect(renderer.shadowSelection().ranges.empty(), "Undisplaced side marker should be outside the light.");
     renderer.setHeightField(makeHeightField(HeightPreset::White));
@@ -171,55 +168,15 @@ int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const Sc
     settings = {};
     settings.shadows = true;
     settings.shadowCoverage = .45f;
-    settings.culling = CullMode::HiZ;
     renderer.setHeightField(makeHeightField(HeightPreset::Waves));
     renderer.setDisplacement({true,.08f});
-    renderer.setHierarchyLevel(1);
     compare(false);
     compare(true);
     renderer.verifyGeneratedGeometry(realScene);
-    settings.adaptiveLod = true;
-    settings.lodPixels = 96;
-    compare(true);
     const auto counts = renderer.lastRecordedDraw();
-    expect(renderer.visibilityStats().depthFrame && counts.shadowCasters > 0 &&
-           counts.shadowCasters < counts.shadowCandidates && counts.shadowTriangles == 4 * renderer.shadowSelection().triangleCount(),
-           "Adaptive LOD, camera Hi-Z, displaced subdivision and independent light drawing disagree.");
-    const auto& levels = realScene.hierarchy.levels;
-    const auto distant = std::find_if(levels.begin(), levels.end(), [](const LodLevel& l) { return l.maxDiameterPixels != 0; });
-    if (distant != levels.end()) {
-        const auto regular = static_cast<uint32_t>(distant - levels.begin() - 1);
-        settings.shadowCoverage = 1;
-        for (bool generated : {false, true}) {
-            camera.setPose({0, 0, 20});
-            settings.adaptiveLod = false;
-            renderer.setHierarchyLevel(regular);
-            compare(generated);
-            const auto reference = renderer.readShadowDepth();
-            const auto light = renderer.lastLightMatrix();
-            const auto protectedTriangles = renderer.lastRecordedDraw().shadowTriangles;
-            expect(*std::min_element(reference.begin(), reference.end()) < 1, "Protected shadow reference is empty.");
-            // Negative control: forcing the camera proxy into the light must actually change its map.
-            renderer.setHierarchyLevel(static_cast<uint32_t>(levels.size() - 1));
-            draw(generated);
-            expect(reference != renderer.readShadowDepth(), "Distant shadow test does not distinguish the proxy.");
-            settings.adaptiveLod = true;
-            for (float distance : {20.f, 96.f, 256.f, 96.f, 20.f}) {
-                camera.setPose({0, 0, distance});
-                compare(generated);
-                expect(light == renderer.lastLightMatrix() && reference == renderer.readShadowDepth() &&
-                       renderer.lastRecordedDraw().shadowTriangles == protectedTriangles,
-                       "Switching the distant camera mesh changed a protected shadow texel.");
-                if (distance == 256) {
-                    expect(renderer.clusterSelection().triangleCount() == levels.back().indexCount / 3,
-                           "Expected the extreme-distance camera proxy.");
-                    std::cout << "Extreme camera / shadow triangles: " << renderer.lastRecordedDraw().triangles
-                              << " / " << protectedTriangles << (generated ? " (displaced).\n" : " (source).\n");
-                }
-            }
-        }
-    }
-    std::cout << "Shadow caster integration passed. Camera IDs 0,2,3; light IDs 0,1. Off-camera caster texel, "
-                 "exact depth maps, empty/reversed lists, displacement and real mixed LOD verified.\n";
+    expect(counts.shadowCasters > 0 && counts.shadowCasters < counts.shadowCandidates &&
+           counts.shadowTriangles == 4 * renderer.shadowSelection().triangleCount(),
+           "Displaced fixed input and light-space caster selection disagree.");
+    std::cout << "Verified off-camera shadows, depth images, empty and reversed lists, displacement and real mesh casters.\n";
     return 0;
 }

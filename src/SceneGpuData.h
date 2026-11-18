@@ -17,7 +17,7 @@ struct SceneUploadStats {
 };
 
 // All levels share the vertex array. Bind the cluster storage buffer at zero;
-// the three metadata offsets below are in 32-bit words. LodLevel / LodNode are
+// the three metadata offsets below are in 32-bit words. AcrLevelRecord / AcrNodeRecord are
 // std430 records. Traversal uses absolute node/cluster IDs and index ranges.
 struct ResidentHierarchy {
     VkDeviceSize allIndexOffset = 0;
@@ -45,9 +45,9 @@ struct SceneGpuData {
     uint32_t indexStride = sizeof(uint32_t);
     uint32_t clusterStride = sizeof(GpuClusterDesc);
     VkDescriptorSet clusterSet = VK_NULL_HANDLE; // set 0, binding 0, readonly storage buffer
-    // Borrowed from the GPU selector for mixed cuts. Word 4 starts four
-    // VkDispatchIndirectCommands (n=1,2,4,8); work contains absolute index addresses.
-    static constexpr uint32_t lodRecordStride = sizeof(uint32_t) + sizeof(VkDrawIndexedIndirectCommand);
-    VkBuffer lodCommands = VK_NULL_HANDLE, lodTriangleWork = VK_NULL_HANDLE;
-    VkDeviceSize lodRecordOffset = 0, lodWorkAllocation = 0;
+    // Optional device-generated work for the selected ranges. Word 4 starts four
+    // VkDispatchIndirectCommands (n=1,2,4,8); triangle addresses are relative to this index-buffer view.
+    static constexpr uint32_t drawRecordStride = sizeof(uint32_t) + sizeof(VkDrawIndexedIndirectCommand);
+    VkBuffer indirectCommands = VK_NULL_HANDLE, triangleWork = VK_NULL_HANDLE;
+    VkDeviceSize drawRecordOffset = 0, triangleWorkAllocation = 0;
 };

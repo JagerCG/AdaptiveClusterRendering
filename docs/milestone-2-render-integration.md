@@ -1,10 +1,8 @@
 # M2 Part 2 and rendering integration
 
-For the completed eight-module pipeline and the current shadow demo, see the [M2 acceptance record](milestone-2-acceptance.md).
+The current branch includes sampled camera depth, fixed-view replay, ACR v1/v2 storage and independent shadow caster selection. [Current demo and checks](milestone-2-acceptance.md)
 
-The [01/02 hierarchy handoff](../README.md#m2-mesh-hierarchy-and-acr-v2) implements mesh preprocessing and resident storage. The [03/06 handoff](../README.md#m2-gpu-lod-and-camera-depth) adds GPU-selected geometry, saved views and the sampled main camera depth for module 04. The notes below describe the earlier integration checkpoint.
-
-The [04/05/07 integration](../README.md#m2-gpu-visibility-drawing-and-subdivision) connects GPU frustum, hierarchy and Hi-Z visibility to camera drawing and displaced geometry. It includes exact-depth comparisons and an independent check of every Hi-Z level.
+The notes below describe the original Part 2 and Part 3 integration checkpoint.
 
 Updated 2026-11-16. This integrates the standalone Part 2 checkpoint `f5e9e8d`
 with member 3's PR #3, upstream `5224108`. No GPU LOD or hierarchy completion is

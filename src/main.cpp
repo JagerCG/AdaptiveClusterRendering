@@ -22,10 +22,9 @@ TessellationFixture parseFixtureName(const std::filesystem::path& name)
     if (name == "triangle") return TessellationFixture::Triangle;
     if (name == "plane") return TessellationFixture::Plane;
     if (name == "shadow") return TessellationFixture::ShadowStage;
-    if (name == "occlusion") return TessellationFixture::Occlusion;
     if (name == "shadow-casters") return TessellationFixture::ShadowCasters;
     if (name == "grid") return TessellationFixture::ClusterGrid;
-    throw std::runtime_error("Unknown fixture; choose triangle, plane, grid, shadow, occlusion or shadow-casters.");
+    throw std::runtime_error("Unknown fixture; choose triangle, plane, grid, shadow or shadow-casters.");
 }
 
 void printGlfwError(int code, const char* description)
@@ -136,16 +135,13 @@ int main(int argc, char** argv)
     const auto argument = [&](int i) { return std::filesystem::path(argv[i]); };
     const auto usage = [] {
         std::cout << "Usage: AdaptiveClusterRendering [model.obj | model.acr | --cube | --mock]\n"
-                     "       [--fixture triangle|plane|grid|shadow|occlusion|shadow-casters]\n"
+                     "       [--fixture triangle|plane|grid|shadow|shadow-casters]\n"
                      "       [--cluster-colors] [--bounds] [--compute-copy] [--verify-gpu] [--smoke-test]\n"
                      "       [--subdivision 1|2|4|8] [--wireframe]\n"
-                     "       [--geometry-level N] [--group-colors]\n"
-                     "       [--gpu-lod] [--lod-pixels P] [--level-colors] [--hide-ui]\n"
-                     "       [--view-config file.acrview] [--save-view file.acrview] [--lod-depth-smoke | --suzanne-lod-shape-smoke]\n"
+                     "       [--geometry-level N] [--hide-ui] [--view-config file.acrview] [--save-view file.acrview]\n"
                      "       [--shadows] [--shadow-bias 0..0.08] [--depth-view | --shadow-map]\n"
                      "       [--shadow-cull all|frustum] [--shadow-coverage 0.05..1] [--light-direction X Y Z] [--shadow-cull-smoke]\n"
                      "       [--frustum-preview] [--max-distance model_units] [--render-smoke]\n"
-                     "       [--cull off|frustum|hierarchy|hiz|hiz-flat] [--hiz-mip 0..31] [--rejected-bounds] [--visibility-smoke]\n"
                      "       [--displacement amplitude (0..1000)] [--heightmap file.pgm]\n"
                      "       [--selection all|first-last|empty|last-first]\n"
                      "       [--benchmark output.json [--benchmark-warmup 10] [--benchmark-samples 50]]\n"
@@ -208,53 +204,10 @@ int main(int argc, char** argv)
                 }
             for (int i = 1; i < argc; ++i) {
                 const auto option = argument(i);
-                if (option == "--cluster-colors") {
-                    options.clusterColors = true; options.renderSettings.groupColors = options.renderSettings.levelColors = false;
-                }
-                else if (option == "--group-colors") {
-                    options.renderSettings.groupColors = true; options.clusterColors = options.renderSettings.levelColors = false;
-                }
-                else if (option == "--gpu-lod") options.renderSettings.adaptiveLod = true;
-                else if (option == "--level-colors") {
-                    options.renderSettings.levelColors = true; options.clusterColors = options.renderSettings.groupColors = false;
-                }
+                if (option == "--cluster-colors") options.clusterColors = true;
                 else if (option == "--hide-ui") options.hidePanel = true;
-                else if (option == "--lod-depth-smoke" || option == "--suzanne-lod-shape-smoke") {
-                    options.lodDepthSmoke = true;
-                    options.suzanneShapeSmoke = option == "--suzanne-lod-shape-smoke";
-                }
-                else if (option == "--visibility-smoke")
-                    options.visibilitySmoke = true;
                 else if (option == "--shadow-cull-smoke")
                     options.shadowCullSmoke = true;
-                else if (option == "--rejected-bounds")
-                    options.renderSettings.showRejectedBounds = true;
-                else if (option == "--cull") {
-                    if (++i >= argc) throw std::runtime_error("Missing culling mode.");
-                    const auto mode = argument(i);
-                    if (mode == "off")
-                        options.renderSettings.culling = CullMode::Off;
-                    else if (mode == "frustum")
-                        options.renderSettings.culling = CullMode::Frustum;
-                    else if (mode == "hierarchy")
-                        options.renderSettings.culling = CullMode::Hierarchy;
-                    else if (mode == "hiz")
-                        options.renderSettings.culling = CullMode::HiZ;
-                    else if (mode == "hiz-flat")
-                        options.renderSettings.culling = CullMode::FlatHiZ;
-                    else
-                        throw std::runtime_error("Choose off, frustum, hierarchy, hiz or hiz-flat.");
-                }
-                else if (option == "--hiz-mip") {
-                    if (++i >= argc) throw std::runtime_error("Missing Hi-Z mip index.");
-                    const auto token = argument(i).u8string();
-                    if (token.empty() || token.find_first_not_of("0123456789") != std::string::npos ||
-                        std::stoul(token) > 31)
-                        throw std::runtime_error("Choose a Hi-Z mip in 0..31.");
-                    options.renderSettings.hiZMip = static_cast<uint32_t>(std::stoul(token));
-                    options.renderSettings.showHiZ = true;
-                    if (!usesHiZ(options.renderSettings.culling)) options.renderSettings.culling = CullMode::HiZ;
-                }
                 else if (option == "--view-config")
                     ++i; // Loaded before applying CLI overrides.
                 else if (option == "--save-view") {
@@ -269,7 +222,6 @@ int main(int argc, char** argv)
                     const auto parsed = std::stoull(value);
                     if (parsed > INT32_MAX) throw std::runtime_error("Geometry level is out of range.");
                     options.geometryLevel = static_cast<uint32_t>(parsed);
-                    options.renderSettings.adaptiveLod = false;
                 }
                 else if (option == "--bounds") options.showBounds = true;
                 else if (option == "--verify-gpu") options.verifyGpu = true;
@@ -294,14 +246,13 @@ int main(int argc, char** argv)
                 else if (option == "--shadow-map") options.renderSettings.display = RenderDisplay::ShadowMap;
                 else if (option == "--frustum-preview") options.renderSettings.frustumPreview = true;
                 else if (option == "--render-smoke") options.renderSmoke = true;
-                else if (option == "--shadow-bias" || option == "--shadow-coverage" || option == "--max-distance" || option == "--lod-pixels") {
+                else if (option == "--shadow-bias" || option == "--shadow-coverage" || option == "--max-distance") {
                     if (++i >= argc) throw std::runtime_error("Missing render setting value.");
                     const auto value = argument(i).u8string(); size_t consumed = 0;
                     const float number = std::stof(value, &consumed);
                     if (consumed != value.size()) throw std::runtime_error("Invalid render setting value.");
                     if (option == "--shadow-bias") options.renderSettings.shadowBias = number;
                     else if (option == "--shadow-coverage") options.renderSettings.shadowCoverage = number;
-                    else if (option == "--lod-pixels") { options.renderSettings.lodPixels = number; options.renderSettings.adaptiveLod = true; }
                     else options.renderSettings.maxDistance = number;
                 }
                 else if (option == "--benchmark") {
@@ -375,19 +326,11 @@ int main(int argc, char** argv)
                 }
             }
             validateRenderSettings(options.renderSettings);
-            if ((options.visibilitySmoke || options.shadowCullSmoke) &&
-                ((options.visibilitySmoke && options.shadowCullSmoke) || options.smokeTest || options.renderSmoke || options.lodDepthSmoke ||
-                                            !options.hierarchyRoundtripPath.empty() ||
-                                            !options.benchmarkPath.empty() || !options.saveConfigPath.empty()))
-                throw std::runtime_error("Run each visibility acceptance check separately from other test or export modes.");
-            if (options.smokeTest && options.renderSettings.culling != CullMode::Off)
-                throw std::runtime_error("Use --visibility-smoke for GPU culling checks.");
-            if (options.smokeTest && options.renderSettings.adaptiveLod)
-                throw std::runtime_error("Use --lod-depth-smoke for GPU selection checks.");
-            if (!options.saveConfigPath.empty() && (options.smokeTest || options.renderSmoke || options.lodDepthSmoke || !options.hierarchyRoundtripPath.empty()))
+            if (options.shadowCullSmoke && (options.smokeTest || options.renderSmoke || !options.hierarchyRoundtripPath.empty() ||
+                !options.benchmarkPath.empty() || !options.saveConfigPath.empty()))
+                throw std::runtime_error("Run the shadow caster check separately from other tests.");
+            if (!options.saveConfigPath.empty() && (options.smokeTest || options.renderSmoke || !options.hierarchyRoundtripPath.empty()))
                 throw std::runtime_error("Save a view separately from the acceptance checks.");
-            if (options.lodDepthSmoke && (options.renderSmoke || options.smokeTest || !options.hierarchyRoundtripPath.empty() || !options.benchmarkPath.empty()))
-                throw std::runtime_error("Run LOD/depth acceptance separately from other checks.");
             if (!options.hierarchyRoundtripPath.empty() && (options.renderSmoke || options.smokeTest || !options.benchmarkPath.empty()))
                 throw std::runtime_error("Run the hierarchy roundtrip separately from other test modes.");
             validateBenchmarkOptions(options.benchmarkOptions);
