@@ -8,6 +8,11 @@ displaced shadows, depth views and separate pass timings; use it for the current
 
 ## Start the demo
 
+For the blue mound shown in the presentation, open **Scene > Demo scene > Blue mound**.
+The saved view in `assets/views/m2-grid-mound.acrview` loads a built-in grid and height map.
+On **Surface**, toggle **Height displacement** to flatten or raise the grid. Enable **Wireframe**
+and choose 1, 2 or 4 segments per edge to compare the mesh at 8, 32 or 128 triangles.
+
 From the repository root:
 
 ```powershell
@@ -15,8 +20,7 @@ cmake --build --preset release --parallel 1
 .\build\Release\AdaptiveClusterRendering.exe --fixture grid --subdivision 8 --displacement 0.25 --cluster-colors --bounds
 ```
 
-Maximize the window. Collapse sections you are not discussing, or use the panel's
-scrollbar in a small window. **Test inputs** also offers a single triangle and a
+The grid opens on **Surface**. **Scene > Demo scene** also offers a single triangle and a
 continuous-UV plane. Use the plane/grid for displacement: the original Mock scene
 has zero UVs and is intended for storage checks.
 
@@ -26,13 +30,13 @@ has zero UVs and is intended for storage checks.
 | --- | --- | --- |
 | 0-15 s | Enable Wireframe. Set n to 1, 2, 4, then 8. | The four fixed clusters have 8 source triangles. The GPU output has 8, 32, 128 and 512 triangles. Source counts stay unchanged. n is segments per edge, so output grows as n squared. |
 | 15-30 s | Disable Wireframe; toggle Height displacement, change amplitude, then switch Waves to Mound. | Actual positions and face normals change on the GPU. Bounds expand conservatively with amplitude. This is geometry, not just a texture or color change. |
-| 30-45 s | Select First + last, then Empty, then All. Toggle GPU subdivision off/on. | Fixed source cluster IDs determine the work. Empty means zero output. Turning generation off draws the original flat source; turning it back on reuses the cached output when settings match. These IDs are a stand-in for future visibility output. |
-| 45-60 s | Expand Performance measurement and click Measure with 10 warmup / 50 measured runs. | Parameters and camera lock during measurement. Show GPU generation and render medians/p95 plus the output allocation. Explain that CPU generate + wait includes allocation and synchronization. |
-| Extra 20-30 s | Open Suzanne; Save + verify ACR, Load mock, Reload saved ACR. Expand Storage. | Geometry, partition and source IDs survive disk roundtrip exactly. ACR loads the existing partition. File bytes, resident payload/allocation and startup timings are separate quantities. |
+| 30-45 s | In Scene > Cluster inspection, select First + last, Empty and All. Return to Surface and toggle GPU subdivision. | Fixed source cluster IDs determine the work. Empty means zero output. Turning generation off draws the original flat source; turning it back on reuses the cached output when settings match. These IDs are a stand-in for future visibility output. |
+| 45-60 s | In Stats > Performance measurement, click Start measurement with 10 warmup / 50 measured runs. | Parameters and camera lock during measurement. Show GPU generation and render medians/p95 plus the output allocation. Explain that CPU generate + wait includes allocation and synchronization. |
+| Extra 20-30 s | In Scene, open Suzanne, choose Save + verify ACR, then Reload saved ACR. Expand Storage. | Geometry, partition and source IDs survive disk roundtrip exactly. ACR loads the existing partition. File bytes, resident payload/allocation and startup timings are separate quantities. |
 
 For a strict one-minute slot, demonstrate the grid and show the storage result in
-a prepared screenshot or slide. **Regenerate output** performs one generation;
-**Measure** performs a warmup followed by repeated work. Orbit/zoom and Wireframe
+a prepared screenshot or slide. **Stats > GPU output > Regenerate output** performs one generation.
+**Start measurement** runs warmup and measured repetitions. Orbit/zoom and Wireframe
 reuse the geometry in ordinary interactive mode, so their displayed last-generation
 time should not be described as a per-frame cost.
 

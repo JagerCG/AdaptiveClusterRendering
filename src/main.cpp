@@ -7,6 +7,12 @@
 #include "Viewer.h"
 #include "GeometryGenerationPlan.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -16,6 +22,20 @@
 #include <vector>
 
 namespace {
+
+std::filesystem::path executableDirectory(const std::filesystem::path& invocation)
+{
+#ifdef _WIN32
+    wchar_t file[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, file, 32768);
+    if (length > 0 && length < 32768) return std::filesystem::path(file).parent_path();
+#elif defined(__linux__)
+    std::error_code error;
+    const auto file = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (!error) return file.parent_path();
+#endif
+    return std::filesystem::absolute(invocation).parent_path();
+}
 
 TessellationFixture parseFixtureName(const std::filesystem::path& name)
 {
@@ -158,7 +178,9 @@ int main(int argc, char** argv)
     std::filesystem::path inputPath;
     ViewerOptions options;
     bool benchmarkCountsSpecified = false;
-    options.reportDirectory = std::filesystem::absolute(argument(0)).parent_path() / "benchmarks";
+    const auto programDirectory = executableDirectory(argument(0));
+    options.assetDirectory = programDirectory / "assets";
+    options.reportDirectory = programDirectory / "benchmarks";
     try {
         if (argc == 2 && argument(1) == "--help") { usage(); return 0; }
         if (argc == 4 && argument(1) == "--preprocess") {
@@ -378,7 +400,7 @@ int main(int argc, char** argv)
                 exitCode = runViewer(loadViewScene(*options.initialView),options);
             } else {
                 const auto path = !inputPath.empty() ? inputPath :
-                    std::filesystem::absolute(argv[0]).parent_path() / "assets" / "suzanne.obj";
+                    options.assetDirectory / "suzanne.obj";
                 exitCode = runViewer(loadSceneWithStats(path), options);
             }
         } catch (const std::exception& error) {

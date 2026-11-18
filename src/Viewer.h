@@ -29,6 +29,7 @@ struct ViewerOptions {
     BenchmarkOptions benchmarkOptions;
     std::filesystem::path benchmarkPath; // nonempty: hidden fixed-input measurement, then exit
     std::filesystem::path reportDirectory; // interactive exports
+    std::filesystem::path assetDirectory = "assets"; // bundled models, height maps and views
     bool smokeTest = false; // hidden, bounded run with scene replacement and all draw modes
     std::filesystem::path smokeRoundtripPath; // optional on-disk save/mock/reload verification
     std::filesystem::path hierarchyRoundtripPath;

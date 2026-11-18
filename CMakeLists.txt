@@ -136,6 +136,13 @@ file(GENERATE
     INPUT "${CMAKE_CURRENT_SOURCE_DIR}/assets/heightmaps/ramp-u.pgm"
     NEWLINE_STYLE UNIX
 )
+foreach(view IN ITEMS m2-grid-mound m2-shadow-casters m2-suzanne)
+    file(GENERATE
+        OUTPUT "$<TARGET_FILE_DIR:AdaptiveClusterRendering>/assets/views/${view}.acrview"
+        INPUT "${CMAKE_CURRENT_SOURCE_DIR}/assets/views/${view}.acrview"
+        NEWLINE_STYLE UNIX
+    )
+endforeach()
 
 if(MSVC)
     target_compile_options(acr_scene PRIVATE /W4 /permissive- /utf-8)

@@ -66,8 +66,8 @@ public:
     {
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.IniFilename = nullptr;
+        ImGui::GetIO().IniFilename = nullptr;
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 #ifdef _WIN32
         wchar_t windowsDirectory[MAX_PATH]{};
         const UINT length = GetWindowsDirectoryW(windowsDirectory, MAX_PATH);
@@ -75,17 +75,46 @@ public:
             const auto fontPath = std::filesystem::path(windowsDirectory) / "Fonts" / "msyh.ttc";
             std::error_code error;
             if (std::filesystem::is_regular_file(fontPath, error)) {
-                io.Fonts->AddFontDefault();
-                ImFontConfig font{};
-                font.MergeMode = true;
-                io.Fonts->AddFontFromFileTTF(fontPath.u8string().c_str(), 13.0f, &font);
+                // Use the scalable system font for both controls and Unicode model names.
+                ImGui::GetIO().Fonts->AddFontFromFileTTF(fontPath.u8string().c_str(), 19.0f);
             }
         }
 #endif
         ImGui::StyleColorsDark();
-        // Readable on a presentation display; independent of model/camera scale.
-        ImGui::GetStyle().FontScaleMain = 1.4f;
-        ImGui::GetStyle().ScaleAllSizes(1.2f);
+        auto& style = ImGui::GetStyle();
+        style.FontSizeBase = 19.0f;
+        style.WindowPadding = {14, 12};
+        style.FramePadding = {8, 4};
+        style.ItemSpacing = {8, 6};
+        style.WindowRounding = 8;
+        style.FrameRounding = 4;
+        style.PopupRounding = 4;
+        style.GrabRounding = 3;
+        style.TabRounding = 4;
+        // The preferred Vulkan attachment converts linear UI colors to sRGB at presentation.
+        style.Colors[ImGuiCol_WindowBg] = ImColor(3, 5, 8, 252);
+        style.Colors[ImGuiCol_PopupBg] = ImColor(6, 9, 13);
+        style.Colors[ImGuiCol_Text] = ImColor(238, 244, 245);
+        style.Colors[ImGuiCol_TextDisabled] = ImColor(112, 137, 151);
+        style.Colors[ImGuiCol_Border] = ImColor(18, 27, 35);
+        style.Colors[ImGuiCol_Separator] = style.Colors[ImGuiCol_Border];
+        style.Colors[ImGuiCol_FrameBg] = ImColor(13, 20, 28);
+        style.Colors[ImGuiCol_Button] = style.Colors[ImGuiCol_FrameBg];
+        style.Colors[ImGuiCol_Tab] = style.Colors[ImGuiCol_WindowBg];
+        style.Colors[ImGuiCol_Header] = ImColor(13, 31, 35);
+        style.Colors[ImGuiCol_TabSelected] = style.Colors[ImGuiCol_Header];
+        style.Colors[ImGuiCol_ButtonHovered] = ImColor(21, 43, 49);
+        style.Colors[ImGuiCol_FrameBgHovered] = style.Colors[ImGuiCol_ButtonHovered];
+        style.Colors[ImGuiCol_HeaderHovered] = style.Colors[ImGuiCol_ButtonHovered];
+        style.Colors[ImGuiCol_TabHovered] = style.Colors[ImGuiCol_ButtonHovered];
+        style.Colors[ImGuiCol_ButtonActive] = ImColor(19, 61, 54);
+        style.Colors[ImGuiCol_FrameBgActive] = style.Colors[ImGuiCol_ButtonActive];
+        style.Colors[ImGuiCol_HeaderActive] = style.Colors[ImGuiCol_ButtonActive];
+        style.Colors[ImGuiCol_CheckMark] = ImColor(64, 193, 155);
+        style.Colors[ImGuiCol_TabSelectedOverline] = style.Colors[ImGuiCol_CheckMark];
+        style.Colors[ImGuiCol_NavCursor] = style.Colors[ImGuiCol_CheckMark];
+        style.Colors[ImGuiCol_SliderGrab] = ImColor(41, 120, 104);
+        style.Colors[ImGuiCol_SliderGrabActive] = style.Colors[ImGuiCol_CheckMark];
         if (!ImGui_ImplGlfw_InitForVulkan(window, true)) {
             ImGui::DestroyContext();
             throw std::runtime_error("Could not initialize ImGui input.");
@@ -213,6 +242,7 @@ enum class ModelAction {
     Open,
     Save,
     ReloadSaved,
+    BlueMound,
     Mock,
     Triangle,
     Plane,
@@ -256,35 +286,25 @@ void showBytes(const char* label, uint64_t bytes)
 
 void drawStorageInfo(const ViewerModel& model, const SceneUploadStats& upload)
 {
+    if (!ImGui::CollapsingHeader("Storage")) return;
     const auto& source = model.loaded.source;
-    if (ImGui::CollapsingHeader("Storage", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Text("Source: %s", sceneSourceName(source.kind));
-        if (!source.path.empty()) ImGui::SetItemTooltip("%s", source.path.u8string().c_str());
-        if (source.fileVersion) {
-            ImGui::SameLine();
-            ImGui::Text("v%u", *source.fileVersion);
-        }
-        if (source.fileBytes) showBytes("Source file", *source.fileBytes);
-        else ImGui::TextUnformatted("Source file: N/A (generated)");
-        showBytes("GPU payload", upload.payload.total());
-        showBytes("Resident allocation", upload.residentAllocationBytes);
-        ImGui::SetItemTooltip("All geometry levels and hierarchy records, including allocation alignment.");
-        if (ImGui::TreeNode("Payload breakdown")) {
-            showBytes("Vertices", upload.payload.vertices);
-            showBytes("Render indices", upload.payload.indices);
-            showBytes("Cluster records", upload.payload.clusters);
-            showBytes("Hierarchy records", upload.payload.hierarchy);
-            ImGui::TreePop();
-        }
+    ImGui::Text("Source: %s", sceneSourceName(source.kind));
+    if (!source.path.empty()) ImGui::SetItemTooltip("%s", source.path.u8string().c_str());
+    if (source.fileVersion) {
+        ImGui::SameLine();
+        ImGui::Text("v%u", *source.fileVersion);
     }
-    if (ImGui::CollapsingHeader("Timings (last operation)", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Text("CPU prepare: %.3f ms", source.cpuPrepareMs);
-        ImGui::SetItemTooltip("%s; excludes camera setup and GPU upload.", scenePrepareLabel(source.kind));
-        ImGui::Text("CPU upload + wait: %.3f ms", upload.cpuUploadMs);
-        ImGui::SetItemTooltip("Validation, packing, allocation, staging, submission and waiting. Excludes debug readback.");
-        if (upload.gpuTransferMs) ImGui::Text("GPU copies: %.6f ms", *upload.gpuTransferMs);
-        else ImGui::TextUnformatted("GPU copies: N/A (unsupported)");
-        ImGui::SetItemTooltip("GPU timestamps around vertex/index + cluster copies. Single sample, not a benchmark.");
+    if (source.fileBytes) showBytes("Source file", *source.fileBytes);
+    else ImGui::TextDisabled("Generated in memory");
+    showBytes("GPU payload", upload.payload.total());
+    showBytes("Resident allocation", upload.residentAllocationBytes);
+    ImGui::SetItemTooltip("All resident geometry levels and hierarchy records, including alignment.");
+    if (ImGui::TreeNode("Payload breakdown")) {
+        showBytes("Vertices", upload.payload.vertices);
+        showBytes("Render indices", upload.payload.indices);
+        showBytes("Cluster records", upload.payload.clusters);
+        showBytes("Hierarchy records", upload.payload.hierarchy);
+        ImGui::TreePop();
     }
     if (model.lastSave && ImGui::TreeNode("Last verified save")) {
         ImGui::TextWrapped("%s", model.lastSave->path.filename().u8string().c_str());
@@ -296,58 +316,58 @@ void drawStorageInfo(const ViewerModel& model, const SceneUploadStats& upload)
     }
 }
 
-void drawBenchmarkPanel(BenchmarkSession& benchmark, BenchmarkOptions& options,
-                        const std::filesystem::path& exported, bool& start, std::string& status)
+void drawBenchmarkPanel(const BenchmarkSession& benchmark, BenchmarkOptions& options,
+                        const std::filesystem::path& exported, bool& start)
 {
-    if (!ImGui::CollapsingHeader("Performance measurement")) return;
-    ImGui::TextUnformatted("Build: " ACR_BUILD_CONFIG);
-    ImGui::TextWrapped("Fix the view and settings, then measure repeated work. Use Release for performance comparisons.");
-    if (benchmark.active()) {
-        const auto& report = benchmark.report();
-        ImGui::Text("Run %u / %u (%u warmup)", report.completedRuns,
-                    report.options.warmup + report.options.samples, report.options.warmup);
-        ImGui::TextWrapped("Scene, camera and settings are locked.");
-        if (ImGui::Button("Cancel measurement")) {
-            benchmark.cancel();
-            status = "Measurement cancelled; incomplete samples were not exported.";
-        }
-    } else {
+    if (!ImGui::CollapsingHeader("Performance measurement", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    ImGui::TextDisabled("Build: " ACR_BUILD_CONFIG);
+    if (!benchmark.active()) {
         int warmup = static_cast<int>(options.warmup), samples = static_cast<int>(options.samples);
-        ImGui::SetNextItemWidth(150);
+        ImGui::SetNextItemWidth(116);
         if (ImGui::InputInt("Warmup runs", &warmup)) options.warmup = static_cast<uint32_t>(std::clamp(warmup, 1, 1000));
-        ImGui::SetNextItemWidth(150);
+        ImGui::SetNextItemWidth(116);
         if (ImGui::InputInt("Measured runs", &samples)) options.samples = static_cast<uint32_t>(std::clamp(samples, 2, 10000));
-        const auto label = "Measure (" + std::to_string(options.warmup) + " + " + std::to_string(options.samples) + " runs)";
-        if (ImGui::Button(label.c_str())) start = true;
+        if (ImGui::Button("Start measurement")) start = true;
+        ImGui::SetItemTooltip("Lock the current view and settings, run the benchmark and export JSON.");
     }
     const auto& report = benchmark.report();
-    if (report.complete) {
-        ImGui::Separator();
-        ImGui::TextWrapped("Last completed run (fixed snapshot)");
-        ImGui::TextWrapped("%s | %s | n=%llu", report.context.labels.at("scene").c_str(),
-                           report.context.flags.at("generated_geometry") ? "generated" : "source",
-                           static_cast<unsigned long long>(report.context.counts.at("segments_per_edge")));
-        ImGui::TextWrapped("%s | amplitude %.3f | %llu triangles", report.context.labels.at("height_name").c_str(),
-                           report.context.values.at("amplitude"),
-                           static_cast<unsigned long long>(report.context.counts.at("drawn_triangles")));
+    if (!report.complete) return;
+    ImGui::SeparatorText("Last completed run");
+    ImGui::TextWrapped("%s | %s | n=%llu", report.context.labels.at("scene").c_str(),
+                       report.context.flags.at("generated_geometry") ? "GPU output" : "source",
+                       static_cast<unsigned long long>(report.context.counts.at("segments_per_edge")));
+    ImGui::TextWrapped("%s | amplitude %.3f | %llu triangles", report.context.labels.at("height_name").c_str(),
+                       report.context.values.at("amplitude"),
+                       static_cast<unsigned long long>(report.context.counts.at("drawn_triangles")));
+    if (ImGui::BeginTable("##measurements", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Pass", ImGuiTableColumnFlags_WidthStretch, 1.8f);
+        ImGui::TableSetupColumn("Median ms", ImGuiTableColumnFlags_WidthStretch, 1.05f);
+        ImGui::TableSetupColumn("P95 ms", ImGuiTableColumnFlags_WidthStretch, .9f);
+        ImGui::TableHeadersRow();
         const auto metric = [&](const char* label, std::optional<double> BenchmarkSample::* member) {
-            const auto s = summarizeBenchmark(report, member);
-            if (!s.count) { ImGui::Text("%s: N/A", label); return; }
+            const auto sample = summarizeBenchmark(report, member);
+            ImGui::TableNextColumn();
             ImGui::TextUnformatted(label);
-            ImGui::Text("  median %.6f ms", s.median);
-            ImGui::Text("  min %.6f / p95 %.6f", s.minimum, s.p95);
-            ImGui::Text("  max %.6f ms (%u samples)", s.maximum, s.count);
+            if (sample.count) ImGui::SetItemTooltip("Min %.6f ms | max %.6f ms | %u samples",
+                                                    sample.minimum, sample.maximum, sample.count);
+            ImGui::TableNextColumn();
+            if (sample.count) ImGui::Text("%.4f", sample.median); else ImGui::TextDisabled("N/A");
+            ImGui::TableNextColumn();
+            if (sample.count) ImGui::Text("%.4f", sample.p95); else ImGui::TextDisabled("N/A");
         };
-        metric("CPU generate + wait", &BenchmarkSample::cpuGenerateMs);
-        metric("GPU generate", &BenchmarkSample::gpuGenerateMs);
-        metric("GPU render total", &BenchmarkSample::gpuRenderMs);
-        metric("GPU main pass", &BenchmarkSample::gpuMainMs);
-        metric("GPU shadow pass", &BenchmarkSample::gpuShadowMs);
-        metric("GPU shadow caster culling", &BenchmarkSample::gpuShadowCullMs);
-        metric("CPU shadow cull + wait", &BenchmarkSample::cpuShadowCullMs);
-        metric("CPU frame (wall time)", &BenchmarkSample::cpuFrameMs);
-        ImGui::TextWrapped("GPU render total covers shadows, the main pass and any visible UI. CPU frame time includes queue and presentation waits.");
-        if (!exported.empty()) ImGui::TextWrapped("JSON: %s", exported.u8string().c_str());
+        metric("CPU gen + wait", &BenchmarkSample::cpuGenerateMs);
+        metric("GPU generation", &BenchmarkSample::gpuGenerateMs);
+        metric("GPU render", &BenchmarkSample::gpuRenderMs);
+        metric("GPU main", &BenchmarkSample::gpuMainMs);
+        metric("GPU shadows", &BenchmarkSample::gpuShadowMs);
+        metric("GPU caster cull", &BenchmarkSample::gpuShadowCullMs);
+        metric("CPU cull + wait", &BenchmarkSample::cpuShadowCullMs);
+        metric("CPU frame", &BenchmarkSample::cpuFrameMs);
+        ImGui::EndTable();
+    }
+    if (!exported.empty()) {
+        ImGui::TextWrapped("Report: %s", exported.filename().u8string().c_str());
+        ImGui::SetItemTooltip("%s", exported.u8string().c_str());
     }
 }
 
@@ -442,183 +462,341 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     return context;
 }
 
-ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds, int& boundsCluster,
-                      int& selectionPreset, const ResolvedClusterSelection& selection, bool& computeGeometry,
-                      bool& regenerate, const GeneratedGeometry& generated, int& segmentPreset, bool& wireframe,
-                      bool wireframeSupported, DisplacementSettings& displacement, int& heightPreset,
-                      const HeightField& height, uint64_t heightBytes, const SceneUploadStats& upload,
-                      std::string& status, BenchmarkSession& benchmark, BenchmarkOptions& benchmarkOptions,
-                      const std::filesystem::path& exported, bool& startBenchmark, RenderSettings& renderSettings,
-                      const SourceDrawStats& lastDraw, const ShadowCasterStats& shadowVis)
+enum class PanelTab { Scene, Surface, Shadows, Stats };
+
+PanelTab tabForScene(SceneSourceKind kind, bool generated, const RenderSettings& settings)
+{
+    if (kind == SceneSourceKind::ShadowStage || kind == SceneSourceKind::ShadowCasters ||
+        settings.display == RenderDisplay::ShadowMap) return PanelTab::Shadows;
+    if (kind == SceneSourceKind::Acr) return PanelTab::Scene;
+    if (generated || kind == SceneSourceKind::ClusterGrid || kind == SceneSourceKind::Plane ||
+        kind == SceneSourceKind::Triangle) return PanelTab::Surface;
+    return settings.shadows || settings.display == RenderDisplay::Depth ? PanelTab::Shadows : PanelTab::Scene;
+}
+
+// Keep paired buttons on one row when their labels fit, including in a narrow window.
+void sameLineIfFits(const char* nextLabel, float extraWidth = 0)
+{
+    const auto& style = ImGui::GetStyle();
+    const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+    const float needed = style.ItemSpacing.x + ImGui::CalcTextSize(nextLabel).x + 2 * style.FramePadding.x + extraWidth;
+    if (ImGui::GetItemRectMax().x + needed <= right) ImGui::SameLine();
+}
+
+void fieldLabel(const char* text)
+{
+    ImGui::TextDisabled("%s", text);
+    ImGui::SetNextItemWidth(-1);
+}
+
+void drawSceneTab(ViewerModel& model, const VulkanRenderer& renderer, bool& showBounds, int& boundsCluster,
+                  int& selectionPreset, RenderSettings& settings, ModelAction& action)
 {
     const auto& scene = model.loaded.scene;
-    ModelAction action = ModelAction::None;
-    ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f));
-    ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f));
-    ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 0.0f),
-                                      ImVec2(360.0f, glm::max(100.0f, ImGui::GetIO().DisplaySize.y - 24.0f)));
-    if (ImGui::Begin("Model", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
-        ImGui::TextWrapped("%s", model.name.c_str());
-        ImGui::Text("Vertices: %zu", scene.mesh.vertices.size());
-        const auto active = sceneLevel(scene,model.geometryLevel);
-        ImGui::Text("Source triangles: %u", active.indexCount / 3);
-        ImGui::Text("Clusters: %u", active.clusterCount);
-        ImGui::Text("Drawn triangles: %llu", static_cast<unsigned long long>(lastDraw.triangles));
-        ImGui::Text("Triangles / cluster: <= %u", scene.maxTrianglesPerCluster);
-        drawBenchmarkPanel(benchmark, benchmarkOptions, exported, startBenchmark, status);
+    const auto& selection = renderer.clusterSelection();
+    const auto active = sceneLevel(scene, model.geometryLevel);
+    fieldLabel("Demo scene");
+    if (ImGui::BeginCombo("##fixture", "Choose a scene...")) {
+        if (ImGui::Selectable("Blue mound")) action = ModelAction::BlueMound;
         ImGui::Separator();
-        ImGui::BeginDisabled(benchmark.active() || startBenchmark);
-        ImGui::Checkbox("Cluster colors", &clusterColors);
-        ImGui::BeginDisabled(!wireframeSupported);
-        ImGui::Checkbox("Wireframe", &wireframe);
-        ImGui::EndDisabled();
-        if (!wireframeSupported) ImGui::TextWrapped("Wireframe unavailable on this GPU.");
-        if (scene.hierarchy.levels.size() > 1 && ImGui::CollapsingHeader("Stored ACR geometry levels")) {
-            ImGui::TextUnformatted("Geometry level (L0 is original)");
-            ImGui::SetNextItemWidth(-1);
-            const auto label = [](int i, const AcrLevelRecord& l) {
-                return "L" + std::to_string(i) + (l.maxDiameterPixels ? " (distant)" : "") +
-                       "  |  " + std::to_string(l.indexCount / 3) + " triangles";
-            };
-            if (ImGui::BeginCombo("##geometryLevel", label(model.geometryLevel, active).c_str())) {
-                for (int i = 0; i < static_cast<int>(scene.hierarchy.levels.size()); ++i) {
-                    if (ImGui::Selectable(label(i, scene.hierarchy.levels[i]).c_str(), i == model.geometryLevel))
-                        model.geometryLevel = i;
-                }
-                ImGui::EndCombo();
+        if (ImGui::Selectable("Fixed cluster grid (2 x 2)")) action = ModelAction::ClusterGrid;
+        if (ImGui::Selectable("Continuous UV plane")) action = ModelAction::Plane;
+        if (ImGui::Selectable("Single triangle")) action = ModelAction::Triangle;
+        if (ImGui::Selectable("Off-camera shadow caster")) action = ModelAction::ShadowCasters;
+        if (ImGui::Selectable("Shadow stage (receiver + patch)")) action = ModelAction::ShadowStage;
+        if (ImGui::Selectable("Load mock")) action = ModelAction::Mock;
+        ImGui::EndCombo();
+    }
+    if (scene.hierarchy.levels.size() > 1) {
+        fieldLabel("Stored ACR geometry levels");
+        const auto label = [](int i, const AcrLevelRecord& level) {
+            return "L" + std::to_string(i) + (level.maxDiameterPixels ? " (distant)" : "") +
+                   "  |  " + std::to_string(level.indexCount / 3) + " triangles";
+        };
+        if (ImGui::BeginCombo("##geometryLevel", label(model.geometryLevel, active).c_str())) {
+            for (int i = 0; i < static_cast<int>(scene.hierarchy.levels.size()); ++i) {
+                if (ImGui::Selectable(label(i, scene.hierarchy.levels[i]).c_str(), i == model.geometryLevel))
+                    model.geometryLevel = i;
             }
+            ImGui::EndCombo();
         }
-        if (ImGui::CollapsingHeader("Rendering and shadows")) {
-            int display = static_cast<int>(renderSettings.display);
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##display", &display, "Shaded\0Depth (near is bright)\0Shadow map (light view)\0"))
-                renderSettings.display = static_cast<RenderDisplay>(display);
-            ImGui::Checkbox("Shadows", &renderSettings.shadows);
-            ImGui::Checkbox("Cull casters in light view", &renderSettings.shadowCulling);
-            ImGui::TextUnformatted("Shadow coverage (1 = full scene)");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##shadowCoverage", &renderSettings.shadowCoverage, .05f, 1.f, "%.2f");
-            ImGui::TextUnformatted("Shadow bias");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##shadowBias", &renderSettings.shadowBias, 0, .02f, "%.4f");
-            if (ImGui::Button("Light from left")) renderSettings.lightDirection = {-1, .7f, 1};
+        ImGui::SetItemTooltip("L0 is the original mesh. All levels are already resident on the GPU.");
+    }
+#ifdef _WIN32
+    ImGui::SeparatorText("Model files");
+    if (ImGui::Button("Open OBJ / ACR...")) action = ModelAction::Open;
+    sameLineIfFits("Save + verify ACR...");
+    if (ImGui::Button("Save + verify ACR...")) action = ModelAction::Save;
+#endif
+    if (model.lastSave && ImGui::Button("Reload saved ACR")) action = ModelAction::ReloadSaved;
+#ifdef _WIN32
+    ImGui::SeparatorText("Saved views");
+    if (ImGui::Button("Open view...")) action = ModelAction::OpenView;
+    sameLineIfFits("Save view...");
+    if (ImGui::Button("Save view...")) action = ModelAction::SaveView;
+#endif
+    ImGui::Spacing();
+    drawStorageInfo(model, renderer.uploadStats());
+    if (!ImGui::CollapsingHeader("Cluster inspection")) return;
+    fieldLabel("Manual selection");
+    ImGui::Combo("##selection", &selectionPreset, "All clusters\0First + last cluster\0Empty list\0Last + first cluster\0");
+    ImGui::TextWrapped("Selected: %zu / %u clusters, %llu triangles", selection.ranges.size(), active.clusterCount,
+                       static_cast<unsigned long long>(selection.triangleCount()));
+    if (!selection.allClusters && !selection.ranges.empty()) {
+        ImGui::Text("Source IDs: %u", selection.ranges.front().sourceClusterId);
+        if (selection.ranges.size() > 1) {
             ImGui::SameLine();
-            if (ImGui::Button("Light from right")) renderSettings.lightDirection = {1, .7f, 1};
-            ImGui::Text("Shadow casters: %u / %u", lastDraw.shadowCasters, lastDraw.shadowCandidates);
-            ImGui::Text("Shadow triangles: %llu", static_cast<unsigned long long>(lastDraw.shadowTriangles));
-            if (lastDraw.shadowPass && renderSettings.shadowCulling && shadowVis.gpuCullMs)
-                ImGui::Text("Last GPU caster test: %.4f ms", *shadowVis.gpuCullMs);
-            ImGui::Checkbox("CPU frustum preview", &renderSettings.frustumPreview);
-            ImGui::TextUnformatted("Max distance (model units)");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##maxDistance", &renderSettings.maxDistance, 0, 20, "%.2f");
-            ImGui::TextWrapped("Distance 0 disables the filter. These previews filter main draws only; generated geometry and shadow casters are unchanged.");
-            ImGui::Text("Main view: %u clusters", lastDraw.visibleClusters);
+            ImGui::Text(", %u", selection.ranges.back().sourceClusterId);
         }
-        ImGui::Checkbox("Cluster bounds", &showBounds);
-        if (showBounds) {
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderInt("##bounds", &boundsCluster, -1,
-                             static_cast<int>(active.clusterCount - 1), "Cluster %d");
-            ImGui::TextUnformatted("-1: all selected bounds");
+    }
+    ImGui::Checkbox("Cluster bounds", &showBounds);
+    if (showBounds) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderInt("##bounds", &boundsCluster, -1, static_cast<int>(active.clusterCount - 1), "Cluster %d");
+        ImGui::SetItemTooltip("-1 shows all selected bounds.");
+    }
+    ImGui::SeparatorText("Camera preview");
+    ImGui::Checkbox("CPU frustum preview", &settings.frustumPreview);
+    fieldLabel("Max distance (model units)");
+    ImGui::SliderFloat("##maxDistance", &settings.maxDistance, 0, 20, "%.2f");
+    ImGui::SetItemTooltip("Zero disables the distance filter. Both preview filters affect the camera draw only.");
+    ImGui::Text("Main view: %u clusters", renderer.lastRecordedDraw().visibleClusters);
+}
+
+void drawSurfaceTab(const VulkanRenderer& renderer, bool& computeGeometry, int& segmentPreset,
+                    DisplacementSettings& displacement, int& heightPreset, ModelAction& action)
+{
+    ImGui::Checkbox("GPU subdivision", &computeGeometry);
+    ImGui::SetItemTooltip("Generate a uniformly subdivided mesh on the GPU.");
+    ImGui::BeginDisabled(!computeGeometry);
+    ImGui::TextDisabled("Segments per edge");
+    const char* segments[] = {"1", "2", "4", "8"};
+    const float width = std::max(1.0f, (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4);
+    for (int i = 0; i < 4; ++i) {
+        if (i) ImGui::SameLine();
+        const bool selected = segmentPreset == i;
+        if (selected) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
         }
-        if (ImGui::Button("Reset camera")) {
-            model.camera.reset();
-        }
-        if (ImGui::Button("Hide panel (F1)")) action = ModelAction::HidePanel;
-#ifdef _WIN32
-        if (ImGui::Button("Save view...")) action = ModelAction::SaveView;
-        ImGui::SameLine();
-        if (ImGui::Button("Open view...")) action = ModelAction::OpenView;
-        if (ImGui::Button("Open OBJ / ACR...")) action = ModelAction::Open;
-        if (ImGui::Button("Save + verify ACR...")) action = ModelAction::Save;
-#endif
-        if (model.lastSave && ImGui::Button("Reload saved ACR")) action = ModelAction::ReloadSaved;
-        if (ImGui::Button("Load mock")) action = ModelAction::Mock;
-        if (ImGui::CollapsingHeader("Test inputs", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##fixture", "Load test scene...")) {
-                if (ImGui::Selectable("Shadow stage (receiver + patch)")) action = ModelAction::ShadowStage;
-                if (ImGui::Selectable("Off-camera shadow caster")) action = ModelAction::ShadowCasters;
-                if (ImGui::Selectable("Single triangle")) action = ModelAction::Triangle;
-                if (ImGui::Selectable("Continuous UV plane")) action = ModelAction::Plane;
-                if (ImGui::Selectable("Fixed cluster grid (2 x 2)")) action = ModelAction::ClusterGrid;
-                ImGui::EndCombo();
-            }
-            ImGui::TextUnformatted("Manual selection");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::Combo("##selection", &selectionPreset, "All clusters\0First + last cluster\0Empty list\0Last + first cluster\0");
-            ImGui::Text("Selected: %zu / %u clusters", selection.ranges.size(), active.clusterCount);
-            ImGui::Text("Selected triangles: %llu", static_cast<unsigned long long>(selection.triangleCount()));
-            if (!selection.allClusters && !selection.ranges.empty()) {
-                ImGui::Text("Source IDs: %u", selection.ranges.front().sourceClusterId);
-                if (selection.ranges.size() > 1) {
-                    ImGui::SameLine();
-                    ImGui::Text(", %u", selection.ranges.back().sourceClusterId);
+        if (ImGui::Button(segments[i], {width, 0})) segmentPreset = i;
+        if (selected) ImGui::PopStyleColor(4);
+        ImGui::SetItemTooltip("%u output triangle%s per input triangle.", 1u << (2 * i), i ? "s" : "");
+    }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::Checkbox("Height displacement", &displacement.enabled);
+    if (computeGeometry && displacement.enabled) {
+        fieldLabel("Height map");
+        if (ImGui::BeginCombo("##heightmap", renderer.heightField().name.c_str())) {
+            const char* presets[] = {"Waves", "Mound", "Ramp U", "Ramp V", "Neutral (0.5)", "Black (0)", "White (1)"};
+            for (int i = 0; i < IM_ARRAYSIZE(presets); ++i) {
+                if (ImGui::Selectable(presets[i], heightPreset == i)) {
+                    heightPreset = i;
+                    action = ModelAction::HeightPreset;
                 }
             }
-            if (selection.ranges.empty()) ImGui::TextWrapped("Empty selection: no mesh or bounds.");
-            ImGui::TextWrapped("Storage counts cover the full source; the selection controls what is drawn.");
-        }
-        if (ImGui::CollapsingHeader("Compute geometry", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox("GPU subdivision", &computeGeometry);
-            ImGui::TextUnformatted("Segments per edge (n)");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::Combo("##segments", &segmentPreset, "1 (copy)\0 2\0 4\0 8\0");
-            ImGui::TextWrapped("Each input triangle becomes n x n triangles. Enable Wireframe to see the edges.");
+#ifdef _WIN32
             ImGui::Separator();
-            ImGui::Checkbox("Height displacement", &displacement.enabled);
-            ImGui::TextUnformatted("Amplitude (model units)");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##amplitude", &displacement.amplitude, 0, 1, "%.3f", ImGuiSliderFlags_AlwaysClamp);
-            ImGui::SetItemTooltip("Offset = normalized source normal * amplitude * (2 * height - 1). Gray 0.5 is neutral.");
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##heightmap", height.name.c_str())) {
-                const char* names[] = {"Waves", "Mound", "Ramp U", "Ramp V", "Neutral (0.5)", "Black (0)", "White (1)"};
-                for (int i = 0; i < 7; ++i) if (ImGui::Selectable(names[i], heightPreset == i)) {
-                    heightPreset = i; action = ModelAction::HeightPreset;
-                }
-                ImGui::EndCombo();
-            }
-#ifdef _WIN32
-            if (ImGui::Button("Open height map (.pgm)...")) action = ModelAction::OpenHeight;
+            if (ImGui::Selectable("Open height map (.pgm)...")) action = ModelAction::OpenHeight;
 #endif
-            ImGui::Text("Height image: %u x %u", height.width, height.height);
-            showBytes("Height allocation", heightBytes);
-            if (!computeGeometry && displacement.enabled) ImGui::TextWrapped("Enable GPU subdivision to display displacement.");
-            ImGui::TextWrapped("UVs clamp to [0,1]. Displaced faces use geometric normals. Off / zero / neutral preserves source shading.");
-            if (computeGeometry && ImGui::Button("Regenerate output")) regenerate = true;
-            if (!computeGeometry) ImGui::TextUnformatted("Drawing: source buffers");
-            else if (!generated.valid) ImGui::TextUnformatted("Output: pending generation");
-            else {
-                ImGui::Text("Drawing: GPU output #%llu", static_cast<unsigned long long>(generated.generationRevision));
-                ImGui::Text("Generated level: n=%u", generated.edgeSegments);
-                ImGui::Text("Output vertices: %u", generated.vertexCount);
-                ImGui::Text("Output triangles: %u", generated.indexCount / 3);
-                ImGui::Text("Bounds padding: %.4f", generated.maxDisplacement);
-                showBytes("Output allocation", generated.allocatedOutputBytes);
-                showBytes("Work list allocation", generated.allocatedWorklistBytes);
-                ImGui::Text("CPU generate + wait: %.3f ms", generated.cpuGenerateMs);
-                ImGui::SetItemTooltip("Last generation: planning, allocation, upload, submission and wait. Excludes debug readback and frame fence wait.");
-                if (generated.gpuGenerateMs) ImGui::Text("GPU dispatch: %.6f ms", *generated.gpuGenerateMs);
-                else ImGui::TextUnformatted(generated.indexCount ? "GPU dispatch: N/A (unsupported)" : "GPU dispatch: N/A (empty)");
-                ImGui::SetItemTooltip("GPU timestamps around the dispatch. Single sample, not a benchmark.");
-                ImGui::TextWrapped("Cached until source, selection, n, height map or displacement changes. Camera and wireframe reuse it.");
-            }
+            ImGui::EndCombo();
         }
+        fieldLabel("Amplitude (model units)");
+        ImGui::SliderFloat("##amplitude", &displacement.amplitude, 0, 1, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SetItemTooltip("Offset along the source normal = amplitude x (2 x height - 1). Mid-gray is neutral.");
+    }
+    ImGui::EndDisabled();
+    if (!computeGeometry) ImGui::TextWrapped("Enable GPU subdivision to apply a height map.");
+}
+
+void drawShadowsTab(RenderSettings& settings, const SourceDrawStats& draw)
+{
+    fieldLabel("Display");
+    int display = static_cast<int>(settings.display);
+    if (ImGui::Combo("##display", &display, "Shaded\0Camera depth (near is bright)\0Shadow map (light view)\0"))
+        settings.display = static_cast<RenderDisplay>(display);
+    ImGui::Checkbox("Shadows", &settings.shadows);
+    ImGui::Checkbox("Cull casters in light view", &settings.shadowCulling);
+    ImGui::Text("Shadow casters: %u / %u", draw.shadowCasters, draw.shadowCandidates);
+    ImGui::Text("Shadow triangles: %llu", static_cast<unsigned long long>(draw.shadowTriangles));
+    ImGui::SeparatorText("Directional light");
+    if (ImGui::Button("Light from left")) settings.lightDirection = {-1, .7f, 1};
+    sameLineIfFits("Light from right");
+    if (ImGui::Button("Light from right")) settings.lightDirection = {1, .7f, 1};
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Shadow settings")) {
+        fieldLabel("Shadow coverage");
+        ImGui::SliderFloat("##shadowCoverage", &settings.shadowCoverage, .05f, 1.f, "%.2f");
+        ImGui::SetItemTooltip("1 covers the full scene from the light.");
+        fieldLabel("Shadow bias");
+        ImGui::SliderFloat("##shadowBias", &settings.shadowBias, 0, .02f, "%.4f");
+    }
+}
+
+void drawDiagnostics(const ViewerModel& model, const VulkanRenderer& renderer, bool computeGeometry, bool& regenerate)
+{
+    if (ImGui::CollapsingHeader("GPU output")) {
+        const auto& generated = renderer.generatedGeometry();
+        const auto& height = renderer.heightField();
+        ImGui::Text("Shared source vertices: %zu", model.loaded.scene.mesh.vertices.size());
+        ImGui::Text("Cluster capacity: %u triangles", model.loaded.scene.maxTrianglesPerCluster);
+        ImGui::Text("Height image: %u x %u", height.width, height.height);
+        showBytes("Height allocation", renderer.heightAllocationBytes());
+        if (!computeGeometry) ImGui::TextUnformatted("Drawing source buffers");
+        else if (generated.valid) {
+            ImGui::Text("GPU output #%llu | n=%u", static_cast<unsigned long long>(generated.generationRevision), generated.edgeSegments);
+            ImGui::Text("Output vertices: %u", generated.vertexCount);
+            ImGui::Text("Output triangles: %u", generated.indexCount / 3);
+            ImGui::Text("Bounds padding: %.4f", generated.maxDisplacement);
+            showBytes("Output allocation", generated.allocatedOutputBytes);
+            showBytes("Work list allocation", generated.allocatedWorklistBytes);
+            ImGui::Text("CPU generate + wait: %.3f ms", generated.cpuGenerateMs);
+            if (generated.gpuGenerateMs) ImGui::Text("GPU dispatch: %.6f ms", *generated.gpuGenerateMs);
+            else ImGui::TextDisabled("GPU dispatch: N/A");
+        } else ImGui::TextUnformatted("GPU output pending");
+        if (computeGeometry && ImGui::Button("Regenerate output")) regenerate = true;
+    }
+    if (ImGui::CollapsingHeader("Timings (last operation)")) {
+        const auto& source = model.loaded.source;
+        const auto& upload = renderer.uploadStats();
+        ImGui::Text("CPU prepare: %.3f ms", source.cpuPrepareMs);
+        ImGui::SetItemTooltip("%s; excludes camera setup and GPU upload.", scenePrepareLabel(source.kind));
+        ImGui::Text("CPU upload + wait: %.3f ms", upload.cpuUploadMs);
+        if (upload.gpuTransferMs) ImGui::Text("GPU copies: %.6f ms", *upload.gpuTransferMs);
+        else ImGui::TextDisabled("GPU copies: N/A");
+        const auto& draw = renderer.lastRecordedDraw();
+        const auto& light = renderer.shadowVisibilityStats();
+        if (draw.shadowPass && renderer.renderSettings().shadowCulling && light.gpuCullMs)
+            ImGui::Text("GPU caster test: %.4f ms", *light.gpuCullMs);
+    }
+}
+
+ModelAction drawPanel(ViewerModel& model, const VulkanRenderer& renderer, std::optional<PanelTab>& requestedTab,
+                      bool& clusterColors, bool& showBounds, int& boundsCluster, int& selectionPreset,
+                      bool& computeGeometry, bool& regenerate, int& segmentPreset, bool& wireframe,
+                      DisplacementSettings& displacement, int& heightPreset, std::string& status,
+                      BenchmarkSession& benchmark, BenchmarkOptions& benchmarkOptions,
+                      const std::filesystem::path& exported, bool& startBenchmark, RenderSettings& settings)
+{
+    const auto display = ImGui::GetIO().DisplaySize;
+    const float margin = std::clamp(std::min(display.x, display.y) * .018f, 4.0f, 12.0f);
+    const float width = std::min(std::clamp(display.x * .36f, 320.0f, 368.0f), std::max(1.0f, display.x - 2 * margin));
+    const float height = std::clamp(display.y - 2 * margin, 1.0f, 575.0f);
+    const bool compact = height < 420 || width < 310;
+    ImGui::SetNextWindowPos({margin, margin});
+    ImGui::SetNextWindowSize({width, 0});
+    ImGui::SetNextWindowSizeConstraints({width, 0}, {width, height});
+    auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings;
+    if (!compact) flags |= ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    ModelAction action = ModelAction::None;
+    if (ImGui::Begin("Viewer controls", nullptr, flags)) {
+        const bool locked = benchmark.active() || startBenchmark;
+        ImGui::PushFont(nullptr, 23);
+        ImGui::TextUnformatted(model.name.c_str());
+        ImGui::PopFont();
+        if (!model.loaded.source.path.empty()) ImGui::SetItemTooltip("%s", model.loaded.source.path.u8string().c_str());
+        const auto active = sceneLevel(model.loaded.scene, model.geometryLevel);
+        if (ImGui::BeginTable("##triangles", 2, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("Source triangles");
+            ImGui::SetItemTooltip("All source triangles in the active stored level.");
+            ImGui::PushFont(nullptr, 25);
+            ImGui::Text("%u", active.indexCount / 3);
+            ImGui::PopFont();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("Drawn triangles");
+            ImGui::SetItemTooltip("Triangles submitted in the last camera pass.");
+            ImGui::PushFont(nullptr, 25);
+            ImGui::TextColored(ImGui::GetStyleColorVec4(ImGuiCol_CheckMark), "%llu",
+                               static_cast<unsigned long long>(renderer.lastRecordedDraw().triangles));
+            ImGui::PopFont();
+            ImGui::EndTable();
+        }
+        ImGui::BeginDisabled(locked);
+        ImGui::BeginDisabled(!renderer.supportsWireframe());
+        ImGui::Checkbox("Wireframe", &wireframe);
+        if (!renderer.supportsWireframe() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Wireframe is unavailable on this GPU.");
         ImGui::EndDisabled();
-        if (!status.empty()) {
-            ImGui::Separator();
-            ImGui::TextWrapped("%s", status.c_str());
+        sameLineIfFits("Cluster colors", ImGui::GetFrameHeight());
+        ImGui::Checkbox("Cluster colors", &clusterColors);
+        PanelTab tab = requestedTab.value_or(PanelTab::Scene);
+        if (ImGui::BeginTabBar("##viewerTabs", ImGuiTabBarFlags_DrawSelectedOverline | ImGuiTabBarFlags_FittingPolicyShrink)) {
+            const auto tabItem = [&](PanelTab value, const char* name) {
+                if (ImGui::BeginTabItem(name, nullptr, requestedTab == value ? ImGuiTabItemFlags_SetSelected : 0)) {
+                    tab = value;
+                    ImGui::EndTabItem();
+                }
+            };
+            tabItem(PanelTab::Scene, "Scene");
+            tabItem(PanelTab::Surface, "Surface");
+            tabItem(PanelTab::Shadows, "Shadows");
+            tabItem(PanelTab::Stats, "Stats");
+            ImGui::EndTabBar();
+            requestedTab.reset();
         }
-        drawStorageInfo(model, upload);
+        ImGui::PushID(static_cast<int>(tab));
+        if (!compact) {
+            const auto& style = ImGui::GetStyle();
+            const float footer = ImGui::GetFrameHeightWithSpacing() + 2 * style.ItemSpacing.y + style.WindowPadding.y + 2;
+            const float maxBody = std::max(ImGui::GetFrameHeight(), height - ImGui::GetCursorPosY() - footer);
+            ImGui::SetNextWindowSizeConstraints({0, 0}, {width, maxBody});
+            ImGui::BeginChild("##tabBody", {0, 0}, ImGuiChildFlags_AutoResizeY);
+        }
+        if (!status.empty()) {
+            ImGui::TextWrapped("%s", status.c_str());
+            if (ImGui::SmallButton("Dismiss")) status.clear();
+            ImGui::Separator();
+        }
+        if (renderer.clusterSelection().ranges.empty())
+            ImGui::TextWrapped("Empty selection. Choose All clusters in Scene > Cluster inspection.");
+        switch (tab) {
+        case PanelTab::Scene:
+            drawSceneTab(model, renderer, showBounds, boundsCluster, selectionPreset, settings, action);
+            break;
+        case PanelTab::Surface:
+            drawSurfaceTab(renderer, computeGeometry, segmentPreset, displacement, heightPreset, action);
+            break;
+        case PanelTab::Shadows:
+            drawShadowsTab(settings, renderer.lastRecordedDraw());
+            break;
+        case PanelTab::Stats:
+            drawBenchmarkPanel(benchmark, benchmarkOptions, exported, startBenchmark);
+            drawDiagnostics(model, renderer, computeGeometry, regenerate);
+            break;
+        }
+        if (!compact) ImGui::EndChild();
+        ImGui::PopID();
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        if (benchmark.active()) {
+            const auto& report = benchmark.report();
+            ImGui::Text("Run %u / %u", report.completedRuns, report.options.warmup + report.options.samples);
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel measurement")) {
+                benchmark.cancel();
+                status = "Measurement cancelled.";
+            }
+        } else {
+            ImGui::BeginDisabled(startBenchmark);
+            if (ImGui::Button("Reset camera")) model.camera.reset();
+            ImGui::SetItemTooltip("R resets the camera. Drag the model to orbit or scroll to zoom.");
+            sameLineIfFits("Hide panel (F1)");
+            if (ImGui::Button("Hide panel (F1)")) action = ModelAction::HidePanel;
+            ImGui::EndDisabled();
+        }
     }
     ImGui::End();
     return action;
 }
 
 #ifdef _WIN32
-std::filesystem::path chooseSceneFile(GLFWwindow* window, bool save, bool height = false, bool config = false)
+std::filesystem::path chooseSceneFile(GLFWwindow* window, const std::filesystem::path& assets,
+                                      bool save, bool height = false, bool config = false)
 {
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{};
@@ -630,18 +808,14 @@ std::filesystem::path chooseSceneFile(GLFWwindow* window, bool save, bool height
     dialog.lpstrFile = path;
     dialog.nMaxFile = static_cast<DWORD>(sizeof(path) / sizeof(path[0]));
     dialog.lpstrDefExt = config ? L"acrview" : height ? L"pgm" : save ? L"acr" : L"obj";
-    // Start height-map browsing beside the bundled example, independent of cwd.
+    // Start Open dialogs with the examples that ship beside the executable.
     std::wstring initialDirectory;
-    if (height) {
-        wchar_t executable[32768]{};
-        const DWORD length = GetModuleFileNameW(nullptr, executable, 32768);
-        if (length > 0 && length < 32768) {
-            const auto directory = std::filesystem::path(executable).parent_path() / "assets" / "heightmaps";
-            std::error_code error;
-            if (std::filesystem::is_directory(directory, error)) {
-                initialDirectory = directory.wstring();
-                dialog.lpstrInitialDir = initialDirectory.c_str();
-            }
+    if (!save) {
+        const auto directory = height ? assets / "heightmaps" : config ? assets / "views" : assets;
+        std::error_code error;
+        if (std::filesystem::is_directory(directory, error)) {
+            initialDirectory = directory.wstring();
+            dialog.lpstrInitialDir = initialDirectory.c_str();
         }
     }
     dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER |
@@ -716,6 +890,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     bool computeGeometry = options.computeGeometry;
     bool wireframe = options.wireframe;
     auto renderSettings = options.renderSettings;
+    std::optional<PanelTab> requestedTab = tabForScene(model.loaded.source.kind, computeGeometry, renderSettings);
     auto displacement = options.displacement;
     int heightPreset = options.heightMapPath.empty() ? (options.initialView ? options.initialView->heightPreset : 0) : -1;
     int segmentPreset = options.edgeSegments == 8 ? 3 : options.edgeSegments == 4 ? 2 : options.edgeSegments == 2 ? 1 : 0;
@@ -785,6 +960,7 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
         } else {
             boundsCluster = -1;
             selectionPreset = appliedPreset = 0;
+            requestedTab = tabForScene(model.loaded.source.kind, computeGeometry, renderSettings);
         }
         if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(model.loaded.scene);
         showModelInfo(window.get(), model, renderer.uploadStats());
@@ -919,12 +1095,9 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
         const auto action =
             cliBenchmark || options.hidePanel
                 ? ModelAction::None
-                : drawPanel(model, clusterColors, showBounds, boundsCluster, selectionPreset,
-                            renderer.clusterSelection(), computeGeometry, regenerate, renderer.generatedGeometry(),
-                            segmentPreset, wireframe, renderer.supportsWireframe(), displacement, heightPreset,
-                            renderer.heightField(), renderer.heightAllocationBytes(), renderer.uploadStats(), status,
-                            benchmark, options.benchmarkOptions, exportedBenchmark, benchmarkRequested,
-                             renderSettings, renderer.lastRecordedDraw(), renderer.shadowVisibilityStats());
+                : drawPanel(model, renderer, requestedTab, clusterColors, showBounds, boundsCluster, selectionPreset,
+                            computeGeometry, regenerate, segmentPreset, wireframe, displacement, heightPreset, status,
+                            benchmark, options.benchmarkOptions, exportedBenchmark, benchmarkRequested, renderSettings);
         if (benchmarkRequested && !alreadyRequested) benchmarkStarted = std::chrono::steady_clock::now();
         renderer.setRenderSettings(renderSettings);
         renderer.setEdgeSegments(1u << segmentPreset);
@@ -1031,8 +1204,8 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                             ("benchmark-" + benchmarkUtcStamp() + "-" + std::to_string(++benchmarkSerial) + ".json");
                         writeBenchmarkReport(path, benchmark.report());
                         exportedBenchmark = std::filesystem::absolute(path);
-                        status = "Measurement complete; JSON saved to " + exportedBenchmark.u8string();
-                        std::cout << status << '\n';
+                        status = "Measurement complete. Report saved.";
+                        std::cout << "Measurement complete; JSON saved to " << exportedBenchmark.u8string() << '\n';
                         for (const auto& metric : {std::make_pair("CPU generate + wait", &BenchmarkSample::cpuGenerateMs),
                                                   std::make_pair("GPU generate", &BenchmarkSample::gpuGenerateMs),
                                                   std::make_pair("GPU render", &BenchmarkSample::gpuRenderMs)}) {
@@ -1086,9 +1259,12 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
             input = {};
             try {
                 if (action == ModelAction::HidePanel) options.hidePanel = true;
+                else if (action == ModelAction::BlueMound || action == ModelAction::SaveView || action == ModelAction::OpenView) {
+                    auto path = options.assetDirectory / "views" / "m2-grid-mound.acrview";
 #ifdef _WIN32
-                else if (action == ModelAction::SaveView || action == ModelAction::OpenView) {
-                    const auto path = chooseSceneFile(window.get(), action == ModelAction::SaveView, false, true);
+                    if (action != ModelAction::BlueMound)
+                        path = chooseSceneFile(window.get(), options.assetDirectory, action == ModelAction::SaveView, false, true);
+#endif
                     if (path.empty()) continue;
                     if (action == ModelAction::SaveView)
                         saveViewConfig(path, snapshot());
@@ -1121,21 +1297,22 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                         selectionPreset = v.selection;
                         appliedPreset = -1;
                         computeGeometry = v.generated;
+                        requestedTab = tabForScene(model.loaded.source.kind, computeGeometry, renderSettings);
                         wireframe = v.wire;
                         options.hidePanel = v.hidePanel;
                         segmentPreset = v.segments == 8 ? 3 : v.segments == 4 ? 2 : v.segments == 2 ? 1 : 0;
                         options.benchmarkOptions = v.sampling;
                         int w, h;
                         glfwGetWindowSize(window.get(), &w, &h);
-                        if (w != v.width || h != v.height) {
+                        if (action != ModelAction::BlueMound && (w != v.width || h != v.height)) {
                             if (glfwGetWindowAttrib(window.get(), GLFW_MAXIMIZED)) glfwRestoreWindow(window.get());
                             glfwSetWindowSize(window.get(), v.width, v.height);
                         }
                     }
-                    status = (action == ModelAction::SaveView ? "Saved view: " : "Restored view: ") +
-                             path.filename().u8string();
+                    if (action == ModelAction::BlueMound) status.clear();
+                    else status = (action == ModelAction::SaveView ? "Saved view: " : "Restored view: ") +
+                                  path.filename().u8string();
                 }
-#endif
                 else if (action == ModelAction::HeightPreset) {
                     renderer.setHeightField(makeHeightField(static_cast<HeightPreset>(heightPreset)));
                     heightPath.clear();
@@ -1162,7 +1339,8 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
                 }
 #ifdef _WIN32
                 else {
-                    const auto path = chooseSceneFile(window.get(), action == ModelAction::Save, action == ModelAction::OpenHeight);
+                    const auto path = chooseSceneFile(window.get(), options.assetDirectory,
+                                                      action == ModelAction::Save, action == ModelAction::OpenHeight);
                     if (!path.empty()) {
                         if (action == ModelAction::OpenHeight) {
                             renderer.setHeightField(loadHeightField(path));

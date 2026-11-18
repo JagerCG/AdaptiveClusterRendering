@@ -1,0 +1,12 @@
+ACR_VIEW 4
+source 6 ""
+window 1280 760 0
+camera 0 -1.11 2.95
+level 0
+draw 0 0 -1 0 0 0
+light 0 .002 -.65 -.70 .57
+preview 0 0
+geometry 1 4 1 .8
+height 1 ""
+sample 10 50
+shadow_cull 0 1

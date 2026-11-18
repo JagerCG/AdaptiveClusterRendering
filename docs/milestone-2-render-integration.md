@@ -53,7 +53,7 @@ each. Its 4 input triangles become 256 at n=8. Waves/Mound keep the receiver neu
 at its constant UV (0,0) while deforming the patch. Arbitrary custom height maps can
 also displace the receiver; it is ordinary scene geometry, not a special render pass.
 
-1. Maximize the window. Expand **Rendering and shadows** and choose **Light from
+1. Maximize the window. Open **Shadows** and choose **Light from
    left**, which separates the patch from its shadow clearly in the initial view.
 2. Toggle **Shadows**. The projected dark shape disappears/reappears.
 3. Toggle **Height displacement**, change its amplitude, or choose Mound/Waves.
@@ -62,13 +62,13 @@ also displace the receiver; it is ordinary scene geometry, not a special render 
 4. Switch Shaded -> Depth -> Shadow map. The first depth view follows the camera;
    the shadow map follows the light. Rotate the camera: the directional shadow
    projection and cached generated result remain stable.
-5. In **Test inputs**, select **Empty list**: no mesh, bounds or shadow casters
+5. In **Scene > Cluster inspection**, select **Empty list**: no mesh, bounds or shadow casters
    remain. Restore **All clusters**. On the four-cluster grid, compare ordered
    subsets with cluster colors on and off.
 6. Enable CPU frustum preview or set a small positive maximum distance. Main draws
    can become empty without falling back to All; the shadow caster set is unchanged.
    Set distance back to 0 to disable that filter.
-7. Expand **Performance measurement**, fix the view/settings, and measure. The
+7. Open **Stats > Performance measurement**, fix the view/settings, and measure. The
    controls lock while sampling and the JSON records the display, light, bias,
    visibility settings and both main/shadow triangle counts.
 

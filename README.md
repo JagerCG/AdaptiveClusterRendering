@@ -54,14 +54,34 @@ Use `cmake --build --preset release` to build the Release version in `build/Rele
 The upstream Ninja configure presets remain available with build presets `ninja-debug`
 and `ninja-release`; configure each matching preset in an MSVC developer environment first.
 
+## Viewer controls
+
+The sidebar shows the active model, source triangles and triangles drawn by the camera. Wireframe and cluster colors stay available above four tabs.
+
+| Tab | Controls |
+| --- | --- |
+| Scene | Open models and views, save and verify ACR files, switch stored levels, inspect clusters and storage. |
+| Surface | Enable GPU subdivision, choose 1/2/4/8 segments per edge and adjust height displacement. |
+| Shadows | Switch shaded/depth views, change the directional light and inspect shadow casters. |
+| Stats | Run or cancel benchmarks, inspect generated buffers and see upload timings. |
+
+Choose **Scene > Demo scene > Blue mound** for the presentation grid. It opens on **Surface**
+with four segments per edge, the Mound height map and amplitude 0.80. Toggle **Height displacement**
+to compare the flat grid and the mound at the same 128 drawn triangles. The build copies
+the presets to `assets/views` beside the executable. To launch the same view from the repository root:
+
+```powershell
+.\build\Release\AdaptiveClusterRendering.exe --view-config assets/views/m2-grid-mound.acrview
+```
+
 ## M1 demo
 
-1. Start the viewer. The bundled Suzanne model should show **2,012 vertices, 3,936 triangles, and 117 clusters** in the Model panel.
+1. Start the viewer. The bundled Suzanne model should show **2,012 vertices, 3,936 triangles, and 117 clusters** across the sidebar summary, **Scene > Cluster inspection** and **Stats > GPU output**.
 2. Toggle **Cluster colors**. The same model should show different colors across cluster boundaries.
 3. Drag with the left mouse button to orbit and use the wheel to zoom. Press **R** or click **Reset camera** to return to the initial view.
 4. Enable **Cluster bounds**. Use the slider to inspect one cluster, or select **-1** for all bounds. The line vertices are generated from the GPU cluster buffer, with depth testing.
 5. Use **Save + verify ACR...** to save the preprocessed scene and compare a reload against every persisted field, then **Reload saved ACR** for a fixed-view comparison. ACR loading preserves the existing partition and IDs without running the cluster builder.
-6. Click **Load mock** to switch to four fixed clusters (16 vertices / 16 triangles). Mock and real scenes share validation, serialization and GPU upload.
+6. Choose **Scene > Demo scene > Load mock** to switch to four fixed clusters (16 vertices / 16 triangles). Mock and real scenes share validation, serialization and GPU upload.
 7. Open another OBJ or ACR file. The viewer fits the camera and updates counts. An invalid file reports an error while keeping the previous scene available.
 8. Press **Esc** or close the window to exit.
 
@@ -98,7 +118,7 @@ The main pass draws the fixed cluster selection. `VulkanRenderer::cameraDepth()`
 
 ## M2 Part 2: storage diagnostics demo
 
-1. Start with Suzanne. The **Storage** section identifies the OBJ source and its
+1. Start with Suzanne. **Scene > Storage** identifies the OBJ source and its
    file size. Hover the source name for its full path and a byte count for its exact
    value. Expand **Payload breakdown** for vertex, rendering-index and cluster bytes.
 2. Enable cluster colors/bounds, select one cluster, and adjust the camera.
@@ -109,7 +129,7 @@ The main pass draws the fixed cluster selection. `VulkanRenderer::cameraDepth()`
    current camera, level and cluster selection. The source displays its ACR version and the
    load/upload measurements refresh. A file that no longer matches is rejected;
    use **Open OBJ / ACR...** to deliberately load it as a different scene.
-4. Click **Load mock**, then open the saved ACR through the file picker. Confirm
+4. Choose **Scene > Demo scene > Load mock**, then open the saved ACR through the file picker. Confirm
    the counts return from 16 vertices / 16 triangles / 4 clusters to
    2,012 / 3,936 / 117. A normal Open fits the camera to the newly loaded model.
 5. The sections collapse and the panel scrolls when needed. **Last verified save**
@@ -140,7 +160,7 @@ timings. Use the [repeated measurement workflow](#m2-part-2-repeated-measurement
 
 ## M2 Part 2: test inputs and selection preview
 
-Use **Test inputs > Load test scene...** to switch inputs, or launch one directly:
+Use **Scene > Demo scene** to switch inputs, or launch one directly:
 
 ```powershell
 .\build\Debug\AdaptiveClusterRendering.exe --fixture triangle
@@ -164,7 +184,7 @@ For a quick demonstration:
 
 1. Load the grid and enable **Cluster colors** and **Cluster bounds**. With
    **All clusters**, four patches and eight triangles are selected.
-2. Change **Preview selection** to **First + last cluster**. Only source IDs
+2. Change **Scene > Cluster inspection > Manual selection** to **First + last cluster**. Only source IDs
    **0 and 3** remain visible, with **2 selected clusters / 4 triangles**. Colors
    still use the original IDs. Bounds are restricted to the selected geometry.
 3. Select **Empty list**. Selected counts become zero and both mesh and bounds
@@ -185,7 +205,7 @@ lists expected source counts, sizes and subdivision reference values.
 
 ## M2 Part 2: compute copy-through (Step 4)
 
-Enable **Compute geometry > GPU subdivision** with **Segments per edge = 1 (copy)**, or launch:
+Enable **Surface > GPU subdivision** with **Segments per edge = 1**, or launch:
 
 ```powershell
 .\build\Debug\AdaptiveClusterRendering.exe --fixture grid --compute-copy --cluster-colors --bounds --verify-gpu
@@ -254,7 +274,7 @@ Suggested demonstration:
    against **Output triangles**. Vertices are unshared: output vertices = 3 × triangles.
 2. Load **Fixed cluster grid (2 x 2)** and enable **Cluster colors**. At n=8, All
    yields 512 triangles; First + last yields 256 with original IDs 0,3. Empty yields
-   zero geometry. Level changes also work while empty or while drawing the source.
+   zero geometry at every subdivision level.
 3. Toggle **GPU subdivision** off/on with the same selection and camera. Wireframe
    compares the original topology to the generated topology; filled rendering
    retains the same surface. Camera and wireframe changes reuse the output.
@@ -303,8 +323,8 @@ Suggested demonstration:
    changing the height map, amplitude or displacement toggle regenerates it.
 5. **Open height map (.pgm)...** opens beside the bundled `ramp-u.pgm` example on
    Windows. Select it to tilt the plane using a loaded image. File selection can be
-   cancelled without changing the current image or output. Scroll the panel in a
-   small window to see output counts, bounds padding, allocations and timings.
+   cancelled without changing the current image or output. Open **Stats > GPU output**
+   for the generated counts, bounds padding, allocations and timings.
 
 Height files are **PGM P2 (ASCII) or P5 (binary, 8/16 bit)**, one image per file,
 maximum 2048x2048. Samples are interpreted as linear numbers, without gamma
@@ -331,7 +351,7 @@ still saves the unchanged source. See the [Step 6 interface and validation recor
 
 ## M2 Part 2: repeated measurement
 
-Expand **Performance measurement** to run 10 warmup + 50 measured repetitions by
+Open **Stats > Performance measurement** to run 10 warmup + 50 measured repetitions by
 default. The viewer locks the scene, view and settings, forces a new generation
 on every run, and exports JSON with individual samples, median, p95 and range.
 Cancel or resize discards the incomplete batch. The UI labels the completed

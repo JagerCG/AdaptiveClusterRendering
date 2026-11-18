@@ -10,8 +10,8 @@ From the repository root after a Release build, run
 .\build\Release\AdaptiveClusterRendering.exe --view-config assets/views/m2-shadow-casters.acrview
 ```
 
-1. Open **Rendering and shadows**. A patch outside the camera view casts the shadow in the middle of the receiver.
-2. Leave **Shadow coverage** at **0.30**. Toggle **Cull casters in light view**. The main pass submits 4 clusters and 32 triangles. The light goes from 4 clusters and 32 triangles to 2 clusters and 16 triangles. The receiver keeps its shadow.
+1. Open the **Shadows** tab. A patch outside the camera view casts the shadow in the middle of the receiver.
+2. Under **Shadow settings**, leave **Shadow coverage** at **0.30**. Toggle **Cull casters in light view**. The main pass submits 4 clusters and 32 triangles. The light goes from 4 clusters and 32 triangles to 2 clusters and 16 triangles. The receiver keeps its shadow.
 3. Switch **Shadows** off and on, then choose **Shadow map (light view)** to see the light's depth. Rotate the camera to show its independence from the light.
 
 ## Fixed inputs and geometry
