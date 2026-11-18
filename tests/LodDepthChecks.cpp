@@ -23,11 +23,22 @@ std::vector<uint32_t> referenceCut(const SceneData& s, const OrbitCamera& camera
     const auto& h = s.hierarchy;
     const auto aspect = float(size.width) / size.height;
     const glm::dmat4 vp = camera.viewProjection(aspect);
+    auto lo = s.dataset.clusters.front().boundsMin, hi = s.dataset.clusters.front().boundsMax;
+    for (const auto& cluster : s.dataset.clusters) {
+        lo = glm::min(lo, cluster.boundsMin);
+        hi = glm::max(hi, cluster.boundsMax);
+    }
+    const float footprint = projectedDiameterPixels(lo - pad, hi + pad, vp, size.width, size.height);
+    const auto excluded = std::find_if(h.levels.begin(), h.levels.end(), [&](const LodLevel& level) {
+        return level.maxDiameterPixels && footprint > level.maxDiameterPixels;
+    });
+    const auto eligible = excluded == h.levels.end() ? h.nodes.size() : excluded->firstNode;
     std::vector<uint32_t> todo, ids;
     for (uint32_t n = 0; n < h.levels.back().nodeCount; ++n)
         todo.push_back(h.levels.back().firstNode + n);
     while (!todo.empty()) {
-        const auto& node = h.nodes[todo.back()];
+        const auto id = todo.back();
+        const auto& node = h.nodes[id];
         todo.pop_back();
         double nearest = std::numeric_limits<double>::infinity();
         for (int corner = 0; corner < 8; ++corner) {
@@ -36,7 +47,7 @@ std::vector<uint32_t> referenceCut(const SceneData& s, const OrbitCamera& camera
                                    corner & 4 ? node.boundsMax.z + pad : node.boundsMin.z - pad};
             nearest = std::min(nearest, (vp * glm::dvec4(point, 1)).w);
         }
-        if (!node.childCount || (pixels > 0 && nearest > camera.nearPlane(aspect) &&
+        if (!node.childCount || (id < eligible && pixels > 0 && nearest > camera.nearPlane(aspect) &&
                                  node.error * double(camera.focalPixels(size.height)) / nearest <= pixels)) {
             for (uint32_t i = 0; i < node.clusterCount; ++i)
                 ids.push_back(node.firstCluster + i);
@@ -139,6 +150,26 @@ void checkSuzanneCrownHeight(const CameraDepthView& info, const std::vector<floa
     std::cout << "Overhead crown height change: " << maxChange << " model units across " << samples << " samples.\n";
     expect(samples > 100 && maxChange < .035, "Suzanne's adaptive LOD lost too much crown height.");
 }
+
+bool silhouetteWithin(VkExtent2D size, const std::vector<float>& from, const std::vector<float>& to, int pixels)
+{
+    const int w = static_cast<int>(size.width), h = static_cast<int>(size.height);
+    bool covered = false;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const auto i = size_t(y) * w + x;
+            if (from[i] >= 1) continue;
+            covered = true;
+            if (to[i] < 1) continue;
+            bool found = false;
+            for (int row = std::max(0, y - pixels); !found && row <= std::min(h - 1, y + pixels); ++row)
+                for (int col = std::max(0, x - pixels); col <= std::min(w - 1, x + pixels); ++col)
+                    found |= to[size_t(row) * w + col] < 1;
+            if (!found) return false;
+        }
+    }
+    return covered;
+}
 } // namespace
 
 int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& scene, OrbitCamera camera, bool suzanneShape)
@@ -167,6 +198,13 @@ int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& sc
     };
     if (suzanneShape) {
         camera.reset();
+        auto wheel = camera;
+        for (int step = 0; step < 60; ++step) wheel.zoom(-1.f);
+        expect(std::abs(wheel.pose().z - 256.f) < .001f, "Scroll wheel could not reach the extreme-distance limit.");
+        auto restored = camera;
+        restored.setPose(wheel.pose());
+        wheel.zoom(1.f);
+        expect(wheel.pose().z < restored.pose().z && wheel.pose().z > 12.f, "Scroll wheel could not return from the limit.");
         const float distance = camera.pose().z;
         const auto capture = [&](float pitch, float budget) {
             camera.setPose({0, pitch, distance});
@@ -185,6 +223,52 @@ int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& sc
         const auto fineTop = capture(1.463f, 0);
         const auto coarseTop = capture(1.463f, 96);
         checkSuzanneCrownHeight(r.cameraDepth(), fineTop, coarseTop);
+        const auto size = r.renderExtent();
+        auto lo = scene.dataset.clusters.front().boundsMin, hi = scene.dataset.clusters.front().boundsMax;
+        for (const auto& c : scene.dataset.clusters) {
+            lo = glm::min(lo, c.boundsMin);
+            hi = glm::max(hi, c.boundsMax);
+        }
+        const float aspect = float(size.width) / size.height;
+        for (uint32_t level = 1; level < scene.hierarchy.levels.size(); ++level) {
+            const auto& proxy = scene.hierarchy.levels[level];
+            if (!proxy.maxDiameterPixels) continue;
+            int worst = 0;
+            for (glm::vec2 view : {glm::vec2{0,0}, {.785f,0}, {1.57f,0}, {2.35f,0}, {3.1415f,0},
+                                   {-.78f,.42f}, {0,1.46f}, {0,-.75f}}) {
+                // Find the entry size by projecting the box, independent of the on-screen triangle count.
+                float near = 12, far = 256;
+                for (int step = 0; step < 16; ++step) {
+                    const float mid = .5f * (near + far);
+                    camera.setPose({view, mid});
+                    if (projectedDiameterPixels(lo, hi, camera.viewProjection(aspect), size.width, size.height)
+                        > .99f * proxy.maxDiameterPixels) near = mid;
+                    else far = mid;
+                }
+                camera.setPose({view, far * .97f});
+                s.adaptiveLod = true;
+                s.lodPixels = 65536;
+                draw();
+                expect(r.lodStats().clustersPerLevel[level] == 0, "Distant proxy appeared before its footprint gate.");
+                camera.setPose({view, far});
+                s.adaptiveLod = false;
+                r.setHierarchyLevel(level - 1);
+                draw();
+                const auto before = r.readCameraDepth();
+                s.adaptiveLod = true;
+                s.lodPixels = 96;
+                draw();
+                expect(r.lastRecordedDraw().triangles == proxy.indexCount / 3, "Distance cut did not draw the proxy.");
+                const auto after = r.readCameraDepth();
+                int delta = 0;
+                while (delta <= 2 && !(silhouetteWithin(size, before, after, delta) &&
+                                       silhouetteWithin(size, after, before, delta))) ++delta;
+                expect(delta <= 2, "Distant LOD lost the silhouette at its entry size.");
+                worst = std::max(worst, delta);
+            }
+            std::cout << "Distant L" << level << ": " << proxy.indexCount / 3 << " triangles, eight views, max switch "
+                      << worst << " px.\n";
+        }
         return 0;
     }
     auto checkCut = [&](const SceneData& source, float pixels, float padding = 0) {
@@ -219,15 +303,21 @@ int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& sc
     }
     draw();
     const auto fine = r.readCameraDepth();
-    const auto first = scene.hierarchy.levels.front(), last = scene.hierarchy.levels.back();
+    const auto& levels = scene.hierarchy.levels;
+    const auto first = levels.front();
+    const auto firstDistant = std::find_if(levels.begin(), levels.end(), [](const LodLevel& level) {
+        return level.maxDiameterPixels != 0;
+    });
+    const auto protectedLevel = static_cast<uint32_t>(firstDistant - levels.begin() - 1);
+    const auto last = levels[protectedLevel];
     expect(checkCut(scene, 0) == first.indexCount / 3, "Strict threshold did not retain full detail.");
     draw();
     expect(r.readCameraDepth() == fine, "Indirect fine rendering differs from manual L0.");
-    expect(checkCut(scene, 65536) == last.indexCount / 3, "Loose threshold did not select all roots.");
+    expect(checkCut(scene, 65536) == last.indexCount / 3, "Close-up selected a distant proxy or missed a protected root.");
     draw();
     const auto coarse = r.readCameraDepth();
     s.adaptiveLod = false;
-    r.setHierarchyLevel(static_cast<uint32_t>(scene.hierarchy.levels.size() - 1));
+    r.setHierarchyLevel(protectedLevel);
     draw();
     expect(coarse == r.readCameraDepth() && coarse != fine, "Root draw geometry diverged from manual coarse level.");
     uint64_t prev = first.indexCount / 3;
@@ -244,7 +334,7 @@ int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& sc
     camera.zoom(12);
     const auto nearCount = checkCut(scene, 96);
     camera = baseline;
-    camera.zoom(-18);
+    camera.setPose({baseline.pose().x, baseline.pose().y, 12.f});
     const auto farCount = checkCut(scene, 96);
     expect(nearCount > farCount, "Camera distance did not change actual selected geometry.");
     camera = baseline;

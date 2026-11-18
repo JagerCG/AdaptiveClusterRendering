@@ -14,7 +14,7 @@ struct alignas(16) LodLevel {
     uint32_t firstNode, nodeCount, firstCluster, clusterCount;
     uint32_t firstIndex, indexCount;
     float buildMs;
-    uint32_t reserved = 0;
+    uint32_t maxDiameterPixels = 0; // zero for regular levels; whole-object footprint limit for distant proxies
 };
 
 struct alignas(16) LodNode {

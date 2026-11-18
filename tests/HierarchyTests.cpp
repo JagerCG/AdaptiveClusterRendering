@@ -54,17 +54,22 @@ void checkCuts(const SceneData& s)
 {
     const auto& h = s.hierarchy;
     size_t reductions = 0;
+    const auto firstDistant = std::find_if(h.levels.begin(), h.levels.end(), [](const LodLevel& l) { return l.maxDiameterPixels != 0; });
     for (const auto& n : h.nodes) {
         if (!n.childCount) continue;
+        const bool protectedRegion = firstDistant == h.levels.end() || n.firstCluster < firstDistant->firstCluster;
         Surface before, after;
         for (uint32_t i = 0; i < n.childCount; ++i)
             addNode(before, s, h.nodes[h.children[n.firstChild + i]]);
         addNode(after, s, n);
-        check(before.boundary == after.boundary, "Parent changed oriented boundary edges or an attribute seam.");
+        if (protectedRegion)
+            check(before.boundary == after.boundary, "Protected parent changed oriented boundary edges or an attribute seam.");
+        else
+            check(n.childCount == 1 && !after.vertices.empty(), "Distant proxy merged or discarded a region.");
         check(std::includes(before.vertices.begin(), before.vertices.end(), after.vertices.begin(),
                             after.vertices.end()),
               "Coarse geometry references a vertex outside its child regions.");
-        for (int axis = 0; axis < 3; ++axis) {
+        for (int axis = 0; protectedRegion && axis < 3; ++axis) {
             const auto extent = [&](const Surface& surface) {
                 const auto ends =
                     std::minmax_element(surface.vertices.begin(), surface.vertices.end(), [&](auto a, auto b) {
@@ -107,6 +112,8 @@ int main(int argc, char** argv)
         check(h.levels.size() >= 3 && h.levels.back().indexCount < s.dataset.indices.size() / 2,
               "Suzanne must contain real progressively coarser geometry.");
         checkCuts(s);
+        check(h.levels.back().maxDiameterPixels && h.levels.back().indexCount / 3 <= 48,
+              "Suzanne must reach a separate, very low polygon count at extreme distance.");
         auto repeated = buildScene(s.mesh, s.maxTrianglesPerCluster);
         check(repeated.hierarchy.levels.size() == h.levels.size(), "Unstable level count.");
         for (size_t i = 0; i < h.levels.size(); ++i)
@@ -115,6 +122,10 @@ int main(int argc, char** argv)
         const auto saved = saveSceneVerified(dir / "hierarchy.acr", s);
         auto restored = loadSceneWithStats(saved.path);
         check(restored.source.fileVersion == 2 && sameSceneData(s, restored.scene), "ACR v2 roundtrip failed.");
+        const auto cube = buildScene(makeCube());
+        const auto ordinary = saveSceneVerified(dir / "ordinary-v2.acr", cube);
+        check(!cube.hierarchy.levels.back().maxDiameterPixels && sameSceneData(cube, loadScene(ordinary.path)),
+              "Ordinary ACR v2 hierarchy lost backward compatibility.");
         auto damaged = s;
         damaged.hierarchy.children[0] = UINT32_MAX;
         reject([&] { validateScene(damaged); });
@@ -128,6 +139,9 @@ int main(int argc, char** argv)
         reject([&] { validateScene(damaged); });
         damaged = s;
         damaged.hierarchy.levels[1].firstCluster++;
+        reject([&] { validateScene(damaged); });
+        damaged = s;
+        damaged.hierarchy.levels.back().maxDiameterPixels = 0;
         reject([&] { validateScene(damaged); });
         const auto truncated = dir / "truncated.acr";
         std::filesystem::copy_file(saved.path, truncated, std::filesystem::copy_options::overwrite_existing);

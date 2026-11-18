@@ -32,6 +32,7 @@ struct SourceDrawStats {
 
 struct LodSelectionStats {
     std::vector<uint32_t> clustersPerLevel;
+    std::optional<float> footprintPixels;
     double cpuMs = 0;
     std::optional<double> gpuMs;
 };
@@ -75,7 +76,7 @@ public:
     const VisibilityStats& visibilityStats() const { return cameraList_.stats; }
     const VisibilityStats& shadowVisibilityStats() const { return lightList_.stats; }
     const ResolvedClusterSelection& mainSelection() const { return cameraList_.active ? cameraList_.selection : selection_; }
-    const ResolvedClusterSelection& shadowSelection() const { return lightList_.active ? lightList_.selection : selection_; }
+    const ResolvedClusterSelection& shadowSelection() const { return lightList_.active ? lightList_.selection : shadowCandidates(); }
     const SceneGpuData& mainScene() const { return cameraList_.active ? cameraList_.scene : sceneGpu_; }
     std::vector<float> readHiZ(); // all valid mips in order for acceptance
     const LodSelectionStats& lodStats() const { return lodStats_; }
@@ -134,9 +135,12 @@ private:
         VkDeviceSize resultCapacity = 0, workCapacity = 0;
         VkDescriptorSet set = VK_NULL_HANDLE;
     };
-    const SceneGpuData& shadowScene() const { return lightList_.active ? lightList_.scene : sceneGpu_; }
+    const ResolvedClusterSelection& shadowCandidates() const { return regularCasters_.sceneRevision ? regularCasters_ : selection_; }
+    const SceneGpuData& shadowSource() const { return regularCasters_.sceneRevision ? regularCasterScene_ : sceneGpu_; }
+    const SceneGpuData& shadowScene() const { return lightList_.active ? lightList_.scene : shadowSource(); }
     void buildVisibilityList(VisibilityList& list, const glm::mat4& vp, VkExtent2D extent, float padding,
-                             bool hierarchy, uint64_t depthFrame);
+                             bool hierarchy, uint64_t depthFrame, const ResolvedClusterSelection& candidates,
+                             const SceneGpuData& source);
     void prepareShadowPass(bool generated, bool forceCulling);
 
     struct SwapchainImage {
@@ -236,11 +240,15 @@ private:
     std::vector<LodLevel> residentLevels_;
     std::vector<uint32_t> clusterGroups_; // absolute cluster ID -> parent group for coloring
     std::vector<uint32_t> clusterLevels_;
+    glm::vec3 boundsMin_{}, boundsMax_{};
+    uint32_t firstDistantCluster_ = 0;
+    struct ClusterSpan { uint32_t first, count; };
+    std::vector<ClusterSpan> distantCasterSpans_; // distant cluster ID -> last protected region
     struct LodPush {
         glm::vec4 cameraZ{};
         float focalPixels = 0, budget = 0, nearPlane = 0, padding = 0;
         uint32_t nodeWord = 0, nodes = 0, blocks = 0, gridX = 0;
-        uint32_t clusterCapacity = 0, triangleCapacity = 0, phase = 0;
+        uint32_t clusterCapacity = 0, triangleCapacity = 0, phase = 0, eligibleNodes = 0;
     };
     LodPush lastLod_{};
     LodSelectionStats lodStats_;
@@ -253,6 +261,8 @@ private:
     VkPipeline lodPipeline_ = VK_NULL_HANDLE;
     VkQueryPool lodQueries_ = VK_NULL_HANDLE;
     ResolvedClusterSelection selection_;
+    ResolvedClusterSelection regularCasters_;
+    SceneGpuData regularCasterScene_;
     VisibilityList cameraList_, lightList_;
     bool separateShadowGeometry_ = false;
     uint64_t lightCandidateRevision_ = 0, lightFitRevision_ = 0;

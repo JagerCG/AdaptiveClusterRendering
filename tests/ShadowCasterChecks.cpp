@@ -185,6 +185,40 @@ int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const Sc
     expect(renderer.visibilityStats().depthFrame && counts.shadowCasters > 0 &&
            counts.shadowCasters < counts.shadowCandidates && counts.shadowTriangles == 4 * renderer.shadowSelection().triangleCount(),
            "Adaptive LOD, camera Hi-Z, displaced subdivision and independent light drawing disagree.");
+    const auto& levels = realScene.hierarchy.levels;
+    const auto distant = std::find_if(levels.begin(), levels.end(), [](const LodLevel& l) { return l.maxDiameterPixels != 0; });
+    if (distant != levels.end()) {
+        const auto regular = static_cast<uint32_t>(distant - levels.begin() - 1);
+        settings.shadowCoverage = 1;
+        for (bool generated : {false, true}) {
+            camera.setPose({0, 0, 20});
+            settings.adaptiveLod = false;
+            renderer.setHierarchyLevel(regular);
+            compare(generated);
+            const auto reference = renderer.readShadowDepth();
+            const auto light = renderer.lastLightMatrix();
+            const auto protectedTriangles = renderer.lastRecordedDraw().shadowTriangles;
+            expect(*std::min_element(reference.begin(), reference.end()) < 1, "Protected shadow reference is empty.");
+            // Negative control: forcing the camera proxy into the light must actually change its map.
+            renderer.setHierarchyLevel(static_cast<uint32_t>(levels.size() - 1));
+            draw(generated);
+            expect(reference != renderer.readShadowDepth(), "Distant shadow test does not distinguish the proxy.");
+            settings.adaptiveLod = true;
+            for (float distance : {20.f, 96.f, 256.f, 96.f, 20.f}) {
+                camera.setPose({0, 0, distance});
+                compare(generated);
+                expect(light == renderer.lastLightMatrix() && reference == renderer.readShadowDepth() &&
+                       renderer.lastRecordedDraw().shadowTriangles == protectedTriangles,
+                       "Switching the distant camera mesh changed a protected shadow texel.");
+                if (distance == 256) {
+                    expect(renderer.clusterSelection().triangleCount() == levels.back().indexCount / 3,
+                           "Expected the extreme-distance camera proxy.");
+                    std::cout << "Extreme camera / shadow triangles: " << renderer.lastRecordedDraw().triangles
+                              << " / " << protectedTriangles << (generated ? " (displaced).\n" : " (source).\n");
+                }
+            }
+        }
+    }
     std::cout << "Shadow caster integration passed. Camera IDs 0,2,3; light IDs 0,1. Off-camera caster texel, "
                  "exact depth maps, empty/reversed lists, displacement and real mixed LOD verified.\n";
     return 0;

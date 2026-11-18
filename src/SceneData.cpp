@@ -18,6 +18,7 @@ namespace {
 constexpr std::array<char, 8> kMagic{'A', 'C', 'R', 'M', '1', '\r', '\n', '\0'};
 constexpr uint32_t kHeaderBytes = 64;
 constexpr uint32_t kHierarchyHeaderBytes = 72;
+constexpr uint32_t kDistantFootprints = 1u; // ACR v2 flag: the final level word is a projected diameter in pixels
 constexpr uint32_t kVertexBytes = 32;
 constexpr uint32_t kClusterBytes = 48;
 constexpr uint64_t kMaxFileBytes = 512ull * 1024 * 1024;
@@ -145,7 +146,8 @@ SceneData readScene(const std::filesystem::path& path)
     const uint32_t clusterCount = readU32(in);
     const uint32_t capacity = readU32(in);
     require(readU32(in) == kVertexBytes && readU32(in) == kClusterBytes, "Unsupported ACR record layout.");
-    require(readU32(in) == 0, "Unsupported ACR flags.");
+    const auto flags = readU32(in);
+    require(flags == 0 || (version == 2 && flags == kDistantFootprints), "Unsupported ACR flags.");
     require(readU32(in) == vertexCount, "Invalid ACR position ID count.");
     const uint32_t levels = readU32(in), nodes = readU32(in), children = readU32(in);
     uint32_t coarseIndices = 0, coarseClusters = 0;
@@ -194,6 +196,8 @@ SceneData readScene(const std::filesystem::path& path)
         h.levels.push_back({readU32(in), readU32(in), readU32(in), readU32(in), readU32(in), readU32(in),
                             readFloat(in), readU32(in)});
     }
+    require(bool(flags & kDistantFootprints) == std::any_of(h.levels.begin(), h.levels.end(),
+                [](const LodLevel& l) { return l.maxDiameterPixels != 0; }), "Invalid ACR distant footprint flag.");
     h.nodes.reserve(nodes);
     for (uint32_t i = 0; i < nodes; ++i) {
         h.nodes.push_back({readVec3(in), readFloat(in), readVec3(in), readU32(in), readU32(in), readU32(in),
@@ -303,6 +307,7 @@ void saveScene(const std::filesystem::path& path, const SceneData& scene)
     const auto clusters = static_cast<uint32_t>(scene.dataset.clusters.size());
     const auto version = sceneFileVersion(scene);
     const auto& h = scene.hierarchy;
+    const uint32_t flags = !h.levels.empty() && h.levels.back().maxDiameterPixels ? kDistantFootprints : 0u;
     const auto levels = static_cast<uint32_t>(h.levels.size()), nodes = static_cast<uint32_t>(h.nodes.size());
     const auto children = static_cast<uint32_t>(h.children.size());
     const auto coarseIndices = static_cast<uint32_t>(h.coarse.indices.size());
@@ -317,7 +322,7 @@ void saveScene(const std::filesystem::path& path, const SceneData& scene)
     out.write(kMagic.data(), kMagic.size());
     for (uint32_t value :
          {version, version == 1 ? kHeaderBytes : kHierarchyHeaderBytes, vertices, sourceIndices, indices, clusters,
-          scene.maxTrianglesPerCluster, kVertexBytes, kClusterBytes, 0u, vertices, levels, nodes, children}) {
+          scene.maxTrianglesPerCluster, kVertexBytes, kClusterBytes, flags, vertices, levels, nodes, children}) {
         writeU32(out, value);
     }
     if (version == 2) { writeU32(out,coarseIndices); writeU32(out,coarseClusters); }
@@ -333,7 +338,7 @@ void saveScene(const std::filesystem::path& path, const SceneData& scene)
     for (uint32_t id = 0; id < coarseClusters; ++id) writeCluster(out,h.coarse.clusters[id],clusters+id);
     for (const auto& l : h.levels) {
         for (auto v : {l.firstNode,l.nodeCount,l.firstCluster,l.clusterCount,l.firstIndex,l.indexCount}) writeU32(out,v);
-        writeFloat(out,l.buildMs); writeU32(out,l.reserved);
+        writeFloat(out,l.buildMs); writeU32(out,l.maxDiameterPixels);
     }
     for (const auto& n : h.nodes) {
         writeVec3(out, n.boundsMin);

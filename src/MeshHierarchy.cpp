@@ -134,7 +134,7 @@ std::unordered_set<uint32_t> groupLocks(const SceneData& scene, const Groups& gr
 }
 
 void appendParent(SceneData& scene, const std::vector<uint32_t>& children, const std::unordered_set<uint32_t>& locked,
-                  const std::vector<uint32_t>& wedge)
+                  const std::vector<uint32_t>& wedge, unsigned distantGrid)
 {
     auto& h = scene.hierarchy;
     MeshSource patch;
@@ -172,7 +172,8 @@ void appendParent(SceneData& scene, const std::vector<uint32_t>& children, const
     constexpr double firstLevelPlaneFraction = .0025;
     const auto reductionLevel = static_cast<int>(h.levels.size()) - 1;
     const double maxPlaneDistance = std::ldexp(firstLevelPlaneFraction * diameter, reductionLevel);
-    const double bound = parent.error + simplifyPatch(patch, locked, maxPlaneDistance);
+    const double bound = parent.error + (distantGrid ? simplifyDistantPatch(patch, distantGrid)
+                                                     : simplifyPatch(patch, locked, maxPlaneDistance));
     parent.error = static_cast<float>(bound);
     if (parent.error < bound) parent.error = std::nextafter(parent.error, std::numeric_limits<float>::infinity());
     auto rebuilt = buildClusters(patch, scene.maxTrianglesPerCluster);
@@ -237,13 +238,10 @@ void buildMeshHierarchy(SceneData& scene, float fineBuildMs)
     }
     for (uint32_t i = 0; i < wedge.size(); ++i)
         if (seams.count(scene.mesh.positionIds[i])) wedge[i] = i;
-    while (h.levels.size() < 12) {
-        const auto start = Clock::now();
+    const auto appendLevel = [&](const Groups& groups, unsigned distantGrid, uint32_t maxDiameterPixels,
+                                 Clock::time_point start) {
         const auto previous = h.levels.back();
-        const auto groups = groupNeighbors(scene, previous);
-        if (h.levels.size() > 1 && groups.size() == previous.nodeCount && previous.clusterCount == previous.nodeCount)
-            break; // one cluster per remaining connected region
-        const auto locked = groupLocks(scene, groups, seams);
+        const auto locked = distantGrid ? std::unordered_set<uint32_t>{} : groupLocks(scene, groups, seams);
         const auto oldChildren = h.children.size();
         const auto oldIndices = h.coarse.indices.size(), oldClusters = h.coarse.clusters.size();
         LodLevel next{count32(h.nodes.size()),
@@ -252,9 +250,9 @@ void buildMeshHierarchy(SceneData& scene, float fineBuildMs)
                       0,
                       count32(scene.dataset.indices.size() + oldIndices),
                       0,
-                      0};
+                      0, maxDiameterPixels};
         for (const auto& group : groups)
-            appendParent(scene, group, locked, wedge);
+            appendParent(scene, group, locked, wedge, distantGrid);
         next.indexCount = count32(h.coarse.indices.size() - oldIndices);
         next.clusterCount = count32(h.coarse.clusters.size() - oldClusters);
         const auto geometryBytes = [](const LodLevel& level) {
@@ -269,10 +267,29 @@ void buildMeshHierarchy(SceneData& scene, float fineBuildMs)
             h.nodes.resize(next.firstNode);
             for (uint32_t n = previous.firstNode; n < next.firstNode; ++n)
                 h.nodes[n].parent = kNoParent;
-            break;
+            return false;
         }
         next.buildMs = std::chrono::duration<float, std::milli>(Clock::now() - start).count();
         h.levels.push_back(next);
+        return true;
+    };
+    while (h.levels.size() < 12) {
+        const auto start = Clock::now();
+        const auto previous = h.levels.back();
+        const auto groups = groupNeighbors(scene, previous);
+        if (h.levels.size() > 1 && groups.size() == previous.nodeCount && previous.clusterCount == previous.nodeCount)
+            break; // one cluster per remaining connected region
+        if (!appendLevel(groups, 0, 0, start)) break;
+    }
+    // These gates limit the longer projected side of the full mesh's bounds.
+    for (const auto [cells, pixels] : {std::pair{4u, 14u}, std::pair{2u, 6u}}) {
+        const auto start = Clock::now();
+        const auto previous = h.levels.back();
+        if (previous.indexCount <= 16 * 3) break;
+        // Separate regular roots remain separate, even if their bounds overlap.
+        Groups roots(previous.nodeCount);
+        for (uint32_t i = 0; i < previous.nodeCount; ++i) roots[i].push_back(previous.firstNode + i);
+        appendLevel(roots, cells, pixels, start);
     }
 }
 
@@ -301,15 +318,19 @@ void validateMeshHierarchy(const SceneData& s)
         const auto& level = h.levels[depth];
         check(level.firstNode == ni && level.firstCluster == ci && level.firstIndex == ii && level.nodeCount > 0 &&
               ni + level.nodeCount <= h.nodes.size() && ci + level.clusterCount <= clusters &&
-              ii + level.indexCount <= indices && level.reserved == 0 && std::isfinite(level.buildMs) &&
+              ii + level.indexCount <= indices && std::isfinite(level.buildMs) &&
               level.buildMs >= 0);
+        const auto previousLimit = depth ? h.levels[depth - 1].maxDiameterPixels : 0u;
+        check((depth || !level.maxDiameterPixels) &&
+              (!previousLimit || (level.maxDiameterPixels && level.maxDiameterPixels < previousLimit)));
         if (depth) check(level.indexCount <= h.levels[depth - 1].indexCount);
         for (uint32_t n = 0; n < level.nodeCount; ++n, ++ni) {
             const auto& node = h.nodes[ni];
             check(node.firstCluster == ci && node.clusterCount && ci + node.clusterCount <= clusters &&
                   node.firstChild == links && links + node.childCount <= h.children.size() &&
                   std::isfinite(node.error) && node.error >= 0 &&
-                  (depth ? node.childCount > 0 : node.childCount == 0 && node.error == 0 && node.clusterCount == 1));
+                (depth ? node.childCount > 0 : node.childCount == 0 && node.error == 0 && node.clusterCount == 1) &&
+                (!level.maxDiameterPixels || node.childCount == 1));
             check((depth + 1 == h.levels.size()) == (node.parent == kNoParent));
             for (int axis = 0; axis < 3; ++axis)
                 check(std::isfinite(node.boundsMin[axis]) && std::isfinite(node.boundsMax[axis]) &&

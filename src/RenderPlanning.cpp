@@ -68,3 +68,17 @@ glm::mat4 shadowViewProjection(const std::vector<Cluster>& clusters, float paddi
     projection[1][1] *= -1; // same positive-height Vulkan viewport in both passes
     return projection * view;
 }
+
+float projectedDiameterPixels(glm::vec3 lo, glm::vec3 hi, const glm::mat4& vp, uint32_t width, uint32_t height)
+{
+    glm::vec2 lower(std::numeric_limits<float>::infinity()), upper(-lower);
+    for (uint32_t i = 0; i < 8; ++i) {
+        const auto p = vp * glm::vec4(i & 1 ? hi.x : lo.x, i & 2 ? hi.y : lo.y, i & 4 ? hi.z : lo.z, 1);
+        if (p.w <= 0 || p.z <= 0) return std::numeric_limits<float>::infinity();
+        const glm::vec2 ndc = glm::vec2(p) / p.w;
+        lower = glm::min(lower, ndc);
+        upper = glm::max(upper, ndc);
+    }
+    const glm::vec2 extent = (upper - lower) * .5f * glm::vec2(width, height);
+    return std::max(extent.x, extent.y);
+}

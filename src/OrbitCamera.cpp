@@ -11,6 +11,8 @@ namespace {
 constexpr glm::vec3 kInitialDirection{3.0f, 2.25f, 4.0f};
 constexpr float kOrbitSpeed = 0.006f;
 constexpr float kZoomSpeed = 0.12f;
+constexpr float kMinDistance = 1.15f;
+constexpr float kMaxDistance = 256.f; // multiples of the framed model radius
 constexpr float kMaxPitch = glm::radians(85.0f);
 constexpr float kVerticalFov = glm::radians(45.0f);
 
@@ -31,7 +33,7 @@ void OrbitCamera::orbit(float deltaX, float deltaY)
 void OrbitCamera::zoom(float scrollSteps)
 {
     distance_ *= std::exp(-scrollSteps * kZoomSpeed);
-    distance_ = std::clamp(distance_, radius_ * 1.15f, radius_ * 12.0f);
+    distance_ = std::clamp(distance_, radius_ * kMinDistance, radius_ * kMaxDistance);
 }
 
 void OrbitCamera::reset()
@@ -62,11 +64,12 @@ float OrbitCamera::focalPixels(uint32_t height) { return .5f * height / std::tan
 void OrbitCamera::setPose(glm::vec3 p)
 {
     if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
-        std::abs(p.y) > kMaxPitch + 1e-5f || p.z < 1.14999f || p.z > 12.00001f)
+        std::abs(p.y) > kMaxPitch + 1e-5f || p.z < kMinDistance - 1e-5f ||
+        p.z > kMaxDistance * (1.f + 1e-6f))
         throw std::runtime_error("Invalid saved orbit camera.");
     yaw_ = p.x;
     pitch_ = p.y;
-    distance_ = std::clamp(p.z, 1.15f, 12.f) * radius_;
+    distance_ = std::clamp(p.z, kMinDistance, kMaxDistance) * radius_;
 }
 
 glm::mat4 OrbitCamera::viewProjection(float aspectRatio) const

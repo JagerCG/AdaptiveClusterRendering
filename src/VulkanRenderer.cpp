@@ -574,6 +574,23 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     std::vector<uint32_t> clusterLevels(allClusters.size());
     for (uint32_t i = 0; i < levels.size(); ++i)
         std::fill_n(clusterLevels.begin() + levels[i].firstCluster, levels[i].clusterCount, i);
+    auto lo = drawClusters.front().boundsMin, hi = drawClusters.front().boundsMax;
+    for (const auto& c : drawClusters) {
+        lo = glm::min(lo, c.boundsMin);
+        hi = glm::max(hi, c.boundsMax);
+    }
+    const auto firstDistant = std::find_if(levels.begin(), levels.end(), [](const LodLevel& l) { return l.maxDiameterPixels != 0; });
+    const auto firstDistantCluster = firstDistant == levels.end() ? packed.layout.totalClusters : firstDistant->firstCluster;
+    std::vector<ClusterSpan> casterSpans(allClusters.size() - firstDistantCluster);
+    for (auto it = firstDistant; it != levels.end(); ++it) {
+        for (uint32_t n = it->firstNode; n < it->firstNode + it->nodeCount; ++n) {
+            const auto& proxy = scene.hierarchy.nodes[n];
+            const auto& child = scene.hierarchy.nodes[scene.hierarchy.children[proxy.firstChild]];
+            const auto span = child.firstCluster < firstDistantCluster ? ClusterSpan{child.firstCluster, child.clusterCount}
+                                                                       : casterSpans[child.firstCluster - firstDistantCluster];
+            std::fill_n(casterSpans.begin() + (proxy.firstCluster - firstDistantCluster), proxy.clusterCount, span);
+        }
+    }
     std::vector<uint32_t> groups(allClusters.size());
     for (uint32_t i = 0; i < groups.size(); ++i)
         groups[i] = i;
@@ -694,6 +711,11 @@ void VulkanRenderer::uploadScene(const SceneData& scene)
     cameraDepth_ = {};
     lodStats_ = {};
     clusterLevels_ = std::move(clusterLevels);
+    boundsMin_ = lo;
+    boundsMax_ = hi;
+    firstDistantCluster_ = firstDistantCluster;
+    distantCasterSpans_ = std::move(casterSpans);
+    regularCasters_ = {};
     residentClusters_ = std::move(allClusters);
     residentLevels_ = std::move(levels);
     clusterGroups_ = std::move(groups);
@@ -730,6 +752,7 @@ void VulkanRenderer::setHierarchyLevel(uint32_t level)
     auto selection =
         resolveClusterSelection(active, l.indexCount, revision, {revision, ClusterSelectionMode::All, {}});
     sceneGpu_.activeLevel = level;
+    regularCasters_ = {};
     cameraList_.active = lightList_.active = false;
     ++candidateRevision_;
     sceneGpu_.lodCommands = sceneGpu_.lodTriangleWork = VK_NULL_HANDLE;
@@ -779,7 +802,8 @@ void VulkanRenderer::prepareShadowPass(bool generated, bool forceCulling)
     const bool shadowPass = renderSettings_.shadows || renderSettings_.display == RenderDisplay::ShadowMap;
     if (shadowPass && renderSettings_.shadowCulling) {
         if (forceCulling || !lightList_.active || lightCandidateRevision_ != candidateRevision_) {
-            buildVisibilityList(lightList_, lightMatrix_, {shadowMapSize, shadowMapSize}, padding, false, 0);
+            buildVisibilityList(lightList_, lightMatrix_, {shadowMapSize, shadowMapSize}, padding, false, 0,
+                                shadowCandidates(), shadowSource());
             lightCandidateRevision_ = candidateRevision_;
         }
     } else {
@@ -1505,7 +1529,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
     const float aspect = float(extent_.width) / float(extent_.height);
     const auto viewProjection = camera.viewProjection(aspect);
     if (stats.shadowPass) {
-        stats.shadowCandidates = static_cast<uint32_t>(selection_.ranges.size());
+        stats.shadowCandidates = static_cast<uint32_t>(shadowCandidates().ranges.size());
         stats.shadowCasters = static_cast<uint32_t>(shadowSelection().ranges.size());
     }
     const LightingUniform lighting{lightMatrix_, glm::vec4(glm::normalize(renderSettings_.lightDirection), 0)};
@@ -1537,7 +1561,7 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera,
         const VkRect2D scissor{{0, 0}, {width, height}};
         vkCmdSetViewport(commandBuffer_, 0, 1, &viewport); vkCmdSetScissor(commandBuffer_, 0, 1, &scissor);
     };
-    // The two views share the LOD cut, then each consumes its own compacted draw commands.
+    // Each view consumes its own selected ranges and draw commands.
     const auto drawMesh = [&](const auto& geometry, const auto& ranges, bool contiguous, bool shadow) {
         if (ranges.empty()) return;
         vkCmdBindVertexBuffers(commandBuffer_, 0, 1, &geometry.vertexBuffer, &geometry.vertexOffset);

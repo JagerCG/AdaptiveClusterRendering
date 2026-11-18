@@ -1,10 +1,13 @@
 #include "QemSimplifier.h"
 #include "Quadric.h"
+#include <glm/common.hpp>
 #include <glm/geometric.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <numeric>
+#include <set>
 #include <tuple>
 
 namespace {
@@ -185,4 +188,52 @@ double simplifyPatch(MeshSource& mesh, const std::unordered_set<uint32_t>& locke
             error, glm::distance(glm::dvec3(mesh.vertices[v].position), glm::dvec3(mesh.vertices[root].position)));
     }
     return error;
+}
+
+double simplifyDistantPatch(MeshSource& mesh, unsigned cellsPerAxis)
+{
+    auto lo = glm::dvec3(mesh.vertices.front().position), hi = lo;
+    for (const auto& v : mesh.vertices) {
+        lo = glm::min(lo, glm::dvec3(v.position));
+        hi = glm::max(hi, glm::dvec3(v.position));
+    }
+    const glm::dvec3 span = hi - lo;
+    const double width = std::max({span.x, span.y, span.z});
+    if (width == 0) return 0;
+    const glm::dvec3 center = (lo + hi) * .5;
+    const size_t cellCount = size_t(cellsPerAxis) * cellsPerAxis * cellsPerAxis;
+    std::vector<uint32_t> cell(mesh.vertices.size()), support(cellCount, UINT32_MAX);
+    std::vector<double> best(cellCount, -std::numeric_limits<double>::infinity());
+    for (uint32_t i = 0; i < mesh.vertices.size(); ++i) {
+        const glm::dvec3 offset = (glm::dvec3(mesh.vertices[i].position) - center) / width;
+        const auto grid = glm::clamp(glm::ivec3((offset + .5) * double(cellsPerAxis)),
+                                     glm::ivec3(0), glm::ivec3(cellsPerAxis - 1));
+        const auto id = grid.x + cellsPerAxis * (grid.y + cellsPerAxis * grid.z);
+        cell[i] = id;
+        // Retain an existing outermost point in the cell's radial direction.
+        const double score = glm::dot(offset, glm::dvec3(grid) + .5 - .5 * cellsPerAxis);
+        if (score > best[id]) {
+            best[id] = score;
+            support[id] = i;
+        }
+    }
+    std::vector<uint32_t> indices;
+    std::set<std::array<uint32_t, 3>> faces;
+    for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+        std::array<uint32_t, 3> tri{};
+        for (int k = 0; k < 3; ++k) tri[k] = support[cell[mesh.indices[i + k]]];
+        if (tri[0] == tri[1] || tri[1] == tri[2] || tri[2] == tri[0]) continue;
+        const auto a = glm::dvec3(mesh.vertices[tri[0]].position);
+        const auto normal = glm::cross(glm::dvec3(mesh.vertices[tri[1]].position) - a,
+                                       glm::dvec3(mesh.vertices[tri[2]].position) - a);
+        if (glm::dot(normal, normal) == 0) continue;
+        auto key = tri;
+        std::sort(key.begin(), key.end());
+        if (faces.insert(key).second) indices.insert(indices.end(), tri.begin(), tri.end());
+    }
+    // A thin component must remain drawable even when it fits inside just one or two cells.
+    if (indices.empty() || indices.size() >= mesh.indices.size()) return 0;
+    mesh.indices = std::move(indices);
+    // The box diagonal also bounds points on faces lost when the grid removes degenerate triangles.
+    return glm::length(span);
 }

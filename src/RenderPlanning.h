@@ -23,6 +23,7 @@ struct RenderSettings {
 };
 void validateRenderSettings(const RenderSettings& settings);
 glm::vec4 lodLevelColor(uint32_t level);
+float projectedDiameterPixels(glm::vec3 lo, glm::vec3 hi, const glm::mat4& vp, uint32_t width, uint32_t height);
 bool clusterVisible(const Cluster& cluster, float padding, const glm::mat4& viewProjection,
                     glm::vec3 eye, const RenderSettings& settings);
 // Camera-independent fit over source bounds plus conservative displacement.

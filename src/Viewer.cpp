@@ -438,6 +438,8 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
     }
     context.flags["level_colors"] = settings.levelColors;
     context.values["lod_error_pixels"] = settings.lodPixels;
+    if (renderer.lodStats().footprintPixels)
+        context.values["lod_bounds_diameter_pixels"] = *renderer.lodStats().footprintPixels;
     const auto& hist = renderer.lodStats().clustersPerLevel;
     for (size_t i=0; i<hist.size(); ++i) context.counts["lod_L"+std::to_string(i)+"_clusters"] = hist[i];
     context.counts["resident_cluster_count"] = source.hierarchy.totalClusters;
@@ -482,7 +484,7 @@ BenchmarkContext captureBenchmark(const ViewerModel& model, const VulkanRenderer
             "Main-view generation uses GPU-visible triangle addresses and indirect dispatch. Additional shadow "
             "geometry is cached using the light's caster list.";
     }
-    context.labels["shadow_scope"] = "The light selects from the pre-camera LOD or manual list. Caster IDs use the same first_cluster_id base as the main view. Shadow raster and caster culling have separate timers.";
+    context.labels["shadow_scope"] = "The light uses the pre-visibility list. Automatic distant proxies cast with their last protected region. Caster IDs use the same first_cluster_id base as the main view.";
     for (const auto& range : selection.ranges) context.selectedClusterIds.push_back(range.sourceClusterId);
     const auto view = model.camera.viewProjection(float(extent.width) / float(extent.height));
     for (int column = 0; column < 4; ++column) for (int row = 0; row < 4; ++row) {
@@ -547,17 +549,21 @@ ModelAction drawPanel(ViewerModel& model, bool& clusterColors, bool& showBounds,
                 else
                     ImGui::TextUnformatted("GPU selection timing: N/A");
                 ImGui::Text("CPU selection + wait: %.3f ms", lod.cpuMs);
+                if (lod.footprintPixels) ImGui::Text("Model bounds: %.1f px", *lod.footprintPixels);
                 for (size_t i = 0; i < lod.clustersPerLevel.size(); ++i)
                     if (lod.clustersPerLevel[i]) {
                         const auto c = lodLevelColor(static_cast<uint32_t>(i));
-                        ImGui::TextColored({c.r, c.g, c.b, 1}, "L%zu: %u clusters", i, lod.clustersPerLevel[i]);
+                        const auto distant = scene.hierarchy.levels[i].maxDiameterPixels != 0;
+                        ImGui::TextColored({c.r, c.g, c.b, 1}, "L%zu%s: %u clusters", i, distant ? " (distant)" : "",
+                                           lod.clustersPerLevel[i]);
                     }
             }
             else {
                 ImGui::TextUnformatted("Geometry level (L0 is original)");
                 ImGui::SetNextItemWidth(-1);
                 const auto label = [](int i, const LodLevel& l) {
-                    return "L" + std::to_string(i) + "  |  " + std::to_string(l.indexCount / 3) + " triangles";
+                    return "L" + std::to_string(i) + (l.maxDiameterPixels ? " (distant)" : "") +
+                           "  |  " + std::to_string(l.indexCount / 3) + " triangles";
                 };
                 if (ImGui::BeginCombo("##geometryLevel", label(model.geometryLevel, active).c_str())) {
                     for (int i = 0; i < static_cast<int>(scene.hierarchy.levels.size()); ++i) {

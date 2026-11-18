@@ -123,11 +123,20 @@ void VulkanRenderer::selectLod(const OrbitCamera& camera, float padding, bool fo
     push.budget = renderSettings_.lodPixels;
     push.padding = padding;
     const bool entering = sceneGpu_.activeLevel != kAdaptiveGeometryLevel;
+    push.nodes = h.nodeCount;
+    push.eligibleNodes = push.nodes;
+    const float footprint = projectedDiameterPixels(boundsMin_ - padding, boundsMax_ + padding, vp, extent_.width, extent_.height);
+    for (const auto& level : residentLevels_) {
+        if (level.maxDiameterPixels && footprint > level.maxDiameterPixels) {
+            push.eligibleNodes = level.firstNode;
+            break;
+        }
+    }
     if (!force && !entering && push.cameraZ == lastLod_.cameraZ && push.focalPixels == lastLod_.focalPixels &&
-        push.nearPlane == lastLod_.nearPlane && push.budget == lastLod_.budget && padding == lastLod_.padding)
+        push.nearPlane == lastLod_.nearPlane && push.budget == lastLod_.budget && padding == lastLod_.padding &&
+        push.eligibleNodes == lastLod_.eligibleNodes)
         return;
     if (entering && sceneGpu_.sceneRevision == UINT64_MAX) throw std::runtime_error("Scene revision exhausted.");
-    push.nodes = h.nodeCount;
     push.nodeWord = h.nodeWord;
     push.blocks = (push.nodes - 1) / 64 + 1;
     push.gridX = std::min(push.blocks, deviceProperties_.limits.maxComputeWorkGroupCount[0]);
@@ -201,6 +210,7 @@ void VulkanRenderer::selectLod(const OrbitCamera& camera, float padding, bool fo
     if (resolved.triangleCount() != triangles)
         throw std::runtime_error("GPU LOD triangle count disagrees with its cluster IDs.");
     LodSelectionStats stats;
+    if (std::isfinite(footprint)) stats.footprintPixels = footprint;
     stats.clustersPerLevel.resize(residentLevels_.size());
     for (auto id : cut.clusterIds)
         ++stats.clustersPerLevel[clusterLevels_[id]];
@@ -226,6 +236,26 @@ void VulkanRenderer::selectLod(const OrbitCamera& camera, float padding, bool fo
     sceneGpu_.lodRecordOffset = 4 * record;
     sceneGpu_.lodWorkAllocation = lodWork_.allocationBytes;
     if (!sameClusterSelection(selection_, resolved)) {
+        regularCasters_ = {};
+        if (!cut.clusterIds.empty() && cut.clusterIds.back() >= firstDistantCluster_) {
+            // A complete selected proxy replaces one regular region. Restore that region for the
+            // light even if the camera cannot resolve it. Other mixed-LOD regions keep their IDs.
+            ClusterSelection casters{cut.sceneRevision, ClusterSelectionMode::Explicit, {}};
+            for (auto id : cut.clusterIds) {
+                if (id < firstDistantCluster_) {
+                    casters.clusterIds.push_back(id);
+                    continue;
+                }
+                const auto span = distantCasterSpans_[id - firstDistantCluster_];
+                if (!casters.clusterIds.empty() && casters.clusterIds.back() == span.first + span.count - 1) continue;
+                for (uint32_t i = 0; i < span.count; ++i) casters.clusterIds.push_back(span.first + i);
+            }
+            std::sort(casters.clusterIds.begin(), casters.clusterIds.end());
+            regularCasters_ = resolveClusterSelection(residentClusters_, h.totalIndices, cut.sceneRevision, casters);
+            regularCasterScene_ = sceneGpu_;
+            regularCasterScene_.lodCommands = regularCasterScene_.lodTriangleWork = VK_NULL_HANDLE;
+            regularCasterScene_.lodRecordOffset = regularCasterScene_.lodWorkAllocation = 0;
+        }
         compute_->invalidate(); cameraList_.active = lightList_.active = false; ++candidateRevision_;
     }
     selection_ = std::move(resolved);

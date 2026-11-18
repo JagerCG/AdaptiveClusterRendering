@@ -152,24 +152,26 @@ void VulkanRenderer::selectVisibility(const OrbitCamera& camera, bool generated,
                           (!generated || (depthInputs_.segments == edgeSegments_ && depthInputs_.height == heightRevision() &&
                                           sameDisplacement(depthInputs_.displacement, displacement_)));
     buildVisibilityList(cameraList_, vp, extent_, generated ? plannedDisplacementBound() : 0,
-                        mode == CullMode::Hierarchy || mode == CullMode::HiZ, useDepth ? cameraDepth_.frame : 0);
+                        mode == CullMode::Hierarchy || mode == CullMode::HiZ, useDepth ? cameraDepth_.frame : 0,
+                        selection_, sceneGpu_);
 }
 
 void VulkanRenderer::buildVisibilityList(VisibilityList& list, const glm::mat4& vp, VkExtent2D extent, float padding,
-                                         bool hierarchy, uint64_t depthFrame)
+                                         bool hierarchy, uint64_t depthFrame, const ResolvedClusterSelection& candidates,
+                                         const SceneGpuData& source)
 {
     list.active = false;
     list.stats = {};
     const auto start = std::chrono::steady_clock::now();
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, UINT64_MAX), "Wait before culling");
-    const auto& h = sceneGpu_.hierarchy;
+    const auto& h = source.hierarchy;
     CullParams p{};
     p.vp = vp;
-    p.candidates = static_cast<uint32_t>(selection_.ranges.size());
-    p.firstCluster = sceneGpu_.firstCluster;
-    p.firstIndex = static_cast<uint32_t>((sceneGpu_.indexOffset - h.allIndexOffset) / sizeof(uint32_t));
-    p.inputBase = static_cast<uint32_t>(sceneGpu_.lodRecordOffset / 4);
-    p.stride = sceneGpu_.lodCommands ? 6 : 1;
+    p.candidates = static_cast<uint32_t>(candidates.ranges.size());
+    p.firstCluster = source.firstCluster;
+    p.firstIndex = static_cast<uint32_t>((source.indexOffset - h.allIndexOffset) / sizeof(uint32_t));
+    p.inputBase = static_cast<uint32_t>(source.lodRecordOffset / 4);
+    p.stride = source.lodCommands ? 6 : 1;
     p.nodeWord = h.nodeWord;
     p.nodes = hierarchy ? h.nodeCount : 0;
     p.useHierarchy = p.nodes != 0;
@@ -194,9 +196,9 @@ void VulkanRenderer::buildVisibilityList(VisibilityList& list, const glm::mat4& 
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     growVisibilityBuffer(list.result, list.resultCapacity, resultBytes,
                          VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, coherent);
-    growVisibilityBuffer(list.work, list.workCapacity, std::max<uint64_t>(4, 4 * selection_.triangleCount()), 0,
+    growVisibilityBuffer(list.work, list.workCapacity, std::max<uint64_t>(4, 4 * candidates.triangleCount()), 0,
                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!sceneGpu_.lodCommands) {
+    if (!source.lodCommands) {
         growVisibilityBuffer(visInput_, visInputCapacity_, std::max<uint64_t>(4, 4ull * p.candidates), 0, coherent);
         if (p.candidates) {
             void* mapped = nullptr;
@@ -204,14 +206,14 @@ void VulkanRenderer::buildVisibilityList(VisibilityList& list, const glm::mat4& 
                   "Map manual candidates");
             auto* ids = static_cast<uint32_t*>(mapped);
             for (size_t i = 0; i < p.candidates; ++i)
-                ids[i] = selection_.ranges[i].sourceClusterId;
+                ids[i] = candidates.ranges[i].sourceClusterId;
             vkUnmapMemory(device_, visInput_.memory);
         }
     }
     const VkDescriptorBufferInfo buffers[] = {{hiZ_.handle, 0, hiZCapacity_},
                                               {},
-                                              {sceneGpu_.lodCommands ? sceneGpu_.lodCommands : visInput_.handle, 0,
-                                               sceneGpu_.lodCommands ? lodResultSize_ : visInputCapacity_},
+                                              {source.lodCommands ? source.lodCommands : visInput_.handle, 0,
+                                               source.lodCommands ? lodResultSize_ : visInputCapacity_},
                                               {list.result.handle, 0, resultBytes},
                                               {list.work.handle, 0, list.workCapacity}};
     const VkDescriptorImageInfo image{shadowSampler_, depthFrame ? depthView_ : shadowView_,
@@ -240,7 +242,7 @@ void VulkanRenderer::buildVisibilityList(VisibilityList& list, const glm::mat4& 
     vkCmdFillBuffer(cmd, list.result.handle, 0, 24 * 4, 0);
     memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    const VkDescriptorSet sets[]{sceneGpu_.clusterSet, list.set};
+    const VkDescriptorSet sets[]{source.clusterSet, list.set};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, visLayout_, 0, 2, sets, 0, nullptr);
     if (visQueries_) {
         vkCmdResetQueryPool(cmd, visQueries_, 0, 3);
@@ -298,7 +300,7 @@ void VulkanRenderer::buildVisibilityList(VisibilityList& list, const glm::mat4& 
     submit.pCommandBuffers = &cmd;
     check(vkQueueSubmit(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "Submit visibility");
     check(vkQueueWaitIdle(graphicsQueue_), "Wait for visibility counts");
-    ClusterSelection surviving{sceneGpu_.sceneRevision, ClusterSelectionMode::Explicit, {}};
+    ClusterSelection surviving{source.sceneRevision, ClusterSelectionMode::Explicit, {}};
     surviving.clusterIds.reserve(p.candidates);
     void* mapped = nullptr;
     check(vkMapMemory(device_, list.result.memory, 0, resultBytes, 0, &mapped), "Map visibility result");
@@ -318,10 +320,10 @@ void VulkanRenderer::buildVisibilityList(VisibilityList& list, const glm::mat4& 
     if (uint64_t(list.stats.visible) + list.stats.frustum + list.stats.hierarchy + list.stats.occluded != p.candidates)
         throw std::runtime_error("GPU visibility reason counts do not cover the candidate list.");
     list.selection =
-        resolveClusterSelection(drawClusters_, sceneGpu_.indexCount, sceneGpu_.sceneRevision, surviving);
+        resolveClusterSelection(drawClusters_, source.indexCount, source.sceneRevision, surviving);
     if (list.selection.triangleCount() != triangles)
         throw std::runtime_error("GPU visible geometry count disagrees with its IDs.");
-    list.scene = sceneGpu_;
+    list.scene = source;
     list.scene.lodCommands = list.result.handle;
     list.scene.lodRecordOffset = record * 4;
     list.scene.lodTriangleWork = list.work.handle;

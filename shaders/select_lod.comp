@@ -7,7 +7,7 @@ layout(push_constant) uniform Parameters {
     vec4 cameraZ; // dot(vec4(position,1), cameraZ) is forward view depth
     float focalPixels, budget, nearPlane, padding;
     uint nodeWord, nodes, blocks, gridX;
-    uint clusterCapacity, triangleCapacity, phase;
+    uint clusterCapacity, triangleCapacity, phase, eligibleNodes;
 } p;
 shared uvec2 sums[64];
 uint node(uint id) { return p.nodeWord + 12u * id; }
@@ -15,6 +15,7 @@ uint scratch(uint id) { return 16u + 3u * id; }
 uint blockOffset(uint block) { return scratch(p.nodes) + 2u * block; }
 
 bool fits(uint id) {
+    if (id >= p.eligibleNodes) return false;
     uint n = node(id);
     if (scene.words[n+11] == 0u) return true;
     if (p.budget == 0.0) return false;
