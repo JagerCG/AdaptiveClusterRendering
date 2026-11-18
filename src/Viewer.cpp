@@ -37,7 +37,8 @@
 int runRenderIntegrationChecks(VulkanRenderer& renderer, GLFWwindow* window);
 int runShadowCasterChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
 int runVisibilityChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
-int runLodDepthChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera);
+int runLodDepthChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene, OrbitCamera camera,
+                      bool suzanneShape);
 int runHierarchyChecks(VulkanRenderer& renderer, GLFWwindow* window, const SceneData& scene,
                        const OrbitCamera& camera, const std::filesystem::path& output);
 
@@ -826,7 +827,8 @@ int runViewer(LoadedScene loaded, ViewerOptions options)
     if (options.renderSmoke) return runRenderIntegrationChecks(renderer, window.get());
     if (options.shadowCullSmoke) return runShadowCasterChecks(renderer, window.get(), model.loaded.scene, model.camera);
     if (options.visibilitySmoke) return runVisibilityChecks(renderer, window.get(), model.loaded.scene, model.camera);
-    if (options.lodDepthSmoke) return runLodDepthChecks(renderer,window.get(),model.loaded.scene,model.camera);
+    if (options.lodDepthSmoke)
+        return runLodDepthChecks(renderer, window.get(), model.loaded.scene, model.camera, options.suzanneShapeSmoke);
     if (options.verifyGpu || options.smokeTest) renderer.verifyUpload(model.loaded.scene);
     showModelInfo(window.get(), model, renderer.uploadStats());
 

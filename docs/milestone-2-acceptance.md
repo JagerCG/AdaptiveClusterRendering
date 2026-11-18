@@ -26,9 +26,9 @@ For the complete pipeline on a real mesh, open the second preset. In **Mesh hier
 
 | Module | Implemented behavior | Acceptance evidence |
 | --- | --- | --- |
-| 01 · Mesh building | Groups neighboring clusters, simplifies with boundary protection and reclusters. Each hierarchy node stores bounds, error and its child links. | Suzanne has six resident levels, from 3,936 triangles at L0 to 230 at L5. `scene-hierarchy` checks the hierarchy. |
+| 01 · Mesh building | Groups neighboring clusters, protects boundaries and local curvature during simplification, then reclusters. Each hierarchy node stores bounds, error and its child links. | Suzanne has seven resident levels, from 3,936 triangles at L0 to 224 at L6. `scene-hierarchy` checks the hierarchy. |
 | 02 · Geometry storage | Saves and loads the multilevel mesh in ACR v2 and uploads it as fully resident buffers. The loader also accepts flat ACR v1. | `gpu-hierarchy-roundtrip` checks resident data and draws every level. The end-to-end run repeats the same selection and draws from a saved ACR. |
-| 03 · LOD selection | GPU screen-error traversal chooses detail per region and supplies draw commands and subdivision work. | `gpu-lod-camera-depth` compares the GPU result with a CPU reference at different camera distances. The Suzanne preset selects 78 clusters across four levels. |
+| 03 · LOD selection | GPU screen-error traversal chooses detail per region and supplies draw commands and subdivision work. | `gpu-lod-camera-depth` compares the GPU result with a CPU reference at different camera distances. The Suzanne preset selects 62 clusters at L2 and two at L6 before camera visibility culling. |
 | 04 · Visibility culling | The camera applies frustum, hierarchy and optional Hi-Z occlusion tests with bounds expanded for displacement. | `gpu-visibility-pipeline` checks a hidden patch, exact camera depth and each level of the depth pyramid. |
 | 05 · Rasterization | Draws the selected source or subdivided geometry. Supports all, partial and empty selections, wireframe and fixed-view replay. | `gpu-render-integration` and `gpu-visibility-report` check submitted counts and empty draws. |
 | 06 · Visibility and material | Provides shaded and camera-depth views, sampled camera depth for module 04, timing reports, panel hiding and saved views. | `gpu-lod-camera-depth` checks depth sampling and resizing. `gpu-view-replay` checks the restored view and selection. |
@@ -43,12 +43,12 @@ Measured on an NVIDIA GeForce RTX 4070 Laptop GPU in MSVC Release at 960 × 640,
 
 | Scene / light coverage | Light culling | Light clusters | Shadow triangles | Camera triangles | GPU caster test (ms, median) | GPU shadow draw (ms, median) | CPU frame (ms, median) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Off-camera caster / 0.30 | Off | 4 / 4 | 32 | 24 | — | 0.0099 | 3.53 |
-| Off-camera caster / 0.30 | On | 2 / 4 | 16 | 24 | 0.0096 | 0.0091 | 5.04 |
-| Suzanne / 0.45 | Off | 78 / 78 | 7,288 | 7,288 | — | 0.0240 | 5.32 |
-| Suzanne / 0.45 | On | 75 / 78 | 7,244 | 7,288 | 0.0124 | 0.0249 | 7.36 |
+| Off-camera caster / 0.30 | Off | 4 / 4 | 32 | 24 | — | 0.0104 | 2.97 |
+| Off-camera caster / 0.30 | On | 2 / 4 | 16 | 24 | 0.0109 | 0.0104 | 4.76 |
+| Suzanne / 0.45 | Off | 64 / 64 | 6,560 | 6,544 | — | 0.0261 | 5.22 |
+| Suzanne / 0.45 | On | 63 / 64 | 6,552 | 6,544 | 0.0128 | 0.0263 | 5.88 |
 
-The camera and light matrices and camera selections match within each pair. On these two scenes the selector reduces submitted geometry and increases measured CPU frame time. The benchmark repeats selection and main geometry generation every measured frame. Enabling light culling adds a synchronized dispatch and count readback. Its median CPU time including the wait was 1.26 ms on the fixture and 1.36 ms on Suzanne. Interactive frames can reuse a light selection while its inputs are stable.
+The camera and light matrices and camera selections match within each pair. On these two scenes the light selector reduces shadow geometry and increases measured CPU frame time. The benchmark repeats selection and main geometry generation every measured frame. Enabling light culling adds a synchronized dispatch and count readback. Its median CPU time including the wait was 1.31 ms on the fixture and 1.27 ms on Suzanne. Interactive frames can reuse a light selection while its inputs are stable.
 
 To reproduce the four reports, run the following from the repository root.
 
@@ -62,7 +62,13 @@ foreach ($scene in 'shadow-casters', 'suzanne') {
 
 ## Verification
 
-Both Debug and Release passed **61/61 tests**, including **37 Vulkan GPU tests** per build. Synchronization validation was enabled for the Debug run. The shadow test compared the entire camera and light depth images with culling on and off. It then removed just the off-camera caster and confirmed that the light texel at the visible receiver changed from caster depth to receiver depth. It also covers fully rejected lists, different camera/light lists of equal length, displaced bounds, a manual coarse level and mixed LOD. The saved-asset test compares camera/light matrices, selected IDs and submitted geometry after reloading preprocessed Suzanne.
+Both Debug and Release passed **62/62 tests**, including **38 Vulkan GPU tests** per build. Synchronization validation was enabled for the Debug run.
+
+`gpu-suzanne-lod-shape` captures full-detail and adaptive depth with displacement off at a fixed 960 × 640 viewport and a 96-pixel threshold for the adaptive cut. At the frontal pose, both the largest outline change and the left/right difference across the central crown fell from 6 pixels to 0. Across the entire model, the number of mirrored pixel pairs where only one side was covered fell from 460 to 136. From above, the maximum vertical change across 1,465 interior depth samples is 0.0201 model units. Opening `assets/views/suzanne-lod-crown.acrview` reproduces the frontal pose. Loading the previous ACR reproduces the 6-pixel discrepancy. [Frontal depth comparison](measurements/suzanne-lod-crown.png)
+
+An additional sweep used eight camera azimuths at 25° elevation and two other elevations (−20° and 65°), all at the same distance and 96-pixel threshold. For each GPU selection, vertical rays sampled the central crown against the L0 surface. The largest downward change across the ten poses fell from 0.1271 to 0.0254 model units. With the frontal preset the source triangle count fell from 1,822 to 1,412. Retaining extra detail at intermediate levels increased Suzanne's saved ACR from 238,932 to 280,352 bytes.
+
+The shadow test compared the entire camera and light depth images with culling on and off. It then removed just the off-camera caster and confirmed that the light texel at the visible receiver changed from caster depth to receiver depth. It also covers fully rejected lists, different camera/light lists of equal length, displaced bounds, a manual coarse level and mixed LOD. The saved-asset test compares camera/light matrices, selected IDs and submitted geometry after reloading preprocessed Suzanne.
 
 ```powershell
 cmake --preset windows-vs2022 -DACR_ENABLE_GPU_TESTS=ON

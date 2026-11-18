@@ -4,5 +4,6 @@
 #include <unordered_set>
 
 // Contract edges onto existing endpoints so retained vertices keep their UVs
-// and normals. Replaces patch.indices and returns a model-space error bound.
-double simplifyPatch(MeshSource& patch, const std::unordered_set<uint32_t>& lockedPositions);
+// and normals. maxPlaneDistance limits each removed corner's distance to the
+// replacement face planes. Returns a conservative bound on vertex travel.
+double simplifyPatch(MeshSource& patch, const std::unordered_set<uint32_t>& lockedPositions, double maxPlaneDistance);

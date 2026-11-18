@@ -1,0 +1,13 @@
+ACR_VIEW 3
+source 0 "../suzanne.obj"
+window 960 640 0
+camera 0 0 3.13575125
+lod 0 1 96 0
+draw 0 0 0 -1 0 0 0
+light 0 0.002 0.6 0.8 1
+preview 0 0
+geometry 0 1 0 0
+height 0 ""
+sample 5 30
+culling 0 0 0 0
+shadow_cull 0 1

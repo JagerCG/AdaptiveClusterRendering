@@ -77,9 +77,71 @@ void planeDepth(const CameraDepthView& info, const std::vector<float>& pixels, d
     expect(std::all_of(pixels.begin(), pixels.end(), [](float d) { return std::isfinite(d) && d >= 0 && d <= 1; }),
            "Invalid camera depth pixel.");
 }
+
+void checkSuzanneOutline(VkExtent2D extent, const std::vector<float>& fine, const std::vector<float>& coarse)
+{
+    const auto firstCoveredRow = [&](const std::vector<float>& pixels, uint32_t x) {
+        for (uint32_t y = 0; y < extent.height; ++y)
+            if (pixels[size_t(y) * extent.width + x] < 1.f) return int(y);
+        return int(extent.height);
+    };
+    // At the authored front pose these columns span the top of the skull, between the ears.
+    int maxDeviation = 0, maxAsymmetry = 0;
+    for (uint32_t x = 5 * extent.width / 12; x < extent.width / 2; ++x) {
+        const uint32_t mirror = extent.width - 1 - x;
+        const int left = firstCoveredRow(coarse, x), right = firstCoveredRow(coarse, mirror);
+        const int fineLeft = firstCoveredRow(fine, x), fineRight = firstCoveredRow(fine, mirror);
+        expect(fineLeft < int(extent.height) && fineRight < int(extent.height), "Reference crown outside the viewport.");
+        maxDeviation = std::max({maxDeviation, std::abs(left - fineLeft), std::abs(right - fineRight)});
+        maxAsymmetry = std::max(maxAsymmetry, std::abs(left - right));
+    }
+    std::cout << "Frontal crown contour deviation / mirror difference: " << maxDeviation << " / " << maxAsymmetry << " px.\n";
+    // Count each mirrored pixel pair once. The union covers the projected half-silhouette.
+    size_t coveredPairs = 0, asymmetricPairs = 0;
+    for (uint32_t y = 0; y < extent.height; ++y) {
+        const auto row = size_t(y) * extent.width;
+        for (uint32_t x = 0; x < extent.width / 2; ++x) {
+            const bool left = coarse[row + x] < 1.f;
+            const bool right = coarse[row + extent.width - 1 - x] < 1.f;
+            coveredPairs += left || right;
+            asymmetricPairs += left != right;
+        }
+    }
+    std::cout << "Full silhouette asymmetric pairs: " << asymmetricPairs << " of " << coveredPairs << ".\n";
+    expect(maxDeviation <= 2 && maxAsymmetry <= 2, "Suzanne's adaptive LOD visibly distorted the frontal crown.");
+    expect(coveredPairs && 100 * asymmetricPairs <= coveredPairs, "Suzanne's frontal silhouette lost symmetry.");
+}
+
+void checkSuzanneCrownHeight(const CameraDepthView& info, const std::vector<float>& fine, const std::vector<float>& coarse)
+{
+    const glm::dmat4 inverse = glm::inverse(glm::dmat4(info.viewProjection));
+    const auto w = info.extent.width, h = info.extent.height;
+    size_t samples = 0;
+    double maxChange = 0;
+    for (uint32_t y = 0; y < h; y += 4) {
+        for (uint32_t x = 0; x < w; x += 4) {
+            const size_t i = size_t(y) * w + x;
+            if (fine[i] >= 1.f) continue;
+            const auto world = [&](float depth) {
+                const auto p = inverse * glm::dvec4(2. * (x + .5) / w - 1., 2. * (y + .5) / h - 1., depth, 1.);
+                return glm::dvec3(p) / p.w;
+            };
+            const auto reference = world(fine[i]);
+            // Sample the interior of the original crown. The ears and grazing silhouette
+            // have real depth discontinuities when the covered pixel changes.
+            if (reference.y <= .70 || std::abs(reference.x) >= .55 || reference.z <= -.65 || reference.z >= .40)
+                continue;
+            expect(coarse[i] < 1.f, "The coarse crown contains a hole.");
+            maxChange = std::max(maxChange, std::abs(reference.y - world(coarse[i]).y));
+            ++samples;
+        }
+    }
+    std::cout << "Overhead crown height change: " << maxChange << " model units across " << samples << " samples.\n";
+    expect(samples > 100 && maxChange < .035, "Suzanne's adaptive LOD lost too much crown height.");
+}
 } // namespace
 
-int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& scene, OrbitCamera camera)
+int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& scene, OrbitCamera camera, bool suzanneShape)
 {
     expect(scene.hierarchy.levels.size() >= 3, "Expected a real multi-level scene.");
     RenderSettings s;
@@ -99,10 +161,32 @@ int runLodDepthChecks(VulkanRenderer& r, GLFWwindow* window, const SceneData& sc
             prep();
             if (s.adaptiveLod) r.selectLod(camera, generated ? r.plannedDisplacementBound() : 0);
             if (generated) r.ensureGeneratedGeometry();
-            if (r.drawFrame(camera, false, true, -1, generated, wire, nullptr)) break;
+            if (r.drawFrame(camera, false, !suzanneShape, -1, generated, wire, nullptr)) break;
             expect(std::chrono::steady_clock::now() < deadline, "LOD/depth draw timed out.");
         }
     };
+    if (suzanneShape) {
+        camera.reset();
+        const float distance = camera.pose().z;
+        const auto capture = [&](float pitch, float budget) {
+            camera.setPose({0, pitch, distance});
+            s.adaptiveLod = true;
+            s.lodPixels = budget;
+            draw();
+            return r.readCameraDepth();
+        };
+        const auto fineFront = capture(0, 0);
+        const uint64_t fineTriangles = r.lastRecordedDraw().triangles;
+        const auto coarseFront = capture(0, 96);
+        const uint64_t coarseTriangles = r.lastRecordedDraw().triangles;
+        expect(4 * coarseTriangles <= 3 * fineTriangles,
+               "Shape check requires at least a quarter fewer triangles than the source.");
+        checkSuzanneOutline(r.renderExtent(), fineFront, coarseFront);
+        const auto fineTop = capture(1.463f, 0);
+        const auto coarseTop = capture(1.463f, 96);
+        checkSuzanneCrownHeight(r.cameraDepth(), fineTop, coarseTop);
+        return 0;
+    }
     auto checkCut = [&](const SceneData& source, float pixels, float padding = 0) {
         s.adaptiveLod = true;
         s.lodPixels = pixels;

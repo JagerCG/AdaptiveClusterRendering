@@ -2,6 +2,7 @@
 #include "ClusterGpu.h"
 #include "QemSimplifier.h"
 #include <glm/common.hpp>
+#include <glm/geometric.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -165,7 +166,13 @@ void appendParent(SceneData& scene, const std::vector<uint32_t>& children, const
             }
         });
     }
-    const double bound = parent.error + simplifyPatch(patch, locked);
+    const double diameter = glm::distance(glm::dvec3(parent.boundsMin), glm::dvec3(parent.boundsMax));
+    // Limit an individual collapse to 0.25% of this patch's diagonal at L1, doubling
+    // the tolerance at each coarser level. GPU selection still uses measured vertex travel.
+    constexpr double firstLevelPlaneFraction = .0025;
+    const auto reductionLevel = static_cast<int>(h.levels.size()) - 1;
+    const double maxPlaneDistance = std::ldexp(firstLevelPlaneFraction * diameter, reductionLevel);
+    const double bound = parent.error + simplifyPatch(patch, locked, maxPlaneDistance);
     parent.error = static_cast<float>(bound);
     if (parent.error < bound) parent.error = std::nextafter(parent.error, std::numeric_limits<float>::infinity());
     auto rebuilt = buildClusters(patch, scene.maxTrianglesPerCluster);

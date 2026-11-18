@@ -99,26 +99,30 @@ Preprocess and validate without creating a Vulkan device or a window:
 3. Use **Save + verify ACR...**, then **Reload saved ACR**. This restores the whole hierarchy and preserves the current camera, displayed level and cluster selection. **Storage** shows the serialized size, GPU payload and timings.
 4. Run `--hierarchy-roundtrip build/suzanne-check.acr` with the bundled OBJ to draw every level, read all resident records back and compare fixed-view light-depth images before and after reloading. Use `--geometry-level 2 --wireframe` to start a manual demo on a coarser level.
 
-With the default capacity of 64 triangles per cluster, the bundled Suzanne has 3,936, 1,982, 1,014, 556, 314 and 230 triangles at L0 through L5. L0 and L2 make a clear same-camera wireframe comparison.
+With the default capacity of 64 triangles per cluster, the bundled Suzanne has 3,936, 3,460, 1,826, 992, 498, 264 and 224 triangles at L0 through L6. L0 and L2 make a clear same-camera wireframe comparison.
 
-Preprocessing grows connected groups across shared position edges and simplifies each group with endpoint QEM contractions. It protects open boundaries, inter-group borders and split UV/normal seams, and keeps extremal vertices along the axes and body diagonals to preserve the width of thin features. Coarse clusters reuse the original vertices. Each parent records its child IDs, conservative descendant bounds and a model-space error bound including the maximum inherited error. Disconnected components can form separate roots.
+Preprocessing grows connected groups across shared position edges and simplifies each group by collapsing edges onto existing vertices. It protects open boundaries, inter-group borders, split UV/normal seams and the outermost vertices along the axes and diagonals. A protected vertex can absorb an interior neighbor while staying in place. A collapse also has to keep each replacement face close to the removed vertex. The distance limit starts at 0.25% of the group's bounding-box diagonal at L1 and doubles at each coarser level. Each parent records its child IDs, conservative descendant bounds and a model-space error bound including the maximum inherited error. Disconnected components can form separate roots.
+
+Opening the OBJ builds the current hierarchy. To update an older saved ACR, open its source OBJ and use **Save + verify ACR...** to write a new file. Opening the old ACR directly displays the geometry it already contains.
 
 ACR v2 stores the original v1 payload and adds coarse index/cluster arrays, level records, hierarchy nodes and child IDs. A versioned 72-byte header gives all counts. ACR v1 still loads as one level, and the fixed mock retains its original format. All levels are uploaded once. `MeshHierarchy.h` defines the 32-byte level and 48-byte node records. `SceneGpuData::hierarchy` gives their word offsets in the storage buffer, the total geometry counts and the shared index-buffer offset. Each node covers contiguous global cluster IDs. Its children index the next finer level. The last level holds the roots. The viewer switches its active index range on the same buffers.
 
 ## M2 GPU LOD and camera depth
 
 1. Start the viewer with the first command below. In **Mesh hierarchy**, **Automatic GPU LOD** lets the GPU choose a level independently for each region. **Level colors** shows the chosen levels on the mesh. The matching legend counts clusters at each level.
-2. At the initial 960 × 640 camera position, set **Allowed screen error** to 0 to draw all 3,936 Suzanne triangles. At 96 pixels the same view draws 1,822 triangles across four levels. Scroll over the model to zoom, then watch the colors and counts change. Turn off **Automatic GPU LOD** to compare against a fixed level. The counts refer to the source geometry before subdivision.
+2. At the initial 960 × 640 camera position, set **Allowed screen error** to 0 to draw all 3,936 Suzanne triangles. At 96 pixels the same view selects 1,640 triangles across two levels. Scroll over the model to zoom, then watch the colors and counts change. Turn off **Automatic GPU LOD** to compare against a fixed level. The counts refer to the source geometry before visibility culling and subdivision.
 3. Under **Rendering and shadows**, switch **Shaded** to **Depth (near is bright)**. Rotate the model to see its main camera depth change. **Shadow map (light view)** displays the separate light-space image. Use **Save view...** and **Open view...** to replay the asset, camera and render settings. F1 hides and restores the panel.
 4. The remaining commands save that starting view, measure consecutive frames from it and run the focused GPU checks. Reports include the camera matrix, source IDs, per-level counts, drawn triangles and CPU frame time. When timestamp queries are supported, GPU time is reported separately for selection, generation (when enabled), the main pass and shadows (when enabled).
 
-On the RTX 4070 Laptop GPU at 960 × 640, the 96-pixel acceptance run selects 3,158 source triangles at its near camera pose, 1,822 at the initial pose and 314 at its far pose. At the initial pose, subdivision with two segments per edge draws 7,288 triangles. The test checks every generated triangle against the selected source patches.
+On the RTX 4070 Laptop GPU at 960 × 640, the 96-pixel acceptance run selects 3,518 source triangles at its near camera pose, 1,640 at the initial pose and 264 at its far pose. At the initial pose, subdivision with two segments per edge draws 6,560 triangles when camera culling is off. The test checks every generated triangle against the selected source patches.
+
+To inspect the crown, open `assets/views/suzanne-lod-crown.acrview` with **Open view...**. The preset faces Suzanne straight on with displacement off. Switch **Allowed screen error** between 0 and 96 to compare full and adaptive detail. The largest outline change across the central crown fell from 6 pixels to 0 at 96 pixels. The GPU test also checks the symmetry of the whole outline and the interior crown height from above. [Before and after at the right crown](docs/measurements/suzanne-lod-crown.png)
 
 ```powershell
 .\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors
 .\build\Release\AdaptiveClusterRendering.exe assets/suzanne.obj --lod-pixels 96 --level-colors --save-view build/suzanne-gpu-lod.acrview
 .\build\Release\AdaptiveClusterRendering.exe --view-config build/suzanne-gpu-lod.acrview --benchmark build/suzanne-gpu-lod.json --benchmark-warmup 5 --benchmark-samples 20
-ctest --test-dir build -C Debug -R "gpu-(lod-camera-depth|view-replay)$" --output-on-failure
+ctest --test-dir build -C Debug -R "gpu-(lod-camera-depth|suzanne-lod-shape|view-replay)$" --output-on-failure
 ```
 
 The selector projects each node's accumulated geometric error using the nearest depth of its conservative bounds and the vertical focal length in pixels. A node that crosses the near plane refines until it reaches a leaf. The compute shader emits global cluster IDs, indexed draw commands and a triangle work list consumed directly by subdivision. The CPU waits for a compact ID/count mirror for debug colors, bounds and exact output sizing. Ordinary interaction reuses an unchanged selection. The benchmark forces a fresh GPU selection for each measured frame.
@@ -157,7 +161,7 @@ Use `--cull hiz-flat` to test each cluster against the depth pyramid without vis
 .\build\Release\AdaptiveClusterRendering.exe --fixture occlusion --cull hiz --subdivision 2 --displacement 0.08 --shadows --benchmark build/visibility-hiz.json --benchmark-warmup 5 --benchmark-samples 20
 ```
 
-On an RTX 4070 Laptop GPU, a Release run at 960 × 640 with these settings took a median 0.016 ms for the hierarchy and cluster tests and 0.032 ms to build Hi-Z. The median frame time, including forced regeneration and CPU waits, was 2.35 ms with culling off and 3.67 ms with hierarchical Hi-Z. On this 16-cluster fixture the extra overhead outweighed the geometry savings. In the default Suzanne view, the 96-pixel LOD threshold selected 78 clusters across four geometry levels. All 78 survived culling, and subdivision turned 1,822 source triangles into 7,288 drawn triangles.
+On an RTX 4070 Laptop GPU, a Release run at 960 × 640 with these settings took a median 0.016 ms for the hierarchy and cluster tests and 0.032 ms to build Hi-Z. The median frame time, including forced regeneration and CPU waits, was 2.35 ms with culling off and 3.67 ms with hierarchical Hi-Z. On this 16-cluster fixture the extra overhead outweighed the geometry savings. In the Suzanne preset, the 96-pixel LOD threshold selects 64 clusters across two levels. Camera Hi-Z keeps 62, and subdivision turns their 1,636 source triangles into 6,544 drawn triangles.
 
 ## M2 Part 2: storage diagnostics demo
 

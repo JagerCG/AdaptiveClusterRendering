@@ -18,7 +18,8 @@ struct Candidate {
 };
 using Ring = std::vector<std::vector<uint32_t>>;
 
-bool legalCollapse(const MeshSource& mesh, const Ring& faces, const Ring& neighbors, uint32_t from, uint32_t to)
+bool legalCollapse(const MeshSource& mesh, const Ring& faces, const Ring& neighbors, uint32_t from, uint32_t to,
+                   double maxPlaneDistance)
 {
     // The link of an interior manifold edge consists of its two opposite
     // vertices. Additional shared neighbors would pinch the surface.
@@ -41,6 +42,10 @@ bool legalCollapse(const MeshSource& mesh, const Ring& faces, const Ring& neighb
         const auto after = glm::cross(edge, glm::dvec3(mesh.vertices[to].position) - p);
         const double oldArea = glm::length(before), newArea = glm::length(after);
         if (glm::dot(before, after) <= .5 * oldArea * newArea) return false;
+        // Each old incident triangle contains the removed point. A replacement face
+        // cutting too far past it makes a visible dent, even if its winding survives.
+        if (std::abs(glm::dot(after, glm::dvec3(mesh.vertices[from].position) - p)) > maxPlaneDistance * newArea)
+            return false;
         const auto shape = [&](uint32_t vertex, double area) {
             const auto side = glm::dvec3(mesh.vertices[vertex].position) - p;
             return area / (glm::dot(edge, edge) + glm::dot(side, side) + glm::dot(side - edge, side - edge));
@@ -52,7 +57,7 @@ bool legalCollapse(const MeshSource& mesh, const Ring& faces, const Ring& neighb
 }
 } // namespace
 
-double simplifyPatch(MeshSource& mesh, const std::unordered_set<uint32_t>& lockedPositions)
+double simplifyPatch(MeshSource& mesh, const std::unordered_set<uint32_t>& lockedPositions, double maxPlaneDistance)
 {
     if (mesh.indices.size() <= 3) return 0.0;
     const size_t target = std::max<size_t>(1, mesh.indices.size() / 6);
@@ -63,10 +68,10 @@ double simplifyPatch(MeshSource& mesh, const std::unordered_set<uint32_t>& locke
     std::vector<bool> locked(count);
     for (size_t i = 0; i < count; ++i)
         locked[i] = lockedPositions.count(mesh.positionIds[i]) != 0;
-    // Retain the patch's width along the axes and body diagonals at every level.
-    // Thin protrusions can otherwise disappear at little plane-quadric cost.
-    const std::array<glm::dvec3, 7> directions{
-        {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 1}, {1, 1, -1}, {1, -1, 1}, {-1, 1, 1}}};
+    // Keep support points along the axes, face diagonals and body diagonals.
+    const std::array<glm::dvec3, 13> directions{{
+        {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, -1, 0}, {1, 0, 1}, {1, 0, -1},
+        {0, 1, 1}, {0, 1, -1}, {1, 1, 1}, {1, 1, -1}, {1, -1, 1}, {-1, 1, 1}}};
     for (const auto& dir : directions) {
         const auto limits =
             std::minmax_element(mesh.vertices.begin(), mesh.vertices.end(), [&](const Vertex& a, const Vertex& b) {
@@ -112,7 +117,7 @@ double simplifyPatch(MeshSource& mesh, const std::unordered_set<uint32_t>& locke
             if (j - i != 2 || e.forward == edges[j - 1].forward || e.lo == e.hi) {
                 locked[e.lo] = locked[e.hi] = true; // open, split or non-manifold edge
             }
-            else if (!locked[e.lo] && !locked[e.hi]) {
+            else if (!locked[e.lo] || !locked[e.hi]) {
                 auto q = quadrics[e.lo];
                 q += quadrics[e.hi];
                 const glm::dvec3 a = mesh.vertices[e.lo].position, b = mesh.vertices[e.hi].position;
@@ -120,8 +125,11 @@ double simplifyPatch(MeshSource& mesh, const std::unordered_set<uint32_t>& locke
                 // A small length penalty distinguishes nearly equivalent plane
                 // fits and discourages long, thin triangles in smooth regions.
                 const double regularizer = .1 * length * length;
-                candidates.push_back({std::max(0.0, q.evaluate(b)) + regularizer, length, e.lo, e.hi});
-                candidates.push_back({std::max(0.0, q.evaluate(a)) + regularizer, length, e.hi, e.lo});
+                // A protected endpoint can absorb its neighbor while keeping its exact position and attributes.
+                if (!locked[e.lo])
+                    candidates.push_back({std::max(0.0, q.evaluate(b)) + regularizer, length, e.lo, e.hi});
+                if (!locked[e.hi])
+                    candidates.push_back({std::max(0.0, q.evaluate(a)) + regularizer, length, e.hi, e.lo});
             }
             i = j;
         }
@@ -130,13 +138,14 @@ double simplifyPatch(MeshSource& mesh, const std::unordered_set<uint32_t>& locke
         std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
             return std::tie(a.cost, a.length, a.from, a.to) < std::tie(b.cost, b.length, b.from, b.to);
         });
-        auto busy = locked;
+        std::vector<bool> busy(count);
         std::vector<uint32_t> remap(count);
         std::iota(remap.begin(), remap.end(), 0u);
         size_t remaining = mesh.indices.size() / 3;
         for (const auto& c : candidates) {
             if (remaining < target + 2) break;
-            if (busy[c.from] || busy[c.to] || !legalCollapse(mesh, faces, neighbors, c.from, c.to)) continue;
+            if (locked[c.from] || busy[c.from] || busy[c.to] ||
+                !legalCollapse(mesh, faces, neighbors, c.from, c.to, maxPlaneDistance)) continue;
             remap[c.from] = c.to;
             representative[c.from] = c.to;
             quadrics[c.to] += quadrics[c.from];

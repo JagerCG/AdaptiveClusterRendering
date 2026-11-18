@@ -141,7 +141,7 @@ int main(int argc, char** argv)
                      "       [--subdivision 1|2|4|8] [--wireframe]\n"
                      "       [--geometry-level N] [--group-colors]\n"
                      "       [--gpu-lod] [--lod-pixels P] [--level-colors] [--hide-ui]\n"
-                     "       [--view-config file.acrview] [--save-view file.acrview] [--lod-depth-smoke]\n"
+                     "       [--view-config file.acrview] [--save-view file.acrview] [--lod-depth-smoke | --suzanne-lod-shape-smoke]\n"
                      "       [--shadows] [--shadow-bias 0..0.08] [--depth-view | --shadow-map]\n"
                      "       [--shadow-cull all|frustum] [--shadow-coverage 0.05..1] [--light-direction X Y Z] [--shadow-cull-smoke]\n"
                      "       [--frustum-preview] [--max-distance model_units] [--render-smoke]\n"
@@ -219,7 +219,10 @@ int main(int argc, char** argv)
                     options.renderSettings.levelColors = true; options.clusterColors = options.renderSettings.groupColors = false;
                 }
                 else if (option == "--hide-ui") options.hidePanel = true;
-                else if (option == "--lod-depth-smoke") options.lodDepthSmoke = true;
+                else if (option == "--lod-depth-smoke" || option == "--suzanne-lod-shape-smoke") {
+                    options.lodDepthSmoke = true;
+                    options.suzanneShapeSmoke = option == "--suzanne-lod-shape-smoke";
+                }
                 else if (option == "--visibility-smoke")
                     options.visibilitySmoke = true;
                 else if (option == "--shadow-cull-smoke")
