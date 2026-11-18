@@ -26,7 +26,6 @@ constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
 constexpr uint32_t kInvalidFamily = std::numeric_limits<uint32_t>::max();
 constexpr uint64_t kWaitForever = std::numeric_limits<uint64_t>::max();
 constexpr uint64_t kAcquireTimeoutNs = 100'000'000;
-constexpr glm::vec4 kShadedColor{0.24f, 0.54f, 0.84f, 1.0f};
 
 static_assert(std::is_standard_layout_v<Vertex> && std::is_trivially_copyable_v<Vertex>);
 static_assert(sizeof(glm::mat4) == 16 * sizeof(float));
@@ -45,16 +44,6 @@ void check(VkResult result, const char* operation)
         const std::string message = std::string(operation) + " failed (VkResult " + std::to_string(result) + ")";
         throw std::runtime_error(message);
     }
-}
-
-glm::vec4 clusterColor(uint32_t id)
-{
-    // Spread consecutive IDs around the hue wheel.
-    const uint32_t hueBits = id * 2654435761u;
-    const float hue = static_cast<float>(hueBits >> 8) / 16777216.0f;
-    const glm::vec3 cycle = glm::fract(glm::vec3(hue) + glm::vec3(0.0f, 2.0f / 3.0f, 1.0f / 3.0f));
-    const glm::vec3 rgb = glm::clamp(glm::abs(cycle * 6.0f - 3.0f) - 1.0f, 0.0f, 1.0f);
-    return glm::vec4(0.22f + 0.73f * rgb, 1.0f);
 }
 
 VKAPI_ATTR VkBool32 VKAPI_CALL printValidationMessage(
@@ -86,7 +75,9 @@ VulkanRenderer::~VulkanRenderer()
         shutdownUi();
         destroySwapchain();
         vkDestroyPipeline(device_, pipeline_, nullptr);
+        vkDestroyPipeline(device_, wireframePipeline_, nullptr);
         vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+        lodSelection_.reset();
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         vkDestroyFence(device_, frameFence_, nullptr);
         vkDestroySemaphore(device_, imageAvailable_, nullptr);
@@ -112,6 +103,8 @@ void VulkanRenderer::initialize(GLFWwindow* window)
     createInstance();
     check(glfwCreateWindowSurface(instance_, window, nullptr, &surface_), "glfwCreateWindowSurface");
     createDevice();
+    lodSelection_ = std::make_unique<GpuLodSelection>();
+    lodSelection_->initialize(gpu_, device_);
     selectDepthFormat();
     createFrameResources();
 }
@@ -130,6 +123,8 @@ bool VulkanRenderer::prepareFrame(GLFWwindow* window)
         framebufferHeight_ = height;
         rebuildSwapchain_ = false;
     }
+    check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
+    lodSelection_->readStats();
     return true;
 }
 
@@ -206,6 +201,9 @@ void VulkanRenderer::createDevice()
     for (VkPhysicalDevice candidate : devices) {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(candidate, &properties);
+        VkPhysicalDeviceFeatures features{};
+        vkGetPhysicalDeviceFeatures(candidate, &features);
+        if (!features.drawIndirectFirstInstance) continue;
         if (properties.apiVersion < kVulkanVersion) {
             continue;
         }
@@ -233,7 +231,8 @@ void VulkanRenderer::createDevice()
             VkBool32 canPresent = VK_FALSE;
             check(vkGetPhysicalDeviceSurfaceSupportKHR(candidate, i, surface_, &canPresent),
                   "vkGetPhysicalDeviceSurfaceSupportKHR");
-            const bool canDraw = (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+            const auto required = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+            const bool canDraw = (families[i].queueFlags & required) == required;
             if (canDraw && canPresent) {
                 graphics = i;
                 present = i;
@@ -283,12 +282,21 @@ void VulkanRenderer::createDevice()
     queues[1].queueFamilyIndex = presentFamily_;
 
     const char* swapchainExtension = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(gpu_, &supported);
+    VkPhysicalDeviceFeatures enabled{};
+    enabled.fillModeNonSolid = supported.fillModeNonSolid;
+    enabled.drawIndirectFirstInstance = VK_TRUE;
+    enabled.multiDrawIndirect = supported.multiDrawIndirect;
+    maxIndirectDrawCount_ = supported.multiDrawIndirect ? selectedProperties.limits.maxDrawIndirectCount : 1;
+    wireframeSupported_ = supported.fillModeNonSolid == VK_TRUE;
     VkDeviceCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     info.queueCreateInfoCount = graphicsFamily_ == presentFamily_ ? 1u : 2u;
     info.pQueueCreateInfos = queues;
     info.enabledExtensionCount = 1;
     info.ppEnabledExtensionNames = &swapchainExtension;
+    info.pEnabledFeatures = &enabled;
     check(vkCreateDevice(gpu_, &info, nullptr, &device_), "vkCreateDevice");
     vkGetDeviceQueue(device_, graphicsFamily_, 0, &graphicsQueue_);
     vkGetDeviceQueue(device_, presentFamily_, 0, &presentQueue_);
@@ -321,12 +329,12 @@ void VulkanRenderer::createFrameResources()
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    const VkPushConstantRange ranges[] = {
-        {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4)},
-        {VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(glm::mat4), sizeof(glm::vec4)}
-    };
-    layoutInfo.pushConstantRangeCount = 2;
-    layoutInfo.pPushConstantRanges = ranges;
+    const VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) + sizeof(glm::uvec4)};
+    const auto descriptorLayout = lodSelection_->descriptorLayout();
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &descriptorLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &range;
     check(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &pipelineLayout_), "vkCreatePipelineLayout");
 }
 
@@ -372,6 +380,16 @@ void VulkanRenderer::destroyBuffer(const Buffer& buffer)
 {
     vkDestroyBuffer(device_, buffer.handle, nullptr);
     vkFreeMemory(device_, buffer.memory, nullptr);
+}
+
+void VulkanRenderer::uploadHierarchy(const LodHierarchy& hierarchy)
+{
+    auto scene = packLodScene(hierarchy);
+    auto replacement = std::make_unique<GpuLodSelection>();
+    replacement->initialize(gpu_, device_);
+    replacement->upload(scene);
+    uploadMesh(scene.mesh, scene.mesh.indices);
+    lodSelection_ = std::move(replacement);
 }
 
 void VulkanRenderer::uploadMesh(const MeshSource& mesh, const std::vector<uint32_t>& indices)
@@ -435,7 +453,6 @@ void VulkanRenderer::uploadMesh(const MeshSource& mesh, const std::vector<uint32
     destroyBuffer(meshBuffer_);
     meshBuffer_ = replacement;
     indexOffset_ = vertexBytes;
-    indexCount_ = static_cast<uint32_t>(indices.size());
 }
 
 void VulkanRenderer::selectDepthFormat()
@@ -558,6 +575,8 @@ void VulkanRenderer::recreateSwapchain(int width, int height)
         shutdownUi();
         vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = VK_NULL_HANDLE;
+        vkDestroyPipeline(device_, wireframePipeline_, nullptr);
+        wireframePipeline_ = VK_NULL_HANDLE;
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         renderPass_ = VK_NULL_HANDLE;
         colorFormat_ = format.format;
@@ -741,7 +760,11 @@ void VulkanRenderer::createPipeline()
     info.pDynamicState = &dynamic;
     info.layout = pipelineLayout_;
     info.renderPass = renderPass_;
-    const VkResult result = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_);
+    VkResult result = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_);
+    if (result == VK_SUCCESS && wireframeSupported_) {
+        rasterization.polygonMode = VK_POLYGON_MODE_LINE;
+        result = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &wireframePipeline_);
+    }
 
     vkDestroyShaderModule(device_, fragment, nullptr);
     vkDestroyShaderModule(device_, vertex, nullptr);
@@ -806,14 +829,17 @@ void VulkanRenderer::shutdownUi()
     uiMinImageCount_ = 0;
 }
 
-void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, const ClusterDataset& dataset,
-                                bool clusterColors, ImDrawData* ui)
+void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, const LodSettings& lod,
+                                MeshColorMode colorMode, bool wireframe, ImDrawData* ui)
 {
     check(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(commandBuffer_, &begin), "vkBeginCommandBuffer");
+
+    const auto view = camera.view(float(extent_.width) / float(extent_.height), float(extent_.height));
+    lodSelection_->record(commandBuffer_, view, lod);
 
     VkClearValue clearValues[2]{};
     clearValues[0].color = {{0.025f, 0.034f, 0.05f, 1.0f}};
@@ -832,28 +858,27 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, 
     const VkRect2D scissor{{0, 0}, extent_};
     vkCmdSetViewport(commandBuffer_, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer_, 0, 1, &scissor);
-    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    const VkPipeline meshPipeline = wireframe && wireframeSupported_ ? wireframePipeline_ : pipeline_;
+    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline);
 
-    const float aspectRatio = viewport.width / viewport.height;
-    const glm::mat4 viewProjection = camera.viewProjection(aspectRatio);
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                       sizeof(viewProjection), &viewProjection);
+                       sizeof(view.viewProjection), &view.viewProjection);
+    const glm::uvec4 options{uint32_t(colorMode), 0, 0, 0};
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT,
+                       sizeof(glm::mat4), sizeof(options), &options);
+    const auto descriptorSet = lodSelection_->descriptorSet();
+    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_,
+                            0, 1, &descriptorSet, 0, nullptr);
 
     const VkDeviceSize vertexOffset = 0;
     vkCmdBindVertexBuffers(commandBuffer_, 0, 1, &meshBuffer_.handle, &vertexOffset);
     vkCmdBindIndexBuffer(commandBuffer_, meshBuffer_.handle, indexOffset_, VK_INDEX_TYPE_UINT32);
-    if (clusterColors) {
-        for (uint32_t id = 0; id < dataset.clusters.size(); ++id) {
-            const Cluster& cluster = dataset.clusters[id];
-            const glm::vec4 color = clusterColor(id);
-            vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-                               sizeof(glm::mat4), sizeof(color), &color);
-            vkCmdDrawIndexed(commandBuffer_, cluster.indexCount, 1, cluster.firstIndex, 0, 0);
-        }
-    } else {
-        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-                           sizeof(glm::mat4), sizeof(kShadedColor), &kShadedColor);
-        vkCmdDrawIndexed(commandBuffer_, indexCount_, 1, 0, 0, 0);
+    for (uint32_t first = 0; first < lodSelection_->commandCount();) {
+        const uint32_t count = std::min(maxIndirectDrawCount_, lodSelection_->commandCount() - first);
+        vkCmdDrawIndexedIndirect(commandBuffer_, lodSelection_->indirectBuffer(),
+                                  VkDeviceSize(first) * sizeof(VkDrawIndexedIndirectCommand),
+                                  count, sizeof(VkDrawIndexedIndirectCommand));
+        first += count;
     }
 
     ImGui_ImplVulkan_RenderDrawData(ui, commandBuffer_);
@@ -861,8 +886,8 @@ void VulkanRenderer::recordDraw(uint32_t imageIndex, const OrbitCamera& camera, 
     check(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
 }
 
-void VulkanRenderer::drawFrame(const OrbitCamera& camera, const ClusterDataset& dataset, bool clusterColors,
-                               ImDrawData* ui)
+void VulkanRenderer::drawFrame(const OrbitCamera& camera, const LodSettings& lod, MeshColorMode colorMode,
+                               bool wireframe, ImDrawData* ui)
 {
     check(vkWaitForFences(device_, 1, &frameFence_, VK_TRUE, kWaitForever), "vkWaitForFences");
 
@@ -880,7 +905,7 @@ void VulkanRenderer::drawFrame(const OrbitCamera& camera, const ClusterDataset& 
         check(acquire, "vkAcquireNextImageKHR");
     }
 
-    recordDraw(imageIndex, camera, dataset, clusterColors, ui);
+    recordDraw(imageIndex, camera, lod, colorMode, wireframe, ui);
     // Reset only when a submission will signal the fence again.
     check(vkResetFences(device_, 1, &frameFence_), "vkResetFences");
     const VkSemaphore renderFinished = swapchainImages_[imageIndex].renderFinished;

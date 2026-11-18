@@ -42,19 +42,20 @@ target_link_libraries(imgui PRIVATE glfw Vulkan::Vulkan)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>")
 set(SHADER_SOURCES)
 set(COMPILED_SHADERS)
-foreach(SHADER IN ITEMS mesh.vert mesh.frag)
+foreach(SHADER IN ITEMS mesh.vert mesh.frag lod_select.comp)
     set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}")
     set(SHADER_OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER}.inc")
     add_custom_command(
         OUTPUT "${SHADER_OUTPUT}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${SHADER_OUTPUT_DIR}"
         COMMAND Vulkan::glslc --target-env=vulkan1.2 -mfmt=num "${SHADER_SOURCE}" -o "${SHADER_OUTPUT}"
-        DEPENDS "${SHADER_SOURCE}" Vulkan::glslc
+        DEPENDS "${SHADER_SOURCE}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/lod_data.glsl" Vulkan::glslc
         VERBATIM
     )
     list(APPEND SHADER_SOURCES "${SHADER_SOURCE}")
     list(APPEND COMPILED_SHADERS "${SHADER_OUTPUT}")
 endforeach()
+list(APPEND SHADER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/lod_data.glsl")
 
 set_source_files_properties(${SHADER_SOURCES} PROPERTIES HEADER_FILE_ONLY TRUE)
 source_group("Shaders" FILES ${SHADER_SOURCES})
@@ -64,8 +65,16 @@ add_executable(AdaptiveClusterRendering
     src/main.cpp
     src/ClusterBuilder.cpp
     src/ClusterBuilder.h
+    src/ClusterGrouping.cpp
+    src/ClusterGrouping.h
     src/MeshSource.cpp
     src/MeshSource.h
+    src/MeshSimplifier.cpp
+    src/MeshSimplifier.h
+    src/LodBuilder.cpp
+    src/LodBuilder.h
+    src/GpuLodSelection.cpp
+    src/GpuLodSelection.h
     src/ObjLoader.cpp
     src/ObjLoader.h
     src/OrbitCamera.cpp

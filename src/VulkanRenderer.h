@@ -1,7 +1,10 @@
 #pragma once
 
+#include "GpuLodSelection.h"
+
 #include <vulkan/vulkan.h>
 
+#include <memory>
 #include <vector>
 
 struct GLFWwindow;
@@ -19,9 +22,12 @@ public:
     VulkanRenderer& operator=(const VulkanRenderer&) = delete;
 
     void initialize(GLFWwindow* window);
-    void uploadMesh(const MeshSource& mesh, const std::vector<uint32_t>& indices);
+    void uploadHierarchy(const LodHierarchy& hierarchy);
     bool prepareFrame(GLFWwindow* window);
-    void drawFrame(const OrbitCamera& camera, const ClusterDataset& dataset, bool clusterColors, ImDrawData* ui);
+    void drawFrame(const OrbitCamera& camera, const LodSettings& lod, MeshColorMode colorMode,
+                   bool wireframe, ImDrawData* ui);
+    bool supportsWireframe() const { return wireframeSupported_; }
+    const LodStats& lodStats() const { return lodSelection_->stats(); }
 
 private:
     struct Buffer {
@@ -38,6 +44,7 @@ private:
     void createInstance();
     void createDevice();
     void createFrameResources();
+    void uploadMesh(const MeshSource& mesh, const std::vector<uint32_t>& indices);
     VkDeviceMemory allocateMemory(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags properties);
     void createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     void destroyBuffer(const Buffer& buffer);
@@ -49,8 +56,8 @@ private:
     void destroySwapchain();
     void initializeUi(uint32_t minImageCount, uint32_t imageCount);
     void shutdownUi();
-    void recordDraw(uint32_t imageIndex, const OrbitCamera& camera, const ClusterDataset& dataset,
-                    bool clusterColors, ImDrawData* ui);
+    void recordDraw(uint32_t imageIndex, const OrbitCamera& camera, const LodSettings& lod,
+                    MeshColorMode colorMode, bool wireframe, ImDrawData* ui);
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
@@ -69,6 +76,8 @@ private:
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline wireframePipeline_ = VK_NULL_HANDLE;
+    bool wireframeSupported_ = false;
     uint32_t uiImageCount_ = 0;
     uint32_t uiMinImageCount_ = 0;
     int framebufferWidth_ = 0;
@@ -81,8 +90,9 @@ private:
     VkImageView depthView_ = VK_NULL_HANDLE;
 
     Buffer meshBuffer_;
+    std::unique_ptr<GpuLodSelection> lodSelection_;
+    uint32_t maxIndirectDrawCount_ = 1;
     VkDeviceSize indexOffset_ = 0;
-    uint32_t indexCount_ = 0;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;

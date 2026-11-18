@@ -30,7 +30,7 @@ void OrbitCamera::orbit(float deltaX, float deltaY)
 void OrbitCamera::zoom(float scrollSteps)
 {
     distance_ *= std::exp(-scrollSteps * kZoomSpeed);
-    distance_ = std::clamp(distance_, radius_ * 1.15f, radius_ * 12.0f);
+    distance_ = std::clamp(distance_, radius_ * 1.15f, radius_ * 1000.0f);
 }
 
 void OrbitCamera::reset()
@@ -41,6 +41,11 @@ void OrbitCamera::reset()
 }
 
 glm::mat4 OrbitCamera::viewProjection(float aspectRatio) const
+{
+    return view(aspectRatio, 1.0f).viewProjection;
+}
+
+CameraView OrbitCamera::view(float aspectRatio, float height) const
 {
     const float horizontal = std::cos(pitch_);
     const glm::vec3 direction{
@@ -56,5 +61,5 @@ glm::mat4 OrbitCamera::viewProjection(float aspectRatio) const
     const float farPlane = distance + 1.5f * radius_;
     glm::mat4 projection = glm::perspectiveRH_ZO(kVerticalFov, aspectRatio, nearPlane, farPlane);
     projection[1][1] *= -1.0f;
-    return projection * view;
+    return {projection * view, eye, nearPlane, -direction, height * 0.5f * std::abs(projection[1][1])};
 }

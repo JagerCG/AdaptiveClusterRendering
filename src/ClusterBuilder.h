@@ -12,12 +12,20 @@ struct Cluster {
     uint32_t indexCount;
     glm::vec3 boundsMin;
     glm::vec3 boundsMax;
+    uint32_t groupId = 0;
+};
+
+struct ClusterGroup {
+    std::vector<uint32_t> clusters;
+    glm::vec3 boundsMin;
+    glm::vec3 boundsMax;
 };
 
 struct ClusterDataset {
     std::vector<uint32_t> indices;
     // A cluster's ID is its position in this list.
     std::vector<Cluster> clusters;
+    std::vector<ClusterGroup> groups;
 };
 
 ClusterDataset buildClusters(const MeshSource& mesh, uint32_t maxTrianglesPerCluster = 64);

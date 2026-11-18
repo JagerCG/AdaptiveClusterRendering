@@ -1,0 +1,76 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "lod_data.glsl"
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer NodeData { LodNode nodes[]; };
+layout(set = 0, binding = 1, std430) readonly buffer ClusterData { ClusterInfo clusters[]; };
+
+struct DrawCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer DrawCommands { DrawCommand draws[]; };
+layout(set = 0, binding = 3, std430) buffer Statistics {
+    uint selectedClusters;
+    uint selectedTriangles;
+    uint levels[8];
+} stats;
+
+layout(push_constant) uniform SelectionParams {
+    vec4 eyeNear;
+    vec4 forwardScale;
+    vec4 centerRadius;
+    uvec4 options;
+    vec4 thresholds;
+} params;
+
+float screenError(LodNode node)
+{
+    vec3 center = (node.minimumError.xyz + node.maximum.xyz) * 0.5;
+    vec3 halfSize = (node.maximum.xyz - node.minimumError.xyz) * 0.5;
+    float depth = dot(center - params.eyeNear.xyz, params.forwardScale.xyz)
+                - dot(halfSize, abs(params.forwardScale.xyz));
+    return node.minimumError.w * params.forwardScale.w / max(depth, params.eyeNear.w);
+}
+
+bool selected(ClusterInfo cluster)
+{
+    if (params.options.x == 0u) return cluster.geometry.w == params.options.y;
+    if (params.options.x == 1u) {
+        float relativeDistance = distance(params.eyeNear.xyz, params.centerRadius.xyz)
+                               / max(params.centerRadius.w * 3.0, 0.000001);
+        uint level = uint(clamp(floor(log2(max(relativeDistance, 1.0))),
+                                0.0, float(params.options.w - 1u)));
+        return cluster.geometry.w == level;
+    }
+
+    LodNode node = nodes[cluster.geometry.z];
+    if (node.links.w != 0u && screenError(node) > params.thresholds.x) return false;
+    uint parent = node.links.x;
+    for (uint depth = 0u; parent != 0xffffffffu && depth < params.options.w; ++depth) {
+        LodNode ancestor = nodes[parent];
+        if (screenError(ancestor) <= params.thresholds.x) return false;
+        parent = ancestor.links.x;
+    }
+    return parent == 0xffffffffu;
+}
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.options.z) return;
+    ClusterInfo cluster = clusters[id];
+    bool keep = selected(cluster);
+    draws[id] = DrawCommand(keep ? cluster.geometry.y : 0u, 1u, cluster.geometry.x, 0, id);
+    if (keep) {
+        atomicAdd(stats.selectedClusters, 1u);
+        atomicAdd(stats.selectedTriangles, cluster.geometry.y / 3u);
+        atomicAdd(stats.levels[cluster.geometry.w], 1u);
+    }
+}
